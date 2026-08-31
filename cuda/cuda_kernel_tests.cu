@@ -1,4 +1,5 @@
 #include "q38/cuda_kernels.h"
+#include "q38/cuda_moe.h"
 #include "q38/cuda_transport.h"
 #include "q38/cuda_gdn.h"
 #include "q38/cuda_hyper.h"
@@ -8,10 +9,12 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -63,6 +66,301 @@ void require_close(const std::vector<std::uint16_t>& left,
             throw std::runtime_error(std::string(label) + " differs at " +
                                      std::to_string(index));
     }
+}
+
+void test_quantized_decode_gemv(q38::DeviceWeightFormatV1 format,
+                                cudaStream_t stream) {
+    constexpr std::uint32_t rows = 13;
+    constexpr std::uint32_t columns = 384;
+    constexpr std::uint32_t group_size = 128;
+    constexpr std::uint32_t groups = columns / group_size;
+    const bool w8 = format == q38::DeviceWeightFormatV1::kW8A16SymG128;
+    const float alpha = w8 ? 1.0f : 0.625f;
+    const bool accumulate = !w8;
+
+    std::vector<std::uint16_t> input(columns);
+    for (std::uint32_t column = 0; column < columns; ++column)
+        input[column] = bf16(
+            std::sin(static_cast<float>(column) * 0.071f) * 0.75f);
+    std::vector<std::uint16_t> scales(rows * groups);
+    for (std::uint32_t row = 0; row < rows; ++row)
+        for (std::uint32_t group = 0; group < groups; ++group)
+            scales[static_cast<std::size_t>(row) * groups + group] = bf16(
+                (w8 ? 0.003f : 0.0375f) *
+                (1.0f + static_cast<float>((row + group) % 5) * 0.125f));
+
+    std::vector<std::int8_t> logical_weights(
+        static_cast<std::size_t>(rows) * columns);
+    for (std::size_t index = 0; index < logical_weights.size(); ++index) {
+        const int span = w8 ? 255 : 15;
+        const int minimum = w8 ? -127 : -7;
+        logical_weights[index] = static_cast<std::int8_t>(
+            minimum + static_cast<int>((index * 37 + index / columns * 11) %
+                                       span));
+    }
+    std::vector<std::uint8_t> packed;
+    const void* device_weight_data = nullptr;
+    std::int8_t* device_w8 = nullptr;
+    std::uint8_t* device_w4 = nullptr;
+    if (w8) {
+        device_w8 = upload(logical_weights);
+        device_weight_data = device_w8;
+    } else {
+        packed.resize(logical_weights.size() / 2);
+        for (std::size_t index = 0; index < logical_weights.size(); index += 2) {
+            const auto low = static_cast<unsigned>(logical_weights[index]) & 0xfu;
+            const auto high =
+                static_cast<unsigned>(logical_weights[index + 1]) & 0xfu;
+            packed[index / 2] = static_cast<std::uint8_t>(low | (high << 4));
+        }
+        device_w4 = upload(packed);
+        device_weight_data = device_w4;
+    }
+    auto* device_scales = upload(scales);
+    auto* device_input = upload(input);
+    std::vector<std::uint16_t> initial(rows, bf16(0.25f));
+    auto* device_output = upload(initial);
+    q38::CudaMatrixViewV1 matrix{format, device_weight_data, device_scales,
+                                 rows, columns, group_size, false};
+    q38::cuda_gemv_bf16(matrix, device_input, device_output, 1,
+                        reinterpret_cast<void*>(stream), 0, alpha,
+                        accumulate);
+    std::vector<std::uint16_t> actual(rows);
+    check(cudaMemcpyAsync(actual.data(), device_output,
+                          actual.size() * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(quantized decode GEMV)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(quantized decode GEMV)");
+
+    for (std::uint32_t row = 0; row < rows; ++row) {
+        float expected = accumulate ? fp32(initial[row]) : 0.0f;
+        float dot = 0.0f;
+        for (std::uint32_t column = 0; column < columns; ++column) {
+            const auto scale = fp32(
+                scales[static_cast<std::size_t>(row) * groups +
+                       column / group_size]);
+            dot += fp32(input[column]) *
+                   static_cast<float>(logical_weights[
+                       static_cast<std::size_t>(row) * columns + column]) *
+                   scale;
+        }
+        expected += alpha * dot;
+        if (std::fabs(fp32(actual[row]) - expected) > 0.075f)
+            throw std::runtime_error(
+                std::string(w8 ? "W8" : "W4") +
+                " optimized decode GEMV differs at row " +
+                std::to_string(row));
+    }
+
+    (void)cudaFree(device_output);
+    (void)cudaFree(device_input);
+    (void)cudaFree(device_scales);
+    if (device_w4) (void)cudaFree(device_w4);
+    if (device_w8) (void)cudaFree(device_w8);
+}
+
+void test_decode_router_topk(cudaStream_t stream) {
+    constexpr std::uint32_t tokens = 2;
+    constexpr std::uint32_t experts = 512;
+    constexpr std::uint32_t top_k = 10;
+    std::vector<std::uint16_t> logits(tokens * experts);
+    for (std::uint32_t token = 0; token < tokens; ++token) {
+        for (std::uint32_t expert = 0; expert < experts; ++expert) {
+            float value = std::sin(static_cast<float>(expert) * 0.037f +
+                                   static_cast<float>(token) * 0.31f);
+            if (expert == 3 || expert == 7) value = 2.0f;
+            logits[static_cast<std::size_t>(token) * experts + expert] =
+                bf16(value);
+        }
+    }
+    auto* device_logits = upload(logits);
+    auto* device_ids = allocate<std::int32_t>(tokens * top_k);
+    auto* device_weights = allocate<float>(tokens * top_k);
+    q38::cuda_topk_router_bf16(
+        device_logits, device_ids, device_weights, tokens, experts, top_k,
+        true, reinterpret_cast<void*>(stream), 0);
+    std::vector<std::int32_t> ids(tokens * top_k);
+    std::vector<float> weights(tokens * top_k);
+    check(cudaMemcpyAsync(ids.data(), device_ids,
+                          ids.size() * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(router ids)");
+    check(cudaMemcpyAsync(weights.data(), device_weights,
+                          weights.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(router weights)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(router top-k)");
+
+    for (std::uint32_t token = 0; token < tokens; ++token) {
+        std::vector<std::pair<float, std::int32_t>> ordered;
+        ordered.reserve(experts);
+        for (std::uint32_t expert = 0; expert < experts; ++expert)
+            ordered.emplace_back(
+                fp32(logits[static_cast<std::size_t>(token) * experts +
+                            expert]),
+                static_cast<std::int32_t>(expert));
+        std::sort(ordered.begin(), ordered.end(), [](const auto& left,
+                                                     const auto& right) {
+            if (left.first != right.first) return left.first > right.first;
+            return left.second < right.second;
+        });
+        float denominator = 0.0f;
+        for (std::uint32_t rank = 0; rank < top_k; ++rank)
+            denominator += std::exp(ordered[rank].first - ordered[0].first);
+        for (std::uint32_t rank = 0; rank < top_k; ++rank) {
+            const auto index = static_cast<std::size_t>(token) * top_k + rank;
+            if (ids[index] != ordered[rank].second)
+                throw std::runtime_error("decode router top-k ids differ");
+            const float expected =
+                std::exp(ordered[rank].first - ordered[0].first) / denominator;
+            if (std::fabs(weights[index] - expected) > 1.0e-5f)
+                throw std::runtime_error("decode router top-k weights differ");
+        }
+    }
+
+    (void)cudaFree(device_weights);
+    (void)cudaFree(device_ids);
+    (void)cudaFree(device_logits);
+}
+
+std::vector<std::uint8_t> make_quantized_matrix(
+    std::size_t elements, std::uint32_t salt,
+    q38::DeviceWeightFormatV1 format) {
+    const bool w8 = format == q38::DeviceWeightFormatV1::kW8A16SymG128;
+    std::vector<std::uint8_t> result(w8 ? elements : elements / 2);
+    for (std::size_t index = 0; index < elements; index += w8 ? 1 : 2) {
+        const int low_value =
+            (w8 ? -127 : -7) +
+            static_cast<int>((index * 13 + salt) % (w8 ? 255 : 15));
+        if (w8) {
+            result[index] = static_cast<std::uint8_t>(
+                static_cast<std::int8_t>(low_value));
+            continue;
+        }
+        const int high_value =
+            -7 + static_cast<int>(((index + 1) * 13 + salt) % 15);
+        const auto low = static_cast<unsigned>(low_value) & 0xfu;
+        const auto high = static_cast<unsigned>(high_value) & 0xfu;
+        result[index / 2] =
+            static_cast<std::uint8_t>(low | (high << 4));
+    }
+    return result;
+}
+
+void test_moe_decode_parity(q38::DeviceWeightFormatV1 format,
+                            cudaStream_t stream) {
+    constexpr std::uint32_t top_k = q38::kQ38MoeTopK;
+    constexpr std::uint32_t gate_rows = 2 * q38::kQ38MoeIntermediate;
+    constexpr std::uint32_t gate_columns = q38::kQ38HiddenWidth;
+    constexpr std::uint32_t down_rows = q38::kQ38HiddenWidth;
+    constexpr std::uint32_t down_columns = q38::kQ38MoeIntermediate;
+    const auto gate_elements =
+        static_cast<std::size_t>(gate_rows) * gate_columns;
+    const auto down_elements =
+        static_cast<std::size_t>(down_rows) * down_columns;
+    const bool w8 = format == q38::DeviceWeightFormatV1::kW8A16SymG128;
+    auto gate_data = make_quantized_matrix(gate_elements, 3, format);
+    auto down_data = make_quantized_matrix(down_elements, 7, format);
+    std::vector<std::uint16_t> gate_scales(
+        gate_rows * (gate_columns / 128), bf16(w8 ? 0.00075f : 0.0125f));
+    std::vector<std::uint16_t> down_scales(
+        down_rows * (down_columns / 128), bf16(w8 ? 0.001f : 0.0175f));
+    std::vector<std::uint16_t> hidden(gate_columns);
+    for (std::size_t index = 0; index < hidden.size(); ++index)
+        hidden[index] = bf16(
+            std::sin(static_cast<float>(index) * 0.013f) * 0.2f);
+    std::vector<std::uint16_t> hidden_pair = hidden;
+    hidden_pair.insert(hidden_pair.end(), hidden.begin(), hidden.end());
+    std::vector<std::int32_t> experts(top_k, 0);
+    std::vector<std::int32_t> expert_pair = experts;
+    expert_pair.insert(expert_pair.end(), experts.begin(), experts.end());
+    std::vector<float> route_weights(top_k, 1.0f / top_k);
+    std::vector<float> route_weight_pair = route_weights;
+    route_weight_pair.insert(route_weight_pair.end(), route_weights.begin(),
+                             route_weights.end());
+
+    auto* d_gate_data = upload(gate_data);
+    auto* d_down_data = upload(down_data);
+    auto* d_gate_scales = upload(gate_scales);
+    auto* d_down_scales = upload(down_scales);
+    auto* d_hidden = upload(hidden);
+    auto* d_hidden_pair = upload(hidden_pair);
+    auto* d_experts = upload(experts);
+    auto* d_expert_pair = upload(expert_pair);
+    auto* d_route_weights = upload(route_weights);
+    auto* d_route_weight_pair = upload(route_weight_pair);
+
+    q38::DeviceTensorV1 gate_descriptor;
+    gate_descriptor.format = format;
+    gate_descriptor.group_size = 128;
+    gate_descriptor.shape = {q38::kQ38MoeExperts, gate_rows, gate_columns};
+    q38::DeviceTensorV1 down_descriptor;
+    down_descriptor.format = format;
+    down_descriptor.group_size = 128;
+    down_descriptor.shape = {q38::kQ38MoeExperts, down_rows, down_columns};
+    q38::CudaTensorViewV1 gate_view{&gate_descriptor, d_gate_data,
+                                    d_gate_scales};
+    q38::CudaTensorViewV1 down_view{&down_descriptor, d_down_data,
+                                    d_down_scales};
+
+    const auto gate_route_words =
+        static_cast<std::size_t>(top_k) * gate_rows;
+    const auto activated_route_words =
+        static_cast<std::size_t>(top_k) * down_columns;
+    auto* gate_scratch = allocate<std::uint16_t>(gate_route_words);
+    auto* gate_scratch_pair = allocate<std::uint16_t>(2 * gate_route_words);
+    auto* activated = allocate<std::uint16_t>(activated_route_words);
+    auto* activated_pair =
+        allocate<std::uint16_t>(2 * activated_route_words);
+    auto* accumulation = allocate<float>(down_rows);
+    auto* accumulation_pair = allocate<float>(2 * down_rows);
+    auto* output = allocate<std::uint16_t>(down_rows);
+    auto* output_pair = allocate<std::uint16_t>(2 * down_rows);
+
+    q38::cuda_moe_routed_bf16(
+        gate_view, down_view, d_hidden, d_experts, d_route_weights, 1, top_k,
+        gate_scratch, activated, accumulation, output,
+        reinterpret_cast<void*>(stream), 0);
+    q38::cuda_moe_routed_bf16(
+        gate_view, down_view, d_hidden_pair, d_expert_pair, d_route_weight_pair,
+        2, top_k, gate_scratch_pair, activated_pair, accumulation_pair,
+        output_pair, reinterpret_cast<void*>(stream), 0);
+    std::vector<std::uint16_t> decode(down_rows);
+    std::vector<std::uint16_t> reference(down_rows);
+    check(cudaMemcpyAsync(decode.data(), output,
+                          decode.size() * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(MoE decode)");
+    check(cudaMemcpyAsync(reference.data(), output_pair,
+                          reference.size() * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(MoE reference)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(MoE parity)");
+    const std::string parity_label =
+        std::string(w8 ? "W8" : "W4") + " MoE decode parity";
+    require_close(decode, reference, 0.075f, parity_label.c_str());
+
+    (void)cudaFree(output_pair);
+    (void)cudaFree(output);
+    (void)cudaFree(accumulation_pair);
+    (void)cudaFree(accumulation);
+    (void)cudaFree(activated_pair);
+    (void)cudaFree(activated);
+    (void)cudaFree(gate_scratch_pair);
+    (void)cudaFree(gate_scratch);
+    (void)cudaFree(d_route_weight_pair);
+    (void)cudaFree(d_route_weights);
+    (void)cudaFree(d_expert_pair);
+    (void)cudaFree(d_experts);
+    (void)cudaFree(d_hidden_pair);
+    (void)cudaFree(d_hidden);
+    (void)cudaFree(d_down_scales);
+    (void)cudaFree(d_gate_scales);
+    (void)cudaFree(d_down_data);
+    (void)cudaFree(d_gate_data);
 }
 
 void test_boundary_transport_checksum(cudaStream_t stream) {
@@ -576,6 +874,15 @@ int main() {
         check(cudaSetDevice(0), "cudaSetDevice(test)");
         cudaStream_t stream = nullptr;
         check(cudaStreamCreate(&stream), "cudaStreamCreate(test)");
+        test_quantized_decode_gemv(
+            q38::DeviceWeightFormatV1::kW8A16SymG128, stream);
+        test_quantized_decode_gemv(
+            q38::DeviceWeightFormatV1::kW4A16SymG128, stream);
+        test_decode_router_topk(stream);
+        test_moe_decode_parity(
+            q38::DeviceWeightFormatV1::kW8A16SymG128, stream);
+        test_moe_decode_parity(
+            q38::DeviceWeightFormatV1::kW4A16SymG128, stream);
         std::vector<std::int8_t> weights(2 * 128, 1);
         for (std::size_t index = 128; index < weights.size(); ++index)
             weights[index] = index & 1 ? -1 : 1;

@@ -250,7 +250,7 @@ __global__ void qsa_attention_scores_kernel(
 
 __global__ void qsa_attention_output_kernel(
     const std::uint16_t* values, const std::int32_t* selected,
-    std::uint32_t selected_count, const float* scores,
+    std::uint32_t selected_count, float* scores,
     std::uint16_t* output) {
     const auto head = blockIdx.x;
     const auto element = threadIdx.x;
@@ -266,12 +266,19 @@ __global__ void qsa_attention_output_kernel(
          index += blockDim.x)
         local_sum += expf(scores[score_base + index] - maximum);
     const float denominator = block_sum<256>(local_sum);
+    // Normalize each selected score once.  The prior implementation repeated
+    // the same expf/divide for every one of the 256 value dimensions, or about
+    // 12.6 million redundant exponentials per QSA layer at the 2051-token
+    // budget.  Scores are scratch after softmax, so reusing them is safe.
+    for (std::uint32_t index = threadIdx.x; index < selected_count;
+         index += blockDim.x)
+        scores[score_base + index] =
+            expf(scores[score_base + index] - maximum) / denominator;
+    __syncthreads();
     float value = 0.0f;
     for (std::uint32_t index = 0; index < selected_count; ++index) {
-        const float probability = expf(scores[score_base + index] - maximum) /
-                                  denominator;
         const auto position = selected[index];
-        value += probability *
+        value += scores[score_base + index] *
                  bf16_load(values,
                            (static_cast<std::uint64_t>(position) *
                                 kQ38QsaKvHeads +
@@ -476,7 +483,7 @@ __global__ void qsa_attention_scores_prefill_kernel(
 
 __global__ void qsa_attention_output_prefill_kernel(
     const std::uint16_t* values, const std::int32_t* selected,
-    std::uint32_t first_position, const float* scores,
+    std::uint32_t first_position, float* scores,
     std::uint16_t* output) {
     const auto head = blockIdx.x;
     const auto token = blockIdx.y;
@@ -504,12 +511,15 @@ __global__ void qsa_attention_output_prefill_kernel(
          index += blockDim.x)
         local_sum += expf(scores[score_base + index] - maximum);
     const float denominator = block_sum<256>(local_sum);
+    for (std::uint32_t index = threadIdx.x; index < selected_count;
+         index += blockDim.x)
+        scores[score_base + index] =
+            expf(scores[score_base + index] - maximum) / denominator;
+    __syncthreads();
     float value = 0.0f;
     for (std::uint32_t index = 0; index < selected_count; ++index) {
-        const float probability =
-            expf(scores[score_base + index] - maximum) / denominator;
         const auto source_position = token_selected[index];
-        value += probability *
+        value += scores[score_base + index] *
                  bf16_load(values,
                            (static_cast<std::uint64_t>(source_position) *
                                 kQ38QsaKvHeads +

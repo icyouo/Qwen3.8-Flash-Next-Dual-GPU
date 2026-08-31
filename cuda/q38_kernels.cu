@@ -4,6 +4,8 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -13,6 +15,31 @@ namespace q38 {
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kWarpSize = 32;
+constexpr int kDecodeWarpsPerBlock = kThreads / kWarpSize;
+constexpr std::uint32_t kQuantGroupSize = 128;
+constexpr std::uint32_t kMaximumDecodeSharedColumns =
+    (48u * 1024u) / sizeof(std::uint16_t);
+
+bool optimized_decode_gemv_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("Q38_CUDA_DECODE_GEMV");
+        return !value || (std::strcmp(value, "scalar") != 0 &&
+                          std::strcmp(value, "0") != 0 &&
+                          std::strcmp(value, "false") != 0);
+    }();
+    return enabled;
+}
+
+bool optimized_decode_topk_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("Q38_CUDA_DECODE_TOPK");
+        return !value || (std::strcmp(value, "scalar") != 0 &&
+                          std::strcmp(value, "0") != 0 &&
+                          std::strcmp(value, "false") != 0);
+    }();
+    return enabled;
+}
 
 void check(cudaError_t status, const char* operation) {
     if (status != cudaSuccess)
@@ -102,6 +129,81 @@ __global__ void gemv_bf16_kernel(
         const auto output_index = static_cast<std::uint64_t>(batch) * rows + row;
         const float previous = accumulate ? bf16_load(output, output_index) : 0.0f;
         bf16_store(output, output_index, previous + alpha * sum);
+    }
+}
+
+__device__ __forceinline__ int sign_extend_int4(unsigned value) {
+    return static_cast<int>(value) - ((value & 0x8u) ? 16 : 0);
+}
+
+// Batch-1 decode is a GEMV, not a small GEMM.  Giving a 16-row WMMA tile one
+// real row wastes 15/16 of the tensor-core work.  This kernel instead assigns
+// one output row to each warp, shares the activation across eight rows, loads
+// one BF16 scale per 128-value group, and consumes four adjacent weights per
+// lane.  It uses the production artifact layout directly; no repack or second
+// weight ABI is required.
+template <int WeightBits>
+__global__ void decode_gemv_group128_kernel(
+    const void* data, const std::uint16_t* scales, std::uint32_t rows,
+    std::uint32_t columns, const std::uint16_t* input,
+    std::uint16_t* output, float alpha, bool accumulate) {
+    extern __shared__ std::uint16_t cached_input[];
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += blockDim.x)
+        cached_input[column] = input[column];
+    __syncthreads();
+
+    const auto lane = threadIdx.x & (kWarpSize - 1);
+    const auto warp = threadIdx.x / kWarpSize;
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) *
+                         kDecodeWarpsPerBlock +
+                     warp;
+    if (row >= rows) return;
+
+    const auto groups = columns / kQuantGroupSize;
+    float sum = 0.0f;
+    for (std::uint32_t group = 0; group < groups; ++group) {
+        float scale = 0.0f;
+        if (lane == 0)
+            scale = bf16_load(scales,
+                              static_cast<std::uint64_t>(row) * groups + group);
+        scale = __shfl_sync(0xffffffffu, scale, 0);
+
+        const auto column = group * kQuantGroupSize + lane * 4;
+        const float a0 = bf16_load(cached_input, column);
+        const float a1 = bf16_load(cached_input, column + 1);
+        const float a2 = bf16_load(cached_input, column + 2);
+        const float a3 = bf16_load(cached_input, column + 3);
+        float dot = 0.0f;
+        if constexpr (WeightBits == 8) {
+            const auto* weights = static_cast<const std::int8_t*>(data) +
+                                  static_cast<std::uint64_t>(row) * columns +
+                                  column;
+            const auto packed =
+                *reinterpret_cast<const char4*>(weights);
+            dot = a0 * static_cast<float>(packed.x) +
+                  a1 * static_cast<float>(packed.y) +
+                  a2 * static_cast<float>(packed.z) +
+                  a3 * static_cast<float>(packed.w);
+        } else {
+            const auto element = static_cast<std::uint64_t>(row) * columns +
+                                 column;
+            const auto packed = *reinterpret_cast<const std::uint16_t*>(
+                static_cast<const std::uint8_t*>(data) + (element >> 1));
+            dot = a0 * static_cast<float>(sign_extend_int4(packed & 0x0fu)) +
+                  a1 * static_cast<float>(
+                           sign_extend_int4((packed >> 4) & 0x0fu)) +
+                  a2 * static_cast<float>(
+                           sign_extend_int4((packed >> 8) & 0x0fu)) +
+                  a3 * static_cast<float>(
+                           sign_extend_int4((packed >> 12) & 0x0fu));
+        }
+        sum = fmaf(dot, scale, sum);
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) {
+        const float previous = accumulate ? bf16_load(output, row) : 0.0f;
+        bf16_store(output, row, previous + alpha * sum);
     }
 }
 
@@ -301,6 +403,82 @@ __global__ void topk_router_bf16_kernel(
     }
 }
 
+// Qwen3.8 decode routes one token over exactly 512 experts.  The reference
+// kernel above intentionally handles arbitrary shapes, but only thread 0 does
+// its 512 exponentials and insertion sort.  This specialization loads two
+// logits per thread, sorts them in shared memory with stable expert-id tie
+// breaking, and evaluates expf only for the selected top-k entries.
+__global__ void topk_router_512_decode_kernel(
+    const std::uint16_t* logits, std::int32_t* expert_ids,
+    float* expert_weights, std::uint32_t top_k) {
+    constexpr std::uint32_t kExperts = 512;
+    __shared__ float values[kExperts];
+    __shared__ std::int32_t ids[kExperts];
+    __shared__ float numerators[32];
+    __shared__ float denominator;
+    const auto token = blockIdx.x;
+    const auto base = static_cast<std::uint64_t>(token) * kExperts;
+    for (std::uint32_t expert = threadIdx.x; expert < kExperts;
+         expert += blockDim.x) {
+        values[expert] = bf16_load(logits, base + expert);
+        ids[expert] = static_cast<std::int32_t>(expert);
+    }
+    __syncthreads();
+
+    // Ascending bitonic order by (logit, -expert_id).  Reading from the end
+    // therefore produces descending logits and the lowest id first on ties,
+    // matching the reference insertion order.
+    for (std::uint32_t width = 2; width <= kExperts; width <<= 1) {
+        for (std::uint32_t stride = width >> 1; stride != 0; stride >>= 1) {
+            for (std::uint32_t left = threadIdx.x; left < kExperts;
+                 left += blockDim.x) {
+                const auto right = left ^ stride;
+                if (right <= left) continue;
+                const bool ascending = (left & width) == 0;
+                const bool left_better =
+                    values[left] > values[right] ||
+                    (values[left] == values[right] && ids[left] < ids[right]);
+                const bool right_better =
+                    values[right] > values[left] ||
+                    (values[right] == values[left] && ids[right] < ids[left]);
+                if ((ascending && left_better) ||
+                    (!ascending && right_better)) {
+                    const auto value = values[left];
+                    values[left] = values[right];
+                    values[right] = value;
+                    const auto id = ids[left];
+                    ids[left] = ids[right];
+                    ids[right] = id;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    float numerator = 0.0f;
+    if (threadIdx.x < top_k) {
+        const auto sorted = kExperts - 1 - threadIdx.x;
+        numerator = expf(values[sorted] - values[kExperts - 1]);
+        numerators[threadIdx.x] = numerator;
+        expert_ids[static_cast<std::uint64_t>(token) * top_k + threadIdx.x] =
+            ids[sorted];
+    }
+    __syncthreads();
+    // Preserve the reference kernel's rank-order FP32 accumulation.  Only ten
+    // additions are serialized in production, while identical rounding keeps
+    // greedy trajectories from drifting solely because routing weights used a
+    // different reduction tree.
+    if (threadIdx.x == 0) {
+        denominator = 0.0f;
+        for (std::uint32_t rank = 0; rank < top_k; ++rank)
+            denominator += numerators[rank];
+    }
+    __syncthreads();
+    if (threadIdx.x < top_k)
+        expert_weights[static_cast<std::uint64_t>(token) * top_k +
+                       threadIdx.x] = numerators[threadIdx.x] / denominator;
+}
+
 void validate_matrix(const CudaMatrixViewV1& matrix) {
     if (!matrix.data || matrix.rows == 0 || matrix.columns == 0)
         throw std::invalid_argument("invalid CUDA matrix view");
@@ -324,6 +502,35 @@ void cuda_gemv_bf16(const CudaMatrixViewV1& matrix,
     validate_stream(stream, device);
     if (!input || !output || batch == 0)
         throw std::invalid_argument("invalid BF16 GEMV buffers");
+    if (batch == 1 && optimized_decode_gemv_enabled() &&
+        matrix.group_size == kQuantGroupSize &&
+        matrix.columns <= kMaximumDecodeSharedColumns &&
+        (matrix.format == DeviceWeightFormatV1::kW4A16SymG128 ||
+         matrix.format == DeviceWeightFormatV1::kW8A16SymG128)) {
+        const auto blocks =
+            (matrix.rows + kDecodeWarpsPerBlock - 1) / kDecodeWarpsPerBlock;
+        const auto shared_bytes =
+            static_cast<std::size_t>(matrix.columns) * sizeof(std::uint16_t);
+        if (matrix.format == DeviceWeightFormatV1::kW8A16SymG128) {
+            decode_gemv_group128_kernel<8>
+                <<<blocks, kThreads, shared_bytes,
+                   reinterpret_cast<cudaStream_t>(stream)>>>(
+                    matrix.data,
+                    static_cast<const std::uint16_t*>(matrix.scales),
+                    matrix.rows, matrix.columns, input, output, alpha,
+                    accumulate);
+        } else {
+            decode_gemv_group128_kernel<4>
+                <<<blocks, kThreads, shared_bytes,
+                   reinterpret_cast<cudaStream_t>(stream)>>>(
+                    matrix.data,
+                    static_cast<const std::uint16_t*>(matrix.scales),
+                    matrix.rows, matrix.columns, input, output, alpha,
+                    accumulate);
+        }
+        check(cudaPeekAtLastError(), "decode_gemv_group128_kernel");
+        return;
+    }
     const dim3 grid(matrix.rows, batch);
     gemv_bf16_kernel<<<grid, kThreads, 0,
                        reinterpret_cast<cudaStream_t>(stream)>>>(
@@ -465,10 +672,18 @@ void cuda_topk_router_bf16(
     if (!logits || !expert_ids || !expert_weights || tokens == 0 ||
         experts == 0 || top_k == 0 || top_k > experts || top_k > 32)
         throw std::invalid_argument("invalid top-k router buffers");
-    topk_router_bf16_kernel<<<tokens, 32, 0,
-                             reinterpret_cast<cudaStream_t>(stream)>>>(
-        logits, expert_ids, expert_weights, experts, top_k, normalize_top_k);
-    check(cudaPeekAtLastError(), "topk_router_bf16_kernel");
+    if (experts == 512 && normalize_top_k && optimized_decode_topk_enabled()) {
+        topk_router_512_decode_kernel<<<
+            tokens, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+            logits, expert_ids, expert_weights, top_k);
+        check(cudaPeekAtLastError(), "topk_router_512_decode_kernel");
+    } else {
+        topk_router_bf16_kernel<<<tokens, 32, 0,
+                                 reinterpret_cast<cudaStream_t>(stream)>>>(
+            logits, expert_ids, expert_weights, experts, top_k,
+            normalize_top_k);
+        check(cudaPeekAtLastError(), "topk_router_bf16_kernel");
+    }
 }
 
 bool cuda_q38_kernels_compiled() { return true; }

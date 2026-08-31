@@ -15,9 +15,11 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -38,6 +40,12 @@ constexpr std::uint32_t kCut = kQ38ProductionCut;
 constexpr std::uint32_t kPrefillTile = 32;
 constexpr std::uint32_t kSmallBoundaryTokens = 128;
 
+bool decode_profile_requested() {
+    const char* value = std::getenv("Q38_CUDA_PROFILE_DECODE");
+    return value && std::strcmp(value, "0") != 0 &&
+           std::strcmp(value, "false") != 0;
+}
+
 void check(cudaError_t status, const char* operation) {
     if (status != cudaSuccess)
         throw std::runtime_error(std::string(operation) + ": " +
@@ -49,6 +57,88 @@ void check_cublas(cublasStatus_t status, const char* operation) {
         throw std::runtime_error(std::string(operation) + ": cuBLAS status " +
                                  std::to_string(static_cast<int>(status)));
 }
+
+// Opt-in event profiling for real-model batch-1 decode.  It has no CUDA
+// events, records, synchronization, or logging cost unless explicitly enabled.
+// Repeated labels are aggregated across all layers owned by the stage.
+class DecodeEventProfile {
+public:
+    explicit DecodeEventProfile(int value_device) : device_(value_device) {}
+    ~DecodeEventProfile() {
+        (void)cudaSetDevice(device_);
+        for (auto event : events_) (void)cudaEventDestroy(event);
+    }
+
+    DecodeEventProfile(const DecodeEventProfile&) = delete;
+    DecodeEventProfile& operator=(const DecodeEventProfile&) = delete;
+
+    void begin(cudaStream_t stream) {
+        labels_.clear();
+        event_count_ = 0;
+        active_ = true;
+        record(stream);
+    }
+
+    void mark(const char* label, cudaStream_t stream) {
+        if (!active_) return;
+        labels_.emplace_back(label);
+        record(stream);
+    }
+
+    void finish(Stage stage, std::uint64_t position, cudaStream_t stream) {
+        if (!active_) return;
+        check(cudaStreamSynchronize(stream),
+              "cudaStreamSynchronize(decode profile)");
+        std::vector<std::pair<std::string, double>> totals;
+        double total_ms = 0.0;
+        for (std::size_t index = 0; index < labels_.size(); ++index) {
+            float elapsed_ms = 0.0f;
+            check(cudaEventElapsedTime(&elapsed_ms, events_[index],
+                                       events_[index + 1]),
+                  "cudaEventElapsedTime(decode profile)");
+            total_ms += elapsed_ms;
+            const auto found = std::find_if(
+                totals.begin(), totals.end(), [&](const auto& entry) {
+                    return entry.first == labels_[index];
+                });
+            if (found == totals.end())
+                totals.emplace_back(labels_[index], elapsed_ms);
+            else
+                found->second += elapsed_ms;
+        }
+        std::cerr << "{\"type\":\"q38_cuda_decode_profile\",\"stage\":"
+                  << static_cast<unsigned>(stage) << ",\"position\":"
+                  << position << ",\"total_ms\":" << total_ms
+                  << ",\"categories_ms\":{";
+        for (std::size_t index = 0; index < totals.size(); ++index) {
+            if (index) std::cerr << ',';
+            std::cerr << '\"' << totals[index].first << "\":"
+                      << totals[index].second;
+        }
+        std::cerr << "}}\n";
+        active_ = false;
+    }
+
+    bool active() const { return active_; }
+
+private:
+    void record(cudaStream_t stream) {
+        if (event_count_ == events_.size()) {
+            cudaEvent_t event = nullptr;
+            check(cudaEventCreate(&event),
+                  "cudaEventCreate(decode profile)");
+            events_.push_back(event);
+        }
+        check(cudaEventRecord(events_[event_count_++], stream),
+              "cudaEventRecord(decode profile)");
+    }
+
+    int device_ = 0;
+    bool active_ = false;
+    std::size_t event_count_ = 0;
+    std::vector<cudaEvent_t> events_;
+    std::vector<std::string> labels_;
+};
 
 std::uint64_t elements(const DeviceTensorV1& tensor) {
     std::uint64_t result = 1;
@@ -843,6 +933,14 @@ struct CudaStageBackend::Impl {
                     options.device, 1, options.context_capacity);
             }
         }
+        if (decode_profile_requested())
+            decode_profile =
+                std::make_unique<DecodeEventProfile>(options.device);
+    }
+
+    void profile_mark(const char* label) {
+        if (decode_profile && decode_profile->active())
+            decode_profile->mark(label, workspace.stream);
     }
 
     void cuda_gemv_bf16(const CudaMatrixViewV1& matrix,
@@ -1096,30 +1194,36 @@ struct CudaStageBackend::Impl {
         auto stream = reinterpret_cast<void*>(workspace.stream);
         cuda_gemv_bf16(layer.moe.router, workspace.mixed, workspace.small0,
                        tokens, stream, options.device);
+        if (tokens == 1) profile_mark("moe_router");
         cuda_topk_router_bf16(workspace.small0, workspace.expert_ids,
                               workspace.expert_weights, tokens, kQ38MoeExperts,
                               kQ38MoeTopK, true, stream, options.device);
+        if (tokens == 1) profile_mark("moe_topk");
         cuda_moe_routed_bf16(
             layer.moe.gate_up_experts, layer.moe.down_experts, workspace.mixed,
             workspace.expert_ids, workspace.expert_weights, tokens,
             kQ38MoeTopK, workspace.moe_gate_up, workspace.moe_activated,
             workspace.moe_accumulation, workspace.proj6, stream,
             options.device);
+        if (tokens == 1) profile_mark("moe_routed");
         cuda_gemv_bf16(layer.moe.shared_gate, workspace.mixed,
                        workspace.small2, tokens, stream, options.device);
         cuda_gemv_bf16(layer.moe.shared_up, workspace.mixed,
                        workspace.small1, tokens, stream, options.device);
+        if (tokens == 1) profile_mark("moe_shared_gate_up");
         cuda_silu_multiply_bf16(
             workspace.small2, workspace.small1, workspace.small0,
             static_cast<std::size_t>(tokens) * kQ38MoeIntermediate, stream,
             options.device);
         cuda_gemv_bf16(layer.moe.shared_down, workspace.small0,
                        workspace.proj5, tokens, stream, options.device);
+        if (tokens == 1) profile_mark("moe_shared_down");
         cuda_gemv_bf16(layer.moe.shared_output_gate, workspace.mixed,
                        workspace.small1, tokens, stream, options.device);
         cuda_moe_combine_shared_bf16(
             workspace.proj6, workspace.proj5, workspace.small1,
             workspace.block_output, tokens, stream, options.device);
+        if (tokens == 1) profile_mark("moe_shared_combine");
     }
 
     void check_cancelled() const {
@@ -1146,6 +1250,7 @@ struct CudaStageBackend::Impl {
                       cudaMemcpyDeviceToDevice, workspace.stream),
                   "cudaMemcpyAsync(stage boundary token)");
         }
+        profile_mark("input");
         std::uint16_t* current = workspace.hyper_a;
         std::uint16_t* alternate = workspace.hyper_b;
         for (const auto& layer : layers) {
@@ -1154,19 +1259,25 @@ struct CudaStageBackend::Impl {
                 ensure_ple_ready(token_index, 1);
                 run_ple(layer, current, alternate, token_index);
                 std::swap(current, alternate);
+                profile_mark("ple");
             }
             prepare_hyper(layer.attention_hyper, current);
+            profile_mark("attention_hyper");
             if (layer.qsa)
                 run_qsa(layer, position, *qsa_state);
             else
                 run_gdn(layer);
+            profile_mark(layer.qsa ? "qsa" : "gdn");
             finish_hyper(current, alternate);
             std::swap(current, alternate);
+            profile_mark("attention_finish");
 
             prepare_hyper(layer.moe_hyper, current);
+            profile_mark("moe_hyper");
             run_moe(layer);
             finish_hyper(current, alternate);
             std::swap(current, alternate);
+            profile_mark("moe_finish");
         }
         if (options.stage == Stage::kStage0) {
             if (write_result)
@@ -1195,6 +1306,8 @@ struct CudaStageBackend::Impl {
                                  options.device);
             }
         }
+        profile_mark(options.stage == Stage::kStage0 ? "stage_output"
+                                                      : "final_head");
     }
 
     void run_prefill(std::uint32_t count, std::uint32_t chunk_offset,
@@ -1641,6 +1754,7 @@ struct CudaStageBackend::Impl {
     bool ple_read_active = false;
     std::size_t ple_read_bytes = 0;
     std::size_t ple_read_scales = 0;
+    std::unique_ptr<DecodeEventProfile> decode_profile;
     mutable std::uint64_t tracked_peak_bytes = 0;
     StageBackendMetricsV1 metrics{};
 };
@@ -1673,6 +1787,11 @@ StageOutput CudaStageBackend::execute(StageInput input) {
         throw std::runtime_error("CUDA backend received invalid chunk extent");
     ++state.metrics.execute_calls;
     state.metrics.execute_tokens += count;
+    const bool profile_decode =
+        state.decode_profile && count == 1 &&
+        input.txn.kind == TxnKind::kDecode;
+    if (profile_decode)
+        state.decode_profile->begin(state.workspace.stream);
 
     const bool first = state.provisional_epoch == 0;
     if (first) {
@@ -1721,6 +1840,7 @@ StageOutput CudaStageBackend::execute(StageInput input) {
         throw std::runtime_error(
             "CUDA backend chunk is not the next provisional range");
     }
+    if (profile_decode) state.profile_mark("state_begin");
 
     if (state.options.stage == Stage::kStage1) {
         std::string error;
@@ -1776,6 +1896,13 @@ StageOutput CudaStageBackend::execute(StageInput input) {
                 state.workspace.boundary,
                 static_cast<std::size_t>(count) * kQ38HyperWidth,
                 state.workspace.stream);
+            if (profile_decode) {
+                state.profile_mark("boundary");
+                state.decode_profile->finish(
+                    state.options.stage,
+                    input.txn.base_target + input.chunk_offset,
+                    state.workspace.stream);
+            }
             frame.ring_slot = result.boundary.lease->slot();
             frame.payload_checksum = result.boundary.payload_checksum();
             result.state_commit_count = state.provisional_processed;
@@ -1799,8 +1926,14 @@ StageOutput CudaStageBackend::execute(StageInput input) {
                                   state.workspace.stream),
                   "cudaMemcpyAsync(final logits)");
         }
+        if (profile_decode) state.profile_mark("result_copy");
         check(cudaStreamSynchronize(state.workspace.stream),
               "cudaStreamSynchronize(stage1 execute)");
+        if (profile_decode)
+            state.decode_profile->finish(
+                state.options.stage,
+                input.txn.base_target + input.chunk_offset,
+                state.workspace.stream);
         std::uint32_t accepted = count;
         if (input.txn.kind == TxnKind::kSpeculative) {
             if (!first || input.chunk_offset != 0 || !input.final_chunk)

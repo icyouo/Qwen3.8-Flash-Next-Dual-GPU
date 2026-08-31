@@ -6,12 +6,29 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
 namespace q38 {
 
 namespace {
+
+constexpr int kWarpSize = 32;
+constexpr int kDecodeWarpsPerBlock = 8;
+constexpr int kDecodeThreads = kWarpSize * kDecodeWarpsPerBlock;
+constexpr std::uint32_t kQuantGroupSize = 128;
+
+bool optimized_decode_moe_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("Q38_CUDA_DECODE_MOE");
+        return !value || (std::strcmp(value, "scalar") != 0 &&
+                          std::strcmp(value, "0") != 0 &&
+                          std::strcmp(value, "false") != 0);
+    }();
+    return enabled;
+}
 
 void check(cudaError_t status, const char* operation) {
     if (status != cudaSuccess)
@@ -75,6 +92,135 @@ __device__ float quant_weight(int format, const void* data,
     int quantized = (local & 1) ? packed >> 4 : packed & 0x0f;
     if (quantized >= 8) quantized -= 16;
     return static_cast<float>(quantized) * scale;
+}
+
+__device__ __forceinline__ int sign_extend_int4(unsigned value) {
+    return static_cast<int>(value) - ((value & 0x8u) ? 16 : 0);
+}
+
+template <int WeightBits>
+__device__ __forceinline__ float quantized_row_dot_warp(
+    const void* data, const std::uint16_t* scales,
+    std::uint64_t matrix_elements, std::uint64_t matrix_scale_elements,
+    std::uint32_t columns, std::int32_t expert, std::uint32_t row,
+    const std::uint16_t* input) {
+    const auto lane = threadIdx.x & (kWarpSize - 1);
+    const auto groups = columns / kQuantGroupSize;
+    float sum = 0.0f;
+    for (std::uint32_t group = 0; group < groups; ++group) {
+        float scale = 0.0f;
+        if (lane == 0)
+            scale = load_bf16(
+                scales, static_cast<std::uint64_t>(expert) *
+                            matrix_scale_elements +
+                            static_cast<std::uint64_t>(row) * groups + group);
+        scale = __shfl_sync(0xffffffffu, scale, 0);
+
+        const auto column = group * kQuantGroupSize + lane * 4;
+        const float a0 = load_bf16(input, column);
+        const float a1 = load_bf16(input, column + 1);
+        const float a2 = load_bf16(input, column + 2);
+        const float a3 = load_bf16(input, column + 3);
+        const auto local = static_cast<std::uint64_t>(row) * columns + column;
+        float dot = 0.0f;
+        if constexpr (WeightBits == 8) {
+            const auto* weights = static_cast<const std::int8_t*>(data) +
+                                  static_cast<std::uint64_t>(expert) *
+                                      matrix_elements +
+                                  local;
+            const auto packed = *reinterpret_cast<const char4*>(weights);
+            dot = a0 * static_cast<float>(packed.x) +
+                  a1 * static_cast<float>(packed.y) +
+                  a2 * static_cast<float>(packed.z) +
+                  a3 * static_cast<float>(packed.w);
+        } else {
+            const auto* weights = static_cast<const std::uint8_t*>(data) +
+                                  static_cast<std::uint64_t>(expert) *
+                                      (matrix_elements / 2) +
+                                  (local >> 1);
+            const auto packed =
+                *reinterpret_cast<const std::uint16_t*>(weights);
+            dot = a0 * static_cast<float>(sign_extend_int4(packed & 0x0fu)) +
+                  a1 * static_cast<float>(
+                           sign_extend_int4((packed >> 4) & 0x0fu)) +
+                  a2 * static_cast<float>(
+                           sign_extend_int4((packed >> 8) & 0x0fu)) +
+                  a3 * static_cast<float>(
+                           sign_extend_int4((packed >> 12) & 0x0fu));
+        }
+        sum = fmaf(dot, scale, sum);
+    }
+    return warp_sum(sum);
+}
+
+template <int WeightBits>
+__global__ void expert_gate_up_decode_kernel(
+    const void* data, const std::uint16_t* scales,
+    const std::uint16_t* hidden, const std::int32_t* expert_ids,
+    std::uint32_t top_k, std::uint16_t* output) {
+    constexpr std::uint32_t rows = 2 * kQ38MoeIntermediate;
+    constexpr std::uint32_t columns = kQ38HiddenWidth;
+    extern __shared__ std::uint16_t cached_hidden[];
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += blockDim.x)
+        cached_hidden[column] = hidden[column];
+    __syncthreads();
+
+    const auto warp = threadIdx.x / kWarpSize;
+    const auto lane = threadIdx.x & (kWarpSize - 1);
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) *
+                         kDecodeWarpsPerBlock +
+                     warp;
+    const auto route = static_cast<std::uint32_t>(blockIdx.y);
+    if (row >= rows || route >= top_k) return;
+    const auto expert = expert_ids[route];
+    if (expert < 0 || expert >= static_cast<std::int32_t>(kQ38MoeExperts)) {
+        if (lane == 0) store_bf16(output, route * rows + row, 0.0f);
+        return;
+    }
+    const auto sum = quantized_row_dot_warp<WeightBits>(
+        data, scales, static_cast<std::uint64_t>(rows) * columns,
+        static_cast<std::uint64_t>(rows) * (columns / kQuantGroupSize),
+        columns, expert, row, cached_hidden);
+    if (lane == 0) store_bf16(output, route * rows + row, sum);
+}
+
+template <int WeightBits>
+__global__ void expert_down_decode_kernel(
+    const void* data, const std::uint16_t* scales,
+    const std::uint16_t* activated, const std::int32_t* expert_ids,
+    const float* expert_weights, std::uint32_t top_k,
+    std::uint16_t* routed_output) {
+    constexpr std::uint32_t rows = kQ38HiddenWidth;
+    constexpr std::uint32_t columns = kQ38MoeIntermediate;
+    extern __shared__ std::uint16_t cached_activated[];
+    const auto warp = threadIdx.x / kWarpSize;
+    const auto lane = threadIdx.x & (kWarpSize - 1);
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) *
+                         kDecodeWarpsPerBlock +
+                     warp;
+    float total = 0.0f;
+    for (std::uint32_t route = 0; route < top_k; ++route) {
+        const auto* route_input =
+            activated + static_cast<std::uint64_t>(route) * columns;
+        for (std::uint32_t column = threadIdx.x; column < columns;
+             column += blockDim.x)
+            cached_activated[column] = route_input[column];
+        __syncthreads();
+        const auto expert = expert_ids[route];
+        if (row < rows && expert >= 0 &&
+            expert < static_cast<std::int32_t>(kQ38MoeExperts)) {
+            const auto sum = quantized_row_dot_warp<WeightBits>(
+                data, scales, static_cast<std::uint64_t>(rows) * columns,
+                static_cast<std::uint64_t>(rows) *
+                    (columns / kQuantGroupSize),
+                columns, expert, row, cached_activated);
+            if (lane == 0) total += sum * expert_weights[route];
+        }
+        __syncthreads();
+    }
+    if (row < rows && lane == 0)
+        store_bf16(routed_output, row, total);
 }
 
 __global__ void expert_gate_up_kernel(
@@ -206,30 +352,83 @@ void cuda_moe_routed_bf16(
         throw std::invalid_argument("routed MoE chunk exceeds CUDA grid");
     select_device(device);
     const auto routes = static_cast<std::uint32_t>(tokens * top_k);
+    const auto stream_value = reinterpret_cast<cudaStream_t>(stream);
+    if (tokens == 1 && optimized_decode_moe_enabled()) {
+        const auto gate_blocks =
+            (2 * kQ38MoeIntermediate + kDecodeWarpsPerBlock - 1) /
+            kDecodeWarpsPerBlock;
+        const dim3 gate_grid(gate_blocks, top_k);
+        const auto hidden_shared_bytes =
+            static_cast<std::size_t>(kQ38HiddenWidth) *
+            sizeof(std::uint16_t);
+        if (gate_up_experts.descriptor->format ==
+            DeviceWeightFormatV1::kW8A16SymG128) {
+            expert_gate_up_decode_kernel<8>
+                <<<gate_grid, kDecodeThreads, hidden_shared_bytes,
+                   stream_value>>>(
+                    gate_up_experts.data,
+                    static_cast<const std::uint16_t*>(gate_up_experts.scales),
+                    hidden, expert_ids, top_k, gate_up_scratch);
+        } else {
+            expert_gate_up_decode_kernel<4>
+                <<<gate_grid, kDecodeThreads, hidden_shared_bytes,
+                   stream_value>>>(
+                    gate_up_experts.data,
+                    static_cast<const std::uint16_t*>(gate_up_experts.scales),
+                    hidden, expert_ids, top_k, gate_up_scratch);
+        }
+        expert_silu_kernel<<<top_k, 256, 0, stream_value>>>(
+            gate_up_scratch, activated_scratch, top_k);
+
+        const auto down_blocks =
+            (kQ38HiddenWidth + kDecodeWarpsPerBlock - 1) /
+            kDecodeWarpsPerBlock;
+        const auto down_shared_bytes =
+            static_cast<std::size_t>(kQ38MoeIntermediate) *
+            sizeof(std::uint16_t);
+        if (down_experts.descriptor->format ==
+            DeviceWeightFormatV1::kW8A16SymG128) {
+            expert_down_decode_kernel<8>
+                <<<down_blocks, kDecodeThreads, down_shared_bytes,
+                   stream_value>>>(
+                    down_experts.data,
+                    static_cast<const std::uint16_t*>(down_experts.scales),
+                    activated_scratch, expert_ids, expert_weights, top_k,
+                    routed_output);
+        } else {
+            expert_down_decode_kernel<4>
+                <<<down_blocks, kDecodeThreads, down_shared_bytes,
+                   stream_value>>>(
+                    down_experts.data,
+                    static_cast<const std::uint16_t*>(down_experts.scales),
+                    activated_scratch, expert_ids, expert_weights, top_k,
+                    routed_output);
+        }
+        check(cudaPeekAtLastError(), "decode routed MoE kernels");
+        return;
+    }
     const auto accumulation_elements =
         static_cast<std::uint64_t>(tokens) * kQ38HiddenWidth;
     check(cudaMemsetAsync(accumulation_scratch, 0,
                           accumulation_elements * sizeof(float),
-                          reinterpret_cast<cudaStream_t>(stream)),
+                          stream_value),
           "cudaMemsetAsync(MoE accumulation)");
     expert_gate_up_kernel<<<dim3(2 * kQ38MoeIntermediate, routes), 256, 0,
-                              reinterpret_cast<cudaStream_t>(stream)>>>(
+                              stream_value>>>(
         static_cast<int>(gate_up_experts.descriptor->format),
         gate_up_experts.data,
         static_cast<const std::uint16_t*>(gate_up_experts.scales), hidden,
         expert_ids, top_k, gate_up_scratch);
-    expert_silu_kernel<<<routes, 256, 0,
-                         reinterpret_cast<cudaStream_t>(stream)>>>(
+    expert_silu_kernel<<<routes, 256, 0, stream_value>>>(
         gate_up_scratch, activated_scratch, routes);
     expert_down_kernel<<<dim3(kQ38HiddenWidth, routes), 256, 0,
-                           reinterpret_cast<cudaStream_t>(stream)>>>(
+                           stream_value>>>(
         static_cast<int>(down_experts.descriptor->format), down_experts.data,
         static_cast<const std::uint16_t*>(down_experts.scales),
         activated_scratch, expert_ids, expert_weights, top_k,
         accumulation_scratch);
     const auto blocks = static_cast<unsigned>((accumulation_elements + 255) / 256);
-    float_to_bf16_kernel<<<blocks, 256, 0,
-                           reinterpret_cast<cudaStream_t>(stream)>>>(
+    float_to_bf16_kernel<<<blocks, 256, 0, stream_value>>>(
         accumulation_scratch, routed_output, accumulation_elements);
     check(cudaPeekAtLastError(), "routed MoE kernels");
 }

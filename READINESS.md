@@ -26,51 +26,44 @@ Client cancel and deadline remain recoverable transaction outcomes.
 
 Executed on Ubuntu `p3-ultra`, not on the macOS editing workspace:
 
-- `make -j2 verify PYTHON=.venv/bin/python`: C++ runtime tests passed,
-  41 Python tests passed. The initial `sm_86` CUDA compile was superseded by
-  the real boards reporting compute capability 8.0; production now targets
-  `sm_80` and requires the real kernel fixtures below.
-- `make -j1 cuda-test`: the expanded binary compiled; execution correctly
-  skipped while no NVIDIA GPU was attached. When a GPU is present it covers
-  transport checksum/D2H/H2D corruption rejection plus GDN, PLE and QSA fixtures.
-- Unix executor socket → reference sidecar → HTTP create/execute/metrics passed
-  with zero failures and metrics schema hash `0x7133386d65740136`.
-- The final mock transport/state gate reached exactly `canonical=262144` and
-  `target=stage0=stage1=262143`, publishing 64 tokens with zero failure or
-  rollback. Evidence on Ubuntu:
-  `/home/icy/src/q38-runtime/out/mock-strict-262080-plus-64-checksummed.json`,
-  SHA-256 `0ccc0790bfaf8ae828a59b75cfbae7b1fb4c459872dd18125175cc7020b28bcc`.
+- Both 64 GiB CMP 170HX boards were active as SM80 devices under driver
+  610.43.02 and CUDA 13.1.  Validation used the verified 128,193,992,032-byte
+  cut-25 artifact in a separate source/identity/journal directory.
+- C++ runtime tests passed; Python tests passed 42/42 with NumPy; CUDA
+  compile-check, full runtime build, and real GPU fixtures passed.  Fixtures now
+  cover W4/W8 production-layout decode GEMV, W4/W8 routed MoE, QSA parity, and
+  stable 512-expert top-k including tied logits.
+- Final short 8+64 plain decode: 31.76 tok/s, ITL p50 31.32 ms, stage p50
+  13.25 + 13.10 ms.
+- Final 8195+32 plain decode: 22.84 tok/s, ITL p50 43.87 ms, stage p50
+  19.08 + 19.21 ms.  The original 8K native baseline was 11.4 tok/s.
+- Both end-to-end runs reported zero executor failure/rollback/cancel/deadline,
+  CUDA allocation failure, boundary wait, or PLE read error.  The ordered
+  parallel top-k reproduced the scalar reference's initial short greedy tokens.
+- Raw build, fixture, profile, fallback A/B and end-to-end evidence is archived
+  beside this worktree in `validation-native-decode/VALIDATION.md`.
 
-The mock gate proves transport, RPC, transaction, frontier and bounded-context
-behavior. It does **not** prove CUDA numerical correctness, checkpoint parity,
-GPU memory fit, PLE SSD latency, or throughput.
+These synthetic-token runs prove real CUDA state mechanics and performance, but
+they do **not** by themselves prove model quality or the strict 262K release
+gate.
 
-## First real-hardware run order
+## Remaining real-hardware run order
 
 Do not skip directly to the 262K production claim.
 
-1. Attach both CMP 170HX boards and record `nvidia-smi -q`, `nvidia-smi topo -m`,
-   PCIe link state, driver/CUDA versions and P2P-disabled behavior.
-2. Run `make -j1 cuda-test`. All GPU fixtures, including transport checksum
-   corruption rejection, must execute rather than report `skipped (no GPU)`.
-3. Wait for the streaming artifact job to atomically publish `READY.json`, then
-   run `q38_launch.py --dry-run`. Any digest, identity, tensor census, PLE direct
-   lane or memory preflight failure is a hard stop.
-4. Launch the default plain/M1 lane without `--enable-mtp`. First run frozen
-   short numerical fixtures, then fresh executors at 8K, 32K, 128K and strict
-   262K. For the direct-token gate, the corresponding prompt lengths with 64
-   generated tokens are 8,128; 32,704; 131,008; and 262,080.
-5. At every level inspect stage/device/host/PLE metrics, finite logits, exact
+1. Run tokenizer-produced/frozen golden prompts and compare logits/tokens to a
+   trusted reference before treating the kernel parity tests as model quality.
+2. Run fresh executors at 32K, 128K and strict 262K. For the direct-token gate,
+   the corresponding prompt lengths with 64 generated tokens are 32,704;
+   131,008; and 262,080.
+3. At every level inspect stage/device/host/PLE metrics, finite logits, exact
    prefix extension, cancel/timeout/duplicate/fault rollback, and memory reserve.
    Use tokenizer-produced marker inputs or frozen golden fixtures for model
    correctness; synthetic tokens are only a state/transport stress input.
-6. Run near-256K suffix continuation from an existing session and prove the old
+4. Run near-256K suffix continuation from an existing session and prove the old
    prefix is not replayed.
-7. Only after the plain lane passes may `--enable-mtp` be tested. The pinned
+5. Only after the plain lane passes may `--enable-mtp` be tested. The pinned
    official checkpoint currently permits one draft token (width-2 target
    verification); wider requests intentionally fail closed.
-8. Performance/release claims still require the design document's cold/warm PLE,
+6. Performance/release claims still require the design document's cold/warm PLE,
    latency percentiles, memory floors, growing-turn and soak gates.
-
-The runtime implementation is ready for this sequence once the two external
-prerequisites exist: both GPUs and the verified production artifact.

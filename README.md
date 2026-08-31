@@ -1,8 +1,17 @@
 # q38-runtime
 
-Qwen3.8-Flash-Next 专用运行时，目标机器是两张无 P2P 的 64 GiB CMP 170HX。它不是
-vLLM/SGLang fork：模型数据面、双卡调度、状态事务、PLE、artifact 和 CUDA kernels
-都在本仓库；SGLang 或参考 sidecar 只作为可替换的 API/tokenizer 前门。
+面向 **Qwen3.8-Flash-Next** 和双 64 GiB CMP 170HX（SM80）的专用长上下文推理
+运行时。目标是在两张没有 GPU P2P、单卡仅 PCIe 2.0 x4 的 Ampere 卡上完整容纳模型，
+并让一个会话可以持续追加到 256K context，而不重新计算旧 prefix。
+
+本项目不是 vLLM、SGLang 或 llama.cpp 的 fork。模型数据面、离线量化、双卡调度、
+KV/循环状态、事务、SSD-PLE、artifact 格式及 CUDA kernels 均由本仓库实现。HTTP、
+tokenizer、chat template 和 SSE 是可替换的控制面；SGLang 不是运行时依赖。
+
+> **项目状态：research preview。** 双卡真机已建立可重复的 8K decode 性能基线，
+> 但 tokenizer golden parity、32K/128K/严格 256K、MTP 和长时间稳定性门禁尚未全部完成。
+> 当前结果不能作为模型质量或完整 256K 发布声明。权重不随本仓库分发，使用者须遵守
+> 上游模型许可。
 
 ```text
 OpenAI / deep-session client
@@ -18,6 +27,60 @@ GPU0 layers 0..24 + SSD-PLE ── BF16 4H host ring ── GPU1 layers 25..47 +
 
 严格产品门禁是一个 262,080-token prompt 加 64 个 committed generation tokens，最终
 总长度正好 262,144。后续请求只能追加 exact suffix，旧 prefix 不会重新 prefill。
+
+## 当前基线
+
+以下数据在 Ubuntu `p3-ultra` 上实测，使用两张 64 GiB CMP 170HX、驱动
+610.43.02、CUDA 13.1、`sm_80`、cut-25、自有 mixed W4/W8 artifact、batch 1、
+plain decode（MTP 关闭）。两个 stage 对单 token 串行执行；表中的 stage 数值为各自
+p50，并不表示两卡能够把同一个 token 并行算完。
+
+| 运行 | 上下文与输出 | stage 0 | stage 1 + head | ITL p50 | 实测 decode |
+|---|---:|---:|---:|---:|---:|
+| q38 当前基线 | 8,195 + 32 | 19.08 ms | 19.21 ms | 43.87 ms | **22.84 tok/s** |
+| q38 当前基线 | 8 + 64 | 13.25 ms | 13.10 ms | 31.32 ms | **31.76 tok/s** |
+| q38 优化前 | 约 8K | 40.87 ms | 40.92 ms | 87.03 ms | 约 11.4 tok/s |
+| 旧 DS4 参考 | 约 8K | 25.5 ms（0–23） | 26.0 ms（24–47 + head） | 约 51.5 ms | 约 19.4 tok/s |
+
+当前 8K stage 合计为 38.29 ms，对应纯 GPU stage 上限约 26.1 tok/s；端到端 p50
+为 43.87 ms。其差值包含 RPC、事务提交以及启用 snapshot journal 时每个成功写请求的
+`fdatasync`。DS4 行仅是同一机器上的历史工程参考，并非相同 artifact、量化和服务路径的
+严格等价 A/B。
+
+这些基准使用合成 token 验证真实 CUDA 状态机、transport 和性能，不代表文本质量。
+原始构建、fixture、profile、fallback A/B 和端到端 JSON 见
+[`READINESS.md`](READINESS.md) 记录的 evidence 目录。
+
+## 模型与量化格式
+
+artifact 必须由固定 commit 的官方 BF16 checkpoint 生成：
+
+```text
+model          Qwen/Qwen3.8-Flash-Next
+source commit  de4b8e4d43b917e7706784d8bb445c9af86a3540
+policy         Q38_AMPERE_QUANT_POLICY_V5
+stage split    GPU0: layers 0..24; GPU1: layers 25..47 + LM head/MTP
+context limit  262,144 tokens
+```
+
+这不是 NVFP4、AWQ、GPTQ 或 GGUF。compiler 从官方 BF16/F32/I64 tensor 直接生成
+Q38 的 stage-owned artifact；量化权重在运行时不会先整体反量化，也不会 repack 成另一种
+框架格式。
+
+| 张量类别 | artifact 格式 | 运行精度/说明 |
+|---|---|---|
+| 第 2–45 层 routed expert gate/up/down | symmetric **W4A16 group-128** | batch-1 专用 W4 GEMV/MoE kernel，BF16 activation |
+| 第 0/1/46/47 层 routed experts | symmetric **W8A16 group-128** | 质量更敏感的边缘 experts |
+| always-active matrices，包括 embedding、LM head、attention/GDN projections、shared expert | symmetric **W8A16 group-128** | BF16 activation；每组 scale 以 BF16 保存 |
+| MTP matrices 与 routed experts | symmetric **W8A16 group-128** | MTP 默认不加载，需显式启用 |
+| SSD-PLE embedding table | row-scaled **FP8 E4M3FN** | 每行一个 BF16 scale；表位于 SSD，不整表常驻 GPU/DRAM |
+| router、norm、gate、hyper-connection、卷积与其他关键控制张量 | **preserve** | 保留上游 BF16/F32/I64 dtype |
+| main QSA K/V 与 compressed index | **BF16** | 256K 容量基线；尚未启用 INT8 KV |
+| GDN recurrent/累加状态 | **FP32** | 避免长序列状态误差累积 |
+| vision tensors | **skip** | 当前是 text-only runtime |
+
+具体匹配规则以 [`tools/q38_quant_policy.py`](tools/q38_quant_policy.py) 为唯一事实来源；
+policy digest 会进入 artifact/session identity，策略不匹配时启动器 fail closed。
 
 ## 已实现的关键合同
 
@@ -37,7 +100,7 @@ rollback。这样 OOM、illegal access、Xid 或 transport corruption 后不会�
 state 上继续服务。
 
 架构与性能门槛见
-[`../docs/qwen38-p3-ultra-dual-170hx-256k-optimal-runtime.md`](../docs/qwen38-p3-ultra-dual-170hx-256k-optimal-runtime.md)。
+[`docs/qwen38-p3-ultra-dual-170hx-256k-optimal-runtime.md`](docs/qwen38-p3-ultra-dual-170hx-256k-optimal-runtime.md)。
 代码证据、未声明项和首轮真机顺序见 [`READINESS.md`](READINESS.md)。
 
 ## Ubuntu 构建与验证
@@ -57,7 +120,18 @@ GPU 接通后再运行 kernel fixture：
 
 ```sh
 make -j1 cuda-test
+make -j1 cuda-bench
 ```
+
+batch-1 decode 直接消费生产 artifact 的 BF16 activation 与 group-128 W4/W8
+布局。通用矩阵路径使用 warp-per-row GEMV；routed MoE 另有 top-10 gate/up、SiLU
+和 fused down/reduce 路径；512-expert router 使用稳定 tie-break 的并行 bitonic top-k。
+QSA softmax 概率只在 FP32 score scratch 中计算一次，再由 256 个 value 维度复用。
+这些路径都不会把单行 decode 填充成 16 行 WMMA。真机 A/B 或紧急回滚可分别设置
+`Q38_CUDA_DECODE_GEMV=scalar`、`Q38_CUDA_DECODE_MOE=scalar` 和
+`Q38_CUDA_DECODE_TOPK=scalar`；默认启用优化路径。`cuda-bench` 同时输出生产形状的
+GEMV 新旧对比和 routed-MoE 新旧对比。设置 `Q38_CUDA_PROFILE_DECODE=1` 可输出按
+hyper/GDN/QSA/MoE 子路径聚合的 CUDA-event decode profile；默认完全不创建 event。
 
 `make verify PYTHON=.venv/bin/python` 可执行 CPU、Python 和 CUDA 编译门禁。所有测试与
 运行时都应在 Ubuntu 主机执行；macOS 工作区只用于编辑/同步源码。
@@ -69,7 +143,7 @@ python3 tools/q38_hf_fetch.py \
   --repo Qwen/Qwen3.8-Flash-Next \
   --revision de4b8e4d43b917e7706784d8bb445c9af86a3540 \
   --expected-commit de4b8e4d43b917e7706784d8bb445c9af86a3540 \
-  --output /home/icy/models/Qwen3.8-Flash-Next-official-source \
+  --output /data/models/Qwen3.8-Flash-Next-official-source \
   --jobs 4 \
   --manifest-only
 ```
@@ -83,9 +157,9 @@ artifact 同时占满本机 468 GB 根盘。
 
 ```sh
 .venv/bin/python tools/q38_prepare_artifact.py \
-  --source /home/icy/models/Qwen3.8-Flash-Next-official-source \
-  --metadata /home/icy/models/Qwen3.8-Flash-Next-official-metadata \
-  --output /home/icy/models/Qwen3.8-Flash-Next-q38-cut25 \
+  --source /data/models/Qwen3.8-Flash-Next-official-source \
+  --metadata /data/models/Qwen3.8-Flash-Next-official-metadata \
+  --output /data/models/Qwen3.8-Flash-Next-q38-cut25 \
   --session-hash 0x380025 \
   --cut 25 \
   --jobs 1 \
@@ -110,10 +184,10 @@ census、PLE layout、identity 全部通过后才原子发布 `READY.json`。
 
 ```sh
 .venv/bin/python tools/q38_launch.py \
-  --ready /home/icy/models/Qwen3.8-Flash-Next-q38-cut25/READY.json \
+  --ready /data/models/Qwen3.8-Flash-Next-q38-cut25/READY.json \
   --runtime build/q38-cuda-runtime \
   --socket /tmp/q38-executor.sock \
-  --snapshot /home/icy/q38-state/session.q38j \
+  --snapshot /var/lib/q38/session.q38j \
   --host 127.0.0.1 \
   --port 30000
 ```
@@ -204,3 +278,8 @@ executor 已启动后：
 CPU/mock 的严格门禁证明协议、事务和 262K 容量路径；它不代表真实模型速度或数值正确性。
 真实发布仍必须在两张 170HX 与最终 artifact 上依次通过 8K、32K、128K、262K+64、
 near-256K suffix-only、reference parity、显存/主存门槛和 12 小时 fault-injection soak。
+
+## License
+
+运行时代码以 [MIT License](LICENSE) 发布。模型权重不属于本许可证；下载、转换和使用
+Qwen3.8-Flash-Next 时仍须遵守上游模型仓库的许可条款。
