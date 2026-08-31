@@ -15,7 +15,7 @@
 OpenAI-compatible client
           │
           ▼
-SGLang control plane（可替换）
+自研 q38 control plane
 API / tokenizer / template / parser / streaming / cancel
           │  ExecutorRPC v1：请求、token、txn、commit event
           ▼
@@ -26,15 +26,15 @@ API / tokenizer / template / parser / streaming / cancel
       └──────── 一次 host-staged 4H boundary ────────┘
 ```
 
-这里的核心不是 SGLang fork。**模型数据面、调度、状态、双卡传输、PLE、artifact 和 hot kernels 都由我们自研。** SGLang 只提供成熟且低性能敏感的服务入口；如果它不合适，可换成 vLLM frontend 或 Rust/C++ gateway，而无需改 executor。
+**模型数据面、调度、状态、双卡传输、PLE、artifact、hot kernels 和服务控制面都由我们自研。** `q38_sidecar.py` 通过稳定的 ExecutorRPC 提供 token-native 与 OpenAI-compatible HTTP/SSE 接口；官方 tokenizer/chat template 由可选 codec 加载，不进入 executor ABI。
 
-从数据面看，这是独立 model executor；从完整产品看，这是成熟控制面与专用 executor 的混合架构。
+从数据面到控制面，这是一个自包含的专用运行时；控制面与 executor 仍保持进程和 ABI 隔离，便于独立演进与故障隔离。
 
 ## 2. 独立复核结论
 
 第二轮 Pro 推荐的主路线成立，但采用以下本地限定：
 
-1. **SGLang 是可替换 sidecar/control plane，不是 runtime base。** 首版不把私有 scheduler hook 写进核心 ABI；优先使用 UDS 或共享内存 ring 的稳定 adapter。
+1. **q38 control plane 是自研服务入口。** 它只消费 committed token events，通过 UDS ExecutorRPC 与数据面解耦，不把 HTTP、tokenizer 或 parser 状态写进 executor ABI。
 2. **连续双阶段保留，generic PP2 撤销。** 每次 target pass 只跨一次边界，但不继承 rank、NCCL、通用 PP scheduler 或两进程状态模型。
 3. **单 native process 是目标 executor 合同。** 每卡独立 worker/thread 和 CUDA context；任一卡或 epoch 出错，整个 executor fail closed。
 4. **24/24 只是首个 profile seed。** 23/25、24/24、25/23、26/22 必须由最终 artifact 字节账本、stage profile 和显存余量共同裁决。
@@ -53,7 +53,7 @@ API / tokenizer / template / parser / streaming / cancel
 
 ### 3.2 深 fork 最终仍等于重做数据面
 
-若基于 vLLM 或 SGLang 深 fork，仍需重写：
+若基于通用推理框架深 fork，仍需重写：
 
 - QSA、GDN、PLE、MTP、RNG 的统一 commit/rollback；
 - 无 P2P 的单机双卡传输；
@@ -85,10 +85,10 @@ API / tokenizer / template / parser / streaming / cancel
 
 | 类别 | 内容 |
 |---|---|
-| 直接复用 | SGLang API/tokenizer/template/parser/detokenizer；CUDA/cuBLASLt；CUTLASS；通过 ABI 包装的 Marlin、FlashAttention/FlashInfer 适用算子；safetensors；Linux `io_uring` |
-| 必须自研 | artifact compiler、stage planner、单进程双卡 executor、四类 execution lane、无 P2P transport、统一状态事务、SSD-PLE provider、durable snapshot、端到端 trace |
+| 直接复用 | 官方 tokenizer/template 数据与可选 `transformers` codec；CUDA/cuBLASLt；CUTLASS；通过 ABI 包装的 Marlin、FlashAttention/FlashInfer 适用算子；safetensors；Linux `io_uring` |
+| 必须自研 | HTTP/SSE control plane、artifact compiler、stage planner、单进程双卡 executor、四类 execution lane、无 P2P transport、统一状态事务、SSD-PLE provider、durable snapshot、端到端 trace |
 | 按结果选择 | MoE/GDN/QSA/PLE/HC/LM-head kernels：可靠上游实现与自研实现使用同一 fixture 和 microbenchmark 竞赛 |
-| 仅作 oracle/reference | vLLM/SGLang Qwen model、state、MTP、PLE 和当前 ds4；不继承其生产 scheduler/cache/process ABI |
+| 仅作 oracle/reference | 上游 Qwen model/state/MTP/PLE 实现和当前 ds4；不继承其生产 scheduler/cache/process ABI |
 
 原则：自研 kernel 若没有至少 5%–10% 的端到端或集成收益，就 vendor 更可靠的实现；目标是最优 runtime，不是追求“自研率”。
 
@@ -175,7 +175,7 @@ Production baseline 是 4 KiB arithmetic page（25 × 160 B rows + 96 B padding�
 1. 冻结 executor/artifact/state ABI，升窗 32K → 128K → strict 262K；
 2. 引入最终 mixed artifact 与胜出的 SM80 kernels；
 3. 加入 adaptive MTP 和 append-only durable snapshots；
-4. 最后接入 SGLang control plane，要求吞吐回归 ≤2%，且它只消费 committed token events。
+4. 接入并门禁自研 q38 control plane，要求吞吐回归 ≤2%，且它只消费 committed token events。
 
 ## 11. Release gates
 
@@ -196,4 +196,4 @@ Production baseline 是 4 KiB arithmetic page（25 × 160 B rows + 96 B padding�
 - 路线比较：`.artifacts/gpt-pro/qwen38-170hx-256k-optimal-route/extracted/ROUTE_COMPARISON.md`
 - 本地验证：`.artifacts/gpt-pro/qwen38-170hx-256k-optimal-route/VALIDATION.md`
 
-最终责任结论：**我们要自研的是整个 Qwen3.8 数据面；SGLang 只是前门。** 先以直接 token 的 vertical slice 证明 executor，再接 serving。这样既不被当前 upstream 可实施性限制，也不会为了重造 API 层牺牲模型运行时的性能和正确性。
+最终责任结论：**Qwen3.8 数据面与服务控制面均由我们自研。** 先以直接 token 的 vertical slice 证明 executor，再由内置 q38 control plane 提供 serving；两者通过稳定 ExecutorRPC 解耦，控制面不能牺牲模型运行时的性能和正确性。

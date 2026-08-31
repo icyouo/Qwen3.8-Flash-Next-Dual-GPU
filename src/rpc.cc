@@ -29,7 +29,8 @@ namespace q38 {
 namespace {
 
 // One target transaction per writer request preserves retry and cancellation
-// atomicity. The SGLang scheduler batches requests, not semantic decode steps.
+// atomicity. The built-in control plane batches requests, not semantic decode
+// steps.
 constexpr std::uint32_t kMaximumStepsPerRequest = 1;
 constexpr std::uint32_t kMaximumDraftWidth = 64;
 constexpr std::uint32_t kMaximumTimeoutMs = 24u * 60u * 60u * 1000u;

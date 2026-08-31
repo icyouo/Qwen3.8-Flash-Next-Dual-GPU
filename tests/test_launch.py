@@ -127,7 +127,17 @@ class LaunchManifestTest(unittest.TestCase):
             self.assertIn("--identity", command)
             self.assertIn("99", command)
             self.assertIn("--sampling", command)
+            self.assertIn("--snapshot-journal", command)
             self.assertNotIn("--enable-mtp", command)
+            fast_command = runtime_command(
+                validated,
+                Path("/bin/true"),
+                Path("/tmp/q38.sock"),
+                None,
+                4096,
+                8,
+            )
+            self.assertNotIn("--snapshot-journal", fast_command)
             mtp_command = runtime_command(
                 validated,
                 Path("/bin/true"),

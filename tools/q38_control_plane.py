@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Stable control-plane adapter for the Q38 ExecutorRPC Unix socket.
+"""Built-in control-plane core for the Q38 ExecutorRPC Unix socket.
 
-The model data plane intentionally has no dependency on SGLang.  SGLang (or
-another serving frontend) can submit already-tokenized requests through this
-module and consume only committed token events.  The same core is used by the
-small OpenAI-compatible reference sidecar in q38_sidecar.py.
+The control plane accepts token-native requests, validates exact-prefix
+continuations, and consumes only committed token events.  q38_sidecar.py uses
+this core to provide the repository's OpenAI-compatible HTTP/SSE service.
 """
 
 from __future__ import annotations
@@ -538,14 +537,14 @@ class Q38ControlPlane:
 
 
 class HuggingFaceCodec:
-    """Optional reference codec; production SGLang may provide token IDs itself."""
+    """Optional tokenizer codec for the built-in text-request endpoint."""
 
     def __init__(self, model_path: str | Path) -> None:
         try:
             from transformers import AutoTokenizer
         except ImportError as error:
             raise RuntimeError(
-                "transformers is required for the reference OpenAI tokenizer path"
+                "transformers is required for the OpenAI-compatible tokenizer path"
             ) from error
         self.tokenizer = AutoTokenizer.from_pretrained(
             str(model_path), local_files_only=True, trust_remote_code=True

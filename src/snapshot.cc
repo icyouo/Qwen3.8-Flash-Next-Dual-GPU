@@ -139,6 +139,16 @@ struct SnapshotJournal::Impl {
         if (path.empty() || !validate_session_identity(identity, &error))
             throw std::invalid_argument("invalid snapshot journal identity/path");
         load();
+        descriptor = ::open(path.c_str(),
+                            O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                            S_IRUSR | S_IWUSR);
+        if (descriptor < 0)
+            throw std::system_error(errno, std::generic_category(),
+                                    "open snapshot journal for append");
+    }
+
+    ~Impl() {
+        if (descriptor >= 0) (void)::close(descriptor);
     }
 
     void load() {
@@ -211,6 +221,7 @@ struct SnapshotJournal::Impl {
     std::string path;
     SessionIdentityV1 identity{};
     StateSnapshotV1 current{};
+    int descriptor = -1;
     mutable std::mutex mutex;
 };
 
@@ -245,25 +256,13 @@ void SnapshotJournal::append(StateSnapshotV1 snapshot) {
     if (!validate_state_snapshot(snapshot, impl_->identity, &error))
         throw std::invalid_argument("cannot append invalid snapshot: " + error);
 
-    const int descriptor = ::open(impl_->path.c_str(),
-                                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
-                                  S_IRUSR | S_IWUSR);
-    if (descriptor < 0)
+    write_all(impl_->descriptor, &snapshot.header, sizeof(snapshot.header));
+    if (!suffix.empty())
+        write_all(impl_->descriptor, suffix.data(),
+                  suffix.size() * sizeof(std::int32_t));
+    if (::fdatasync(impl_->descriptor) != 0)
         throw std::system_error(errno, std::generic_category(),
-                                "open snapshot journal for append");
-    try {
-        write_all(descriptor, &snapshot.header, sizeof(snapshot.header));
-        if (!suffix.empty())
-            write_all(descriptor, suffix.data(),
-                      suffix.size() * sizeof(std::int32_t));
-        if (::fdatasync(descriptor) != 0)
-            throw std::system_error(errno, std::generic_category(),
-                                    "sync snapshot journal");
-    } catch (...) {
-        (void)::close(descriptor);
-        throw;
-    }
-    (void)::close(descriptor);
+                                "sync snapshot journal");
     snapshot.header.token_start = 0;
     snapshot.header.token_count = snapshot.canonical_tokens.size();
     snapshot.header.payload_bytes =

@@ -19,7 +19,9 @@ struct ExecutorOptions {
     std::uint64_t session_hash = 1;
     std::uint32_t hidden_width = 4 * 2560;
     std::uint32_t vocab_size = 248320;
-    std::uint32_t append_chunk_tokens = 4096;
+    // Matches the grouped-MMQ slab so stage 0 and stage 1 overlap across a
+    // request through the existing three-slot boundary ring.
+    std::uint32_t append_chunk_tokens = 512;
     std::uint32_t context_limit = 262144;
     // A production device backend cannot safely retry after CUDA, transport,
     // or device-state errors. CPU fixtures keep this false so rollback and

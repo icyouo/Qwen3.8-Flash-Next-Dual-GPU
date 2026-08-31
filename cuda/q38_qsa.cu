@@ -227,24 +227,33 @@ __global__ void qsa_attention_scores_kernel(
     const std::int32_t* selected, std::uint32_t selected_count,
     float* scores) {
     const auto head = blockIdx.x;
+    const auto warp = threadIdx.x >> 5;
+    const auto lane = threadIdx.x & 31;
+    constexpr std::uint32_t kWarpsPerBlock = 256 / 32;
     const auto kv_head = head / (kQ38QsaHeads / kQ38QsaKvHeads);
-    for (std::uint32_t selected_index = threadIdx.x;
-         selected_index < selected_count; selected_index += blockDim.x) {
+    const auto query_base = head * kQ38QsaHeadWidth;
+    for (std::uint32_t selected_index = warp;
+         selected_index < selected_count;
+         selected_index += kWarpsPerBlock) {
         const auto position = selected[selected_index];
+        const auto key_base =
+            (static_cast<std::uint64_t>(position) * kQ38QsaKvHeads +
+             kv_head) *
+            kQ38QsaHeadWidth;
         float dot = 0.0f;
-        for (std::uint32_t element = 0; element < kQ38QsaHeadWidth;
-             ++element) {
-            dot += bf16_load(query, head * kQ38QsaHeadWidth + element) *
-                   bf16_load(
-                       keys,
-                       (static_cast<std::uint64_t>(position) * kQ38QsaKvHeads +
-                        kv_head) *
-                               kQ38QsaHeadWidth +
-                           element);
-        }
-        scores[static_cast<std::uint64_t>(head) * selected_count +
-               selected_index] =
-            dot * rsqrtf(static_cast<float>(kQ38QsaHeadWidth));
+        // A warp cooperatively reads one selected token.  The former layout
+        // assigned one token to each lane, so lanes in a memory transaction
+        // were separated by an entire KV-token stride.  Lane-striped head
+        // dimensions turn both Q and K traffic into contiguous BF16 loads.
+        for (std::uint32_t element = lane; element < kQ38QsaHeadWidth;
+             element += 32)
+            dot += bf16_load(query, query_base + element) *
+                   bf16_load(keys, key_base + element);
+        dot = warp_sum(dot);
+        if (lane == 0)
+            scores[static_cast<std::uint64_t>(head) * selected_count +
+                   selected_index] =
+                dot * rsqrtf(static_cast<float>(kQ38QsaHeadWidth));
     }
 }
 
@@ -446,6 +455,9 @@ __global__ void qsa_attention_scores_prefill_kernel(
     float* scores) {
     const auto head = blockIdx.x;
     const auto token = blockIdx.y;
+    const auto warp = threadIdx.x >> 5;
+    const auto lane = threadIdx.x & 31;
+    constexpr std::uint32_t kWarpsPerBlock = 256 / 32;
     const auto position = first_position + token;
     const auto complete_blocks = (position + 1) / kQ38QsaBlockTokens;
     const auto selected_count =
@@ -462,22 +474,23 @@ __global__ void qsa_attention_scores_prefill_kernel(
     const auto score_base =
         (static_cast<std::uint64_t>(token) * kQ38QsaHeads + head) *
         kQ38QsaMaximumSelected;
-    for (std::uint32_t selected_index = threadIdx.x;
-         selected_index < selected_count; selected_index += blockDim.x) {
+    for (std::uint32_t selected_index = warp;
+         selected_index < selected_count;
+         selected_index += kWarpsPerBlock) {
         const auto source_position = token_selected[selected_index];
+        const auto key_base =
+            (static_cast<std::uint64_t>(source_position) * kQ38QsaKvHeads +
+             kv_head) *
+            kQ38QsaHeadWidth;
         float dot = 0.0f;
-        for (std::uint32_t element = 0; element < kQ38QsaHeadWidth;
-             ++element)
+        for (std::uint32_t element = lane; element < kQ38QsaHeadWidth;
+             element += 32)
             dot += bf16_load(query, query_base + element) *
-                   bf16_load(
-                       keys,
-                       (static_cast<std::uint64_t>(source_position) *
-                            kQ38QsaKvHeads +
-                        kv_head) *
-                               kQ38QsaHeadWidth +
-                           element);
-        scores[score_base + selected_index] =
-            dot * rsqrtf(static_cast<float>(kQ38QsaHeadWidth));
+                   bf16_load(keys, key_base + element);
+        dot = warp_sum(dot);
+        if (lane == 0)
+            scores[score_base + selected_index] =
+                dot * rsqrtf(static_cast<float>(kQ38QsaHeadWidth));
     }
 }
 

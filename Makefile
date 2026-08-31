@@ -23,7 +23,7 @@ CUDA_TEST_BIN := $(BUILD_DIR)/q38_cuda_kernel_tests
 CUDA_DECODE_BENCH_BIN := $(BUILD_DIR)/q38_decode_bench
 CUDA_MOE_BENCH_BIN := $(BUILD_DIR)/q38_moe_bench
 CUDA_COMPAT_STAMP := $(BUILD_DIR)/cuda-compat/.stamp
-CUDA_RUNTIME_SOURCES := cuda/cuda_transport.cu cuda/cuda_weights.cu cuda/q38_kernels.cu cuda/q38_gdn.cu cuda/q38_qsa.cu cuda/q38_hyper.cu cuda/q38_moe.cu cuda/q38_ple.cu cuda/cuda_backend.cu
+CUDA_RUNTIME_SOURCES := cuda/cuda_transport.cu cuda/cuda_weights.cu cuda/q38_kernels.cu cuda/q38_gdn.cu cuda/q38_qsa.cu cuda/q38_hyper.cu cuda/q38_moe.cu cuda/q38_moe_prefill.cu cuda/q38_ple.cu cuda/cuda_backend.cu
 
 .PHONY: all test python-test verify cuda-check cuda-runtime cuda-test cuda-bench strict-gate clean
 
@@ -49,7 +49,7 @@ $(CUDA_CHECK_BIN): $(CUDA_RUNTIME_SOURCES) cuda/cuda_compile_check.cc $(RUNTIME_
 $(CUDA_RUNTIME_BIN): $(CUDA_RUNTIME_SOURCES) cuda/cuda_main.cc $(RUNTIME_SOURCES) $(CUDA_COMPAT_STAMP) | $(BUILD_DIR)
 	$(NVCC) -ccbin $(CUDA_HOST_CXX) -I$(BUILD_DIR)/cuda-compat $(CPPFLAGS) $(NVCCFLAGS) $(CUDA_EXTRA_FLAGS) $(filter-out $(CUDA_COMPAT_STAMP),$^) -o $@ $(CUDA_LIBS)
 
-$(CUDA_TEST_BIN): cuda/cuda_transport.cu cuda/q38_kernels.cu cuda/q38_gdn.cu cuda/q38_qsa.cu cuda/q38_moe.cu cuda/q38_ple.cu cuda/cuda_kernel_tests.cu src/contracts.cc $(CUDA_COMPAT_STAMP) | $(BUILD_DIR)
+$(CUDA_TEST_BIN): cuda/cuda_transport.cu cuda/q38_kernels.cu cuda/q38_gdn.cu cuda/q38_qsa.cu cuda/q38_moe.cu cuda/q38_moe_prefill.cu cuda/q38_ple.cu cuda/cuda_kernel_tests.cu src/contracts.cc $(CUDA_COMPAT_STAMP) | $(BUILD_DIR)
 	$(NVCC) -ccbin $(CUDA_HOST_CXX) -I$(BUILD_DIR)/cuda-compat $(CPPFLAGS) $(NVCCFLAGS) $(CUDA_EXTRA_FLAGS) $(filter-out $(CUDA_COMPAT_STAMP),$^) -o $@
 
 $(CUDA_DECODE_BENCH_BIN): cuda/q38_kernels.cu cuda/q38_decode_bench.cu $(CUDA_COMPAT_STAMP) | $(BUILD_DIR)

@@ -264,7 +264,7 @@ def runtime_command(
     validated: dict[str, object],
     runtime: Path,
     socket_path: Path,
-    snapshot: Path,
+    snapshot: Path | None,
     chunk: int,
     ple_cache_gib: int,
     enable_mtp: bool = False,
@@ -296,9 +296,9 @@ def runtime_command(
         "64",
         "--socket",
         str(socket_path.resolve()),
-        "--snapshot-journal",
-        str(snapshot.resolve()),
     ]
+    if snapshot is not None:
+        command.extend(["--snapshot-journal", str(snapshot.resolve())])
     if enable_mtp:
         command.append("--enable-mtp")
     command.extend(sampling_arguments(validated["sampling"]))  # type: ignore[arg-type]
@@ -345,7 +345,13 @@ def main() -> int:
     parser.add_argument("--runtime", type=Path, default=Path("build/q38-cuda-runtime"))
     parser.add_argument("--socket", type=Path, default=Path("/tmp/q38-executor.sock"))
     parser.add_argument("--snapshot", type=Path, default=Path("state/session.q38j"))
-    parser.add_argument("--chunk", type=int, default=4096)
+    parser.add_argument(
+        "--durability",
+        choices=("strict", "off"),
+        default="strict",
+        help="strict syncs a snapshot before each successful writer response; off disables crash recovery",
+    )
+    parser.add_argument("--chunk", type=int, default=512)
     parser.add_argument("--ple-cache-gib", type=int, default=8)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
@@ -369,7 +375,7 @@ def main() -> int:
         validated,
         arguments.runtime,
         arguments.socket,
-        arguments.snapshot,
+        arguments.snapshot if arguments.durability == "strict" else None,
         arguments.chunk,
         arguments.ple_cache_gib,
         arguments.enable_mtp,
@@ -409,6 +415,7 @@ def main() -> int:
         "artifact_bytes": validated["segment_bytes"],
         "segment_hashes_verified": not arguments.skip_segment_hashes,
         "mtp_enabled": arguments.enable_mtp,
+        "durability": arguments.durability,
         "runtime_command": command,
         "sidecar_command": None if arguments.executor_only else sidecar,
     }
@@ -417,7 +424,8 @@ def main() -> int:
         return 0
     if not arguments.runtime.is_file() or not os.access(arguments.runtime, os.X_OK):
         raise FileNotFoundError(f"runtime binary is not executable: {arguments.runtime}")
-    arguments.snapshot.parent.mkdir(parents=True, exist_ok=True)
+    if arguments.durability == "strict":
+        arguments.snapshot.parent.mkdir(parents=True, exist_ok=True)
     arguments.socket.parent.mkdir(parents=True, exist_ok=True)
     previous_sigterm = signal.signal(signal.SIGTERM, interrupt_on_termination)
     executor: subprocess.Popen | None = None

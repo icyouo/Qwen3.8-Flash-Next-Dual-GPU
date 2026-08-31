@@ -1,5 +1,6 @@
 #include "q38/cuda_kernels.h"
 #include "q38/cuda_moe.h"
+#include "q38/cuda_moe_prefill.h"
 #include "q38/cuda_transport.h"
 #include "q38/cuda_gdn.h"
 #include "q38/cuda_hyper.h"
@@ -361,6 +362,448 @@ void test_moe_decode_parity(q38::DeviceWeightFormatV1 format,
     (void)cudaFree(d_gate_scales);
     (void)cudaFree(d_down_data);
     (void)cudaFree(d_gate_data);
+}
+
+void verify_moe_route_plan(std::uint32_t tokens, bool repeated_expert,
+                           cudaStream_t stream) {
+    const std::uint32_t routes = q38::q38_moe_prefill_routes_v1(tokens);
+    std::vector<std::int32_t> experts(routes);
+    for (std::uint32_t assignment = 0; assignment < routes; ++assignment) {
+        experts[assignment] = repeated_expert
+                                  ? 7
+                                  : static_cast<std::int32_t>(
+                                        (assignment * 73u +
+                                         (assignment / q38::kQ38RouteTopK) *
+                                             17u) %
+                                        q38::kQ38RouteExperts);
+    }
+    auto* device_experts = upload(experts);
+    const std::size_t plan_bytes =
+        q38::q38_moe_route_plan_bytes_v1(tokens);
+    auto* device_allocation = allocate<std::uint8_t>(plan_bytes);
+    const auto plan = q38::cuda_moe_route_plan_storage_v1(
+        device_allocation, plan_bytes, tokens);
+
+    q38::cuda_moe_build_route_plan_v1(
+        device_experts, tokens, plan, reinterpret_cast<void*>(stream), 0);
+    std::vector<std::uint8_t> first(plan_bytes);
+    check(cudaMemcpyAsync(first.data(), device_allocation, plan_bytes,
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(route plan first run)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(route plan first run)");
+    check(cudaMemsetAsync(device_allocation, 0xa5, plan_bytes, stream),
+          "cudaMemset(route plan determinism)");
+    q38::cuda_moe_build_route_plan_v1(
+        device_experts, tokens, plan, reinterpret_cast<void*>(stream), 0);
+    std::vector<std::uint8_t> second(plan_bytes);
+    check(cudaMemcpyAsync(second.data(), device_allocation, plan_bytes,
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(route plan second run)");
+
+    q38::Q38RoutePlanHeaderV1 header{};
+    std::vector<std::uint16_t> counts(q38::kQ38RouteExperts);
+    std::vector<std::uint32_t> offsets(q38::kQ38RouteExperts + 1);
+    std::vector<std::uint32_t> task_offsets(q38::kQ38RouteExperts + 1);
+    std::vector<std::uint32_t> packed(routes);
+    std::vector<std::uint32_t> inverse(routes);
+    std::vector<q38::Q38ExpertMmqTaskV1> tasks(
+        q38::q38_moe_prefill_max_tasks_v1(tokens));
+    check(cudaMemcpyAsync(&header, plan.header, sizeof(header),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(route plan header)");
+    check(cudaMemcpyAsync(counts.data(), plan.expert_counts,
+                          counts.size() * sizeof(counts.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(route plan counts)");
+    check(cudaMemcpyAsync(offsets.data(), plan.expert_offsets,
+                          offsets.size() * sizeof(offsets.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(route plan offsets)");
+    check(cudaMemcpyAsync(task_offsets.data(), plan.expert_task_offsets,
+                          task_offsets.size() * sizeof(task_offsets.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(route plan task offsets)");
+    check(cudaMemcpyAsync(packed.data(), plan.packed_assignment,
+                          packed.size() * sizeof(packed.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(route plan packed assignments)");
+    check(cudaMemcpyAsync(inverse.data(), plan.assignment_to_packed,
+                          inverse.size() * sizeof(inverse.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(route plan inverse assignments)");
+    check(cudaMemcpyAsync(tasks.data(), plan.tasks,
+                          tasks.size() * sizeof(tasks.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(route plan tasks)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(route plan validation)");
+
+    if (first != second)
+        throw std::runtime_error("route plan is not bitwise deterministic");
+    if (header.magic != q38::kQ38RoutePlanMagicV1 ||
+        header.version != q38::kQ38RoutePlanVersionV1 ||
+        header.tokens != tokens || header.routes != routes ||
+        header.status !=
+            static_cast<std::uint32_t>(q38::Q38RoutePlanStatusV1::kOk))
+        throw std::runtime_error("route plan header differs");
+
+    std::vector<std::uint16_t> expected_counts(q38::kQ38RouteExperts, 0);
+    for (const std::int32_t expert : experts)
+        ++expected_counts[static_cast<std::size_t>(expert)];
+    std::vector<std::uint32_t> expected_offsets(q38::kQ38RouteExperts + 1, 0);
+    std::vector<std::uint32_t> expected_task_offsets(
+        q38::kQ38RouteExperts + 1, 0);
+    for (std::uint32_t expert = 0; expert < q38::kQ38RouteExperts; ++expert) {
+        expected_offsets[expert + 1] =
+            expected_offsets[expert] + expected_counts[expert];
+        expected_task_offsets[expert + 1] =
+            expected_task_offsets[expert] +
+            (expected_counts[expert] + q38::kQ38MmqM - 1) / q38::kQ38MmqM;
+    }
+    if (counts != expected_counts || offsets != expected_offsets ||
+        task_offsets != expected_task_offsets ||
+        header.task_count != expected_task_offsets.back() ||
+        header.task_count > q38::q38_moe_prefill_max_tasks_v1(tokens))
+        throw std::runtime_error("route plan counts or task bounds differ");
+
+    std::vector<std::uint32_t> expected_packed;
+    expected_packed.reserve(routes);
+    for (std::uint32_t expert = 0; expert < q38::kQ38RouteExperts; ++expert)
+        for (std::uint32_t assignment = 0; assignment < routes; ++assignment)
+            if (experts[assignment] == static_cast<std::int32_t>(expert))
+                expected_packed.push_back(assignment);
+    if (packed != expected_packed)
+        throw std::runtime_error("route plan stable expert packing differs");
+    for (std::uint32_t position = 0; position < routes; ++position)
+        if (inverse[packed[position]] != position)
+            throw std::runtime_error("route plan inverse mapping differs");
+
+    for (std::uint32_t expert = 0; expert < q38::kQ38RouteExperts; ++expert) {
+        const std::uint32_t count = expected_counts[expert];
+        const std::uint32_t expert_tasks =
+            (count + q38::kQ38MmqM - 1) / q38::kQ38MmqM;
+        for (std::uint32_t tile = 0; tile < expert_tasks; ++tile) {
+            const auto& task = tasks[expected_task_offsets[expert] + tile];
+            const std::uint32_t remaining = count - tile * q38::kQ38MmqM;
+            const std::uint32_t expected_rows =
+                std::min(remaining, q38::kQ38MmqM);
+            if (task.packed_begin !=
+                    expected_offsets[expert] + tile * q38::kQ38MmqM ||
+                task.expert != expert || task.valid_rows != expected_rows ||
+                task.flags != 0)
+                throw std::runtime_error("route plan MMQ task differs");
+        }
+    }
+
+    (void)cudaFree(device_allocation);
+    (void)cudaFree(device_experts);
+}
+
+void test_moe_route_plan(cudaStream_t stream) {
+    if (q38::q38_moe_prefill_max_tasks_v1(128) != 560 ||
+        q38::q38_moe_prefill_max_tasks_v1(256) != 640 ||
+        q38::q38_moe_prefill_max_tasks_v1(512) != 800 ||
+        q38::q38_moe_route_plan_bytes_v1(512) != 52552)
+        throw std::runtime_error("route plan compile-time bounds differ");
+    verify_moe_route_plan(1, false, stream);
+    verify_moe_route_plan(128, false, stream);
+    verify_moe_route_plan(512, false, stream);
+    verify_moe_route_plan(512, true, stream);
+
+    constexpr std::uint32_t tokens = 3;
+    const std::uint32_t routes = q38::q38_moe_prefill_routes_v1(tokens);
+    std::vector<std::int32_t> experts(routes);
+    for (std::uint32_t assignment = 0; assignment < routes; ++assignment)
+        experts[assignment] = static_cast<std::int32_t>(
+            (assignment * 19u + 5u) % q38::kQ38RouteExperts);
+    std::vector<std::uint16_t> hidden(
+        static_cast<std::size_t>(tokens) * q38::kQ38HiddenWidth);
+    for (std::uint32_t token = 0; token < tokens; ++token)
+        for (std::uint32_t column = 0; column < q38::kQ38HiddenWidth; ++column)
+            hidden[static_cast<std::size_t>(token) * q38::kQ38HiddenWidth +
+                   column] = bf16(static_cast<float>(token * 4 + column % 4));
+    auto* device_experts = upload(experts);
+    auto* device_hidden = upload(hidden);
+    const std::size_t plan_bytes =
+        q38::q38_moe_route_plan_bytes_v1(tokens);
+    auto* device_allocation = allocate<std::uint8_t>(plan_bytes);
+    const auto plan = q38::cuda_moe_route_plan_storage_v1(
+        device_allocation, plan_bytes, tokens);
+    auto* device_packed_hidden = allocate<std::uint16_t>(
+        static_cast<std::size_t>(routes) * q38::kQ38HiddenWidth);
+    q38::cuda_moe_build_route_plan_v1(
+        device_experts, tokens, plan, reinterpret_cast<void*>(stream), 0);
+    q38::cuda_moe_pack_hidden_v1(
+        device_hidden, plan.packed_assignment, routes, device_packed_hidden,
+        reinterpret_cast<void*>(stream), 0);
+    std::vector<std::uint32_t> packed(routes);
+    std::vector<std::uint16_t> packed_hidden(
+        static_cast<std::size_t>(routes) * q38::kQ38HiddenWidth);
+    check(cudaMemcpyAsync(packed.data(), plan.packed_assignment,
+                          packed.size() * sizeof(packed.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(hidden-pack assignments)");
+    check(cudaMemcpyAsync(packed_hidden.data(), device_packed_hidden,
+                          packed_hidden.size() * sizeof(packed_hidden.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(hidden-pack output)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(hidden-pack test)");
+    for (std::uint32_t position = 0; position < routes; ++position) {
+        const std::uint32_t token = packed[position] / q38::kQ38RouteTopK;
+        for (std::uint32_t column = 0; column < q38::kQ38HiddenWidth; ++column)
+            if (packed_hidden[static_cast<std::size_t>(position) *
+                                  q38::kQ38HiddenWidth +
+                              column] !=
+                hidden[static_cast<std::size_t>(token) *
+                           q38::kQ38HiddenWidth +
+                       column])
+                throw std::runtime_error("route-plan hidden packing differs");
+    }
+
+    experts[4] = -1;
+    check(cudaMemcpyAsync(device_experts, experts.data(),
+                          experts.size() * sizeof(experts.front()),
+                          cudaMemcpyHostToDevice, stream),
+          "cudaMemcpy(invalid route expert)");
+    q38::cuda_moe_build_route_plan_v1(
+        device_experts, tokens, plan, reinterpret_cast<void*>(stream), 0);
+    q38::Q38RoutePlanHeaderV1 header{};
+    check(cudaMemcpyAsync(&header, plan.header, sizeof(header),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(invalid route header)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(invalid route test)");
+    if (header.status != static_cast<std::uint32_t>(
+                             q38::Q38RoutePlanStatusV1::kInvalidExpert))
+        throw std::runtime_error("invalid route expert did not fail closed");
+
+    (void)cudaFree(device_packed_hidden);
+    (void)cudaFree(device_allocation);
+    (void)cudaFree(device_hidden);
+    (void)cudaFree(device_experts);
+}
+
+void test_grouped_moe_prefill(q38::DeviceWeightFormatV1 format,
+                              cudaStream_t stream) {
+    constexpr std::uint32_t tokens = 2;
+    constexpr std::uint32_t routes = tokens * q38::kQ38RouteTopK;
+    constexpr std::uint32_t gate_rows = 2 * q38::kQ38MoeIntermediate;
+    constexpr std::uint32_t gate_columns = q38::kQ38HiddenWidth;
+    constexpr std::uint32_t down_rows = q38::kQ38HiddenWidth;
+    constexpr std::uint32_t down_columns = q38::kQ38MoeIntermediate;
+    const bool w8 = format == q38::DeviceWeightFormatV1::kW8A16SymG128;
+    const std::size_t gate_elements =
+        static_cast<std::size_t>(gate_rows) * gate_columns;
+    const std::size_t down_elements =
+        static_cast<std::size_t>(down_rows) * down_columns;
+    std::vector<std::uint8_t> gate_data(w8 ? gate_elements
+                                           : gate_elements / 2,
+                                        0);
+    std::vector<std::uint8_t> down_data(w8 ? down_elements
+                                           : down_elements / 2,
+                                        0);
+    const auto set_quantized = [w8](std::vector<std::uint8_t>* target,
+                                    std::size_t logical_index,
+                                    std::int8_t value) {
+        if (w8) {
+            (*target)[logical_index] = static_cast<std::uint8_t>(value);
+            return;
+        }
+        const std::size_t packed_index = logical_index / 2;
+        const std::uint8_t nibble =
+            static_cast<std::uint8_t>(value) & 0x0fu;
+        if ((logical_index & 1u) == 0)
+            (*target)[packed_index] = static_cast<std::uint8_t>(
+                ((*target)[packed_index] & 0xf0u) | nibble);
+        else
+            (*target)[packed_index] = static_cast<std::uint8_t>(
+                ((*target)[packed_index] & 0x0fu) | (nibble << 4));
+    };
+    set_quantized(&gate_data, 0, 1);
+    set_quantized(&gate_data,
+                  static_cast<std::size_t>(q38::kQ38MoeIntermediate) *
+                      gate_columns,
+                  1);
+    set_quantized(&down_data, 0, 1);
+    std::vector<std::uint16_t> gate_scales(
+        gate_rows * (gate_columns / 128), bf16(1.0f));
+    std::vector<std::uint16_t> down_scales(
+        down_rows * (down_columns / 128), bf16(1.0f));
+    std::vector<std::uint16_t> hidden(
+        static_cast<std::size_t>(tokens) * gate_columns, bf16(0.0f));
+    hidden[0] = bf16(1.0f);
+    hidden[gate_columns] = bf16(2.0f);
+    std::vector<std::int32_t> experts(routes, 0);
+    std::vector<float> route_weights(routes, 1.0f / q38::kQ38RouteTopK);
+    std::vector<std::uint16_t> shared_output(
+        static_cast<std::size_t>(tokens) * down_rows, bf16(0.0f));
+    std::vector<std::uint16_t> shared_gate(tokens, bf16(0.0f));
+
+    auto* device_gate_data = upload(gate_data);
+    auto* device_down_data = upload(down_data);
+    auto* device_gate_scales = upload(gate_scales);
+    auto* device_down_scales = upload(down_scales);
+    auto* device_hidden = upload(hidden);
+    auto* device_experts = upload(experts);
+    auto* device_route_weights = upload(route_weights);
+    auto* device_shared_output = upload(shared_output);
+    auto* device_shared_gate = upload(shared_gate);
+
+    q38::DeviceTensorV1 gate_descriptor;
+    gate_descriptor.format = format;
+    gate_descriptor.group_size = 128;
+    gate_descriptor.shape = {q38::kQ38RouteExperts, gate_rows, gate_columns};
+    q38::DeviceTensorV1 down_descriptor;
+    down_descriptor.format = format;
+    down_descriptor.group_size = 128;
+    down_descriptor.shape = {q38::kQ38RouteExperts, down_rows, down_columns};
+    q38::CudaTensorViewV1 gate_view{&gate_descriptor, device_gate_data,
+                                    device_gate_scales};
+    q38::CudaTensorViewV1 down_view{&down_descriptor, device_down_data,
+                                    device_down_scales};
+
+    const std::size_t plan_bytes =
+        q38::q38_moe_route_plan_bytes_v1(tokens);
+    auto* device_plan_allocation = allocate<std::uint8_t>(plan_bytes);
+    const auto plan = q38::cuda_moe_route_plan_storage_v1(
+        device_plan_allocation, plan_bytes, tokens);
+    auto* device_packed_hidden = allocate<std::uint16_t>(
+        static_cast<std::size_t>(routes) * gate_columns);
+    auto* device_weighted_mid = allocate<std::uint16_t>(
+        static_cast<std::size_t>(routes) * down_columns);
+    auto* device_weighted_mid_safe = allocate<std::uint16_t>(
+        static_cast<std::size_t>(routes) * down_columns);
+    auto* device_route_output =
+        allocate<float>(static_cast<std::size_t>(routes) * down_rows);
+    auto* device_route_output_safe =
+        allocate<float>(static_cast<std::size_t>(routes) * down_rows);
+    auto* device_output =
+        allocate<std::uint16_t>(static_cast<std::size_t>(tokens) * down_rows);
+    auto* device_output_safe =
+        allocate<std::uint16_t>(static_cast<std::size_t>(tokens) * down_rows);
+
+    q38::cuda_moe_build_route_plan_v1(
+        device_experts, tokens, plan, reinterpret_cast<void*>(stream), 0);
+    q38::Q38RoutePlanHeaderV1 header{};
+    check(cudaMemcpyAsync(&header, plan.header, sizeof(header),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(grouped MoE route header)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(grouped MoE route header)");
+    if (header.status != 0 || header.task_count != 2)
+        throw std::runtime_error("grouped MoE route-plan fixture differs");
+    q38::cuda_moe_pack_hidden_v1(
+        device_hidden, plan.packed_assignment, routes, device_packed_hidden,
+        reinterpret_cast<void*>(stream), 0);
+
+    const auto run_mode = [&](q38::Q38PrefillMoeModeV1 mode,
+                              std::uint16_t* weighted_mid,
+                              float* route_output,
+                              std::uint16_t* output) {
+        q38::cuda_moe_grouped_gate_up_v1(
+            gate_view, device_packed_hidden, plan.packed_assignment,
+            device_route_weights, plan.tasks, header.task_count, weighted_mid,
+            mode, reinterpret_cast<void*>(stream), 0);
+        q38::cuda_moe_grouped_down_v1(
+            down_view, weighted_mid, plan.tasks, header.task_count,
+            route_output, mode, reinterpret_cast<void*>(stream), 0);
+        q38::cuda_moe_reduce_top10_and_combine_shared_v1(
+            route_output, plan.assignment_to_packed, device_shared_output,
+            device_shared_gate, tokens, output,
+            reinterpret_cast<void*>(stream), 0);
+    };
+    run_mode(q38::Q38PrefillMoeModeV1::kGroupedMmq, device_weighted_mid,
+             device_route_output, device_output);
+    run_mode(q38::Q38PrefillMoeModeV1::kGroupedMmqSafe,
+             device_weighted_mid_safe, device_route_output_safe,
+             device_output_safe);
+
+    std::vector<std::uint16_t> weighted_mid(
+        static_cast<std::size_t>(routes) * down_columns);
+    std::vector<std::uint16_t> weighted_mid_safe(weighted_mid.size());
+    std::vector<float> route_output(
+        static_cast<std::size_t>(routes) * down_rows);
+    std::vector<float> route_output_safe(route_output.size());
+    std::vector<std::uint16_t> output(
+        static_cast<std::size_t>(tokens) * down_rows);
+    std::vector<std::uint16_t> output_safe(output.size());
+    check(cudaMemcpyAsync(weighted_mid.data(), device_weighted_mid,
+                          weighted_mid.size() * sizeof(weighted_mid.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(grouped MoE middle)");
+    check(cudaMemcpyAsync(
+              weighted_mid_safe.data(), device_weighted_mid_safe,
+              weighted_mid_safe.size() * sizeof(weighted_mid_safe.front()),
+              cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(grouped MoE safe middle)");
+    check(cudaMemcpyAsync(route_output.data(), device_route_output,
+                          route_output.size() * sizeof(route_output.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(grouped MoE route output)");
+    check(cudaMemcpyAsync(
+              route_output_safe.data(), device_route_output_safe,
+              route_output_safe.size() * sizeof(route_output_safe.front()),
+              cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(grouped MoE safe route output)");
+    check(cudaMemcpyAsync(output.data(), device_output,
+                          output.size() * sizeof(output.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(grouped MoE output)");
+    check(cudaMemcpyAsync(output_safe.data(), device_output_safe,
+                          output_safe.size() * sizeof(output_safe.front()),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(grouped MoE safe output)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(grouped MoE fixture)");
+    if (weighted_mid != weighted_mid_safe ||
+        route_output != route_output_safe || output != output_safe)
+        throw std::runtime_error(
+            "grouped and safe MoE modes are not bitwise equal");
+    for (std::uint32_t token = 0; token < tokens; ++token) {
+        const float gate = fp32(hidden[static_cast<std::size_t>(token) *
+                                         gate_columns]);
+        const float activated = fp32(
+            bf16(gate / (1.0f + std::exp(-gate)) * gate));
+        const float weighted = fp32(bf16(
+            activated * (1.0f / static_cast<float>(q38::kQ38RouteTopK))));
+        float routed = 0.0f;
+        for (std::uint32_t rank = 0; rank < q38::kQ38RouteTopK; ++rank)
+            routed += weighted;
+        for (std::uint32_t column = 0; column < down_rows; ++column) {
+            const std::uint16_t expected =
+                column == 0 ? bf16(routed) : bf16(0.0f);
+            const std::uint16_t actual =
+                output[static_cast<std::size_t>(token) * down_rows + column];
+            if (actual != expected)
+                throw std::runtime_error(
+                    std::string(w8 ? "W8" : "W4") +
+                    " grouped MoE arithmetic differs at token " +
+                    std::to_string(token) + " column " +
+                    std::to_string(column) + ": expected " +
+                    std::to_string(fp32(expected)) + " got " +
+                    std::to_string(fp32(actual)));
+        }
+    }
+
+    (void)cudaFree(device_output_safe);
+    (void)cudaFree(device_output);
+    (void)cudaFree(device_route_output_safe);
+    (void)cudaFree(device_route_output);
+    (void)cudaFree(device_weighted_mid_safe);
+    (void)cudaFree(device_weighted_mid);
+    (void)cudaFree(device_packed_hidden);
+    (void)cudaFree(device_plan_allocation);
+    (void)cudaFree(device_shared_gate);
+    (void)cudaFree(device_shared_output);
+    (void)cudaFree(device_route_weights);
+    (void)cudaFree(device_experts);
+    (void)cudaFree(device_hidden);
+    (void)cudaFree(device_down_scales);
+    (void)cudaFree(device_gate_scales);
+    (void)cudaFree(device_down_data);
+    (void)cudaFree(device_gate_data);
 }
 
 void test_boundary_transport_checksum(cudaStream_t stream) {
@@ -882,6 +1325,11 @@ int main() {
         test_moe_decode_parity(
             q38::DeviceWeightFormatV1::kW8A16SymG128, stream);
         test_moe_decode_parity(
+            q38::DeviceWeightFormatV1::kW4A16SymG128, stream);
+        test_moe_route_plan(stream);
+        test_grouped_moe_prefill(
+            q38::DeviceWeightFormatV1::kW8A16SymG128, stream);
+        test_grouped_moe_prefill(
             q38::DeviceWeightFormatV1::kW4A16SymG128, stream);
         std::vector<std::int8_t> weights(2 * 128, 1);
         for (std::size_t index = 128; index < weights.size(); ++index)

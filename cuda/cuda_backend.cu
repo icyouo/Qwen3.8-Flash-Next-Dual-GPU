@@ -4,6 +4,7 @@
 #include "q38/cuda_hyper.h"
 #include "q38/cuda_kernels.h"
 #include "q38/cuda_moe.h"
+#include "q38/cuda_moe_prefill.h"
 #include "q38/cuda_ple.h"
 #include "q38/cuda_qsa.h"
 #include "q38/cuda_transport.h"
@@ -37,13 +38,33 @@ namespace {
 constexpr std::uint32_t kVocabulary = 248320;
 constexpr std::uint32_t kLayers = 48;
 constexpr std::uint32_t kCut = kQ38ProductionCut;
-constexpr std::uint32_t kPrefillTile = 32;
+// The grouped-MMQ lane needs enough assignments per expert to amortize weight
+// dequantization and Tensor-Core tiles.  This is also the cancellation and
+// stage-boundary slab size; decode remains a separate batch-1 lane.
+constexpr std::uint32_t kPrefillTile = kQ38PrefillSlabMaxTokens;
 constexpr std::uint32_t kSmallBoundaryTokens = 128;
 
-bool decode_profile_requested() {
-    const char* value = std::getenv("Q38_CUDA_PROFILE_DECODE");
+bool profile_requested(const char* name) {
+    const char* value = std::getenv(name);
     return value && std::strcmp(value, "0") != 0 &&
            std::strcmp(value, "false") != 0;
+}
+
+Q38PrefillMoeModeV1 prefill_moe_mode() {
+    static const Q38PrefillMoeModeV1 mode = [] {
+        const char* value = std::getenv("Q38_CUDA_PREFILL_MOE");
+        if (!value || std::strcmp(value, "grouped") == 0 ||
+            std::strcmp(value, "1") == 0)
+            return Q38PrefillMoeModeV1::kGroupedMmq;
+        if (std::strcmp(value, "legacy") == 0 ||
+            std::strcmp(value, "0") == 0)
+            return Q38PrefillMoeModeV1::kLegacyAtomicDiagnostic;
+        if (std::strcmp(value, "safe") == 0 ||
+            std::strcmp(value, "grouped_safe") == 0)
+            return Q38PrefillMoeModeV1::kGroupedMmqSafe;
+        throw std::invalid_argument("invalid Q38_CUDA_PREFILL_MOE mode");
+    }();
+    return mode;
 }
 
 void check(cudaError_t status, const char* operation) {
@@ -61,16 +82,17 @@ void check_cublas(cublasStatus_t status, const char* operation) {
 // Opt-in event profiling for real-model batch-1 decode.  It has no CUDA
 // events, records, synchronization, or logging cost unless explicitly enabled.
 // Repeated labels are aggregated across all layers owned by the stage.
-class DecodeEventProfile {
+class CudaEventProfile {
 public:
-    explicit DecodeEventProfile(int value_device) : device_(value_device) {}
-    ~DecodeEventProfile() {
+    CudaEventProfile(int value_device, std::string value_type)
+        : device_(value_device), type_(std::move(value_type)) {}
+    ~CudaEventProfile() {
         (void)cudaSetDevice(device_);
         for (auto event : events_) (void)cudaEventDestroy(event);
     }
 
-    DecodeEventProfile(const DecodeEventProfile&) = delete;
-    DecodeEventProfile& operator=(const DecodeEventProfile&) = delete;
+    CudaEventProfile(const CudaEventProfile&) = delete;
+    CudaEventProfile& operator=(const CudaEventProfile&) = delete;
 
     void begin(cudaStream_t stream) {
         labels_.clear();
@@ -106,7 +128,8 @@ public:
             else
                 found->second += elapsed_ms;
         }
-        std::cerr << "{\"type\":\"q38_cuda_decode_profile\",\"stage\":"
+        std::cerr << "{\"type\":\"q38_cuda_" << type_
+                  << "_profile\",\"stage\":"
                   << static_cast<unsigned>(stage) << ",\"position\":"
                   << position << ",\"total_ms\":" << total_ms
                   << ",\"categories_ms\":{";
@@ -134,6 +157,7 @@ private:
     }
 
     int device_ = 0;
+    std::string type_;
     bool active_ = false;
     std::size_t event_count_ = 0;
     std::vector<cudaEvent_t> events_;
@@ -727,14 +751,41 @@ public:
                 static_cast<std::uint64_t>(kPrefillTile) * kQ38MoeTopK);
             expert_weights = allocate<float>(
                 static_cast<std::uint64_t>(kPrefillTile) * kQ38MoeTopK);
+            const std::uint32_t legacy_moe_tokens =
+                prefill_moe_mode() ==
+                        Q38PrefillMoeModeV1::kLegacyAtomicDiagnostic
+                    ? kPrefillTile
+                    : 1;
             moe_gate_up = allocate<std::uint16_t>(
-                static_cast<std::uint64_t>(kPrefillTile) * kQ38MoeTopK * 2 *
+                static_cast<std::uint64_t>(legacy_moe_tokens) *
+                kQ38MoeTopK * 2 *
                 kQ38MoeIntermediate);
             moe_activated = allocate<std::uint16_t>(
-                static_cast<std::uint64_t>(kPrefillTile) * kQ38MoeTopK *
+                static_cast<std::uint64_t>(legacy_moe_tokens) *
+                kQ38MoeTopK *
                 kQ38MoeIntermediate);
             moe_accumulation = allocate<float>(
-                static_cast<std::uint64_t>(kPrefillTile) * kQ38HiddenWidth);
+                static_cast<std::uint64_t>(legacy_moe_tokens) *
+                kQ38HiddenWidth);
+            if (prefill_moe_mode() !=
+                Q38PrefillMoeModeV1::kLegacyAtomicDiagnostic) {
+                const auto route_plan_bytes =
+                    q38_moe_route_plan_bytes_v1(kPrefillTile);
+                moe_route_plan_allocation =
+                    allocate<std::uint8_t>(route_plan_bytes);
+                moe_route_plan = cuda_moe_route_plan_storage_v1(
+                    moe_route_plan_allocation, route_plan_bytes,
+                    kPrefillTile);
+                moe_packed_hidden = allocate<std::uint16_t>(
+                    static_cast<std::uint64_t>(kPrefillTile) *
+                    kQ38MoeTopK * kQ38HiddenWidth);
+                moe_weighted_mid = allocate<std::uint16_t>(
+                    static_cast<std::uint64_t>(kPrefillTile) *
+                    kQ38MoeTopK * kQ38MoeIntermediate);
+                moe_route_output = allocate<float>(
+                    static_cast<std::uint64_t>(kPrefillTile) *
+                    kQ38MoeTopK * kQ38HiddenWidth);
+            }
             selected_indices = allocate<std::int32_t>(
                 static_cast<std::uint64_t>(kPrefillTile) *
                 kQ38QsaMaximumSelected);
@@ -865,6 +916,11 @@ public:
     std::uint16_t* moe_gate_up = nullptr;
     std::uint16_t* moe_activated = nullptr;
     float* moe_accumulation = nullptr;
+    std::uint8_t* moe_route_plan_allocation = nullptr;
+    Q38RoutePlanStorageV1 moe_route_plan;
+    std::uint16_t* moe_packed_hidden = nullptr;
+    std::uint16_t* moe_weighted_mid = nullptr;
+    float* moe_route_output = nullptr;
     std::int32_t* selected_indices = nullptr;
     float* block_scores = nullptr;
     float* attention_scores = nullptr;
@@ -933,14 +989,19 @@ struct CudaStageBackend::Impl {
                     options.device, 1, options.context_capacity);
             }
         }
-        if (decode_profile_requested())
-            decode_profile =
-                std::make_unique<DecodeEventProfile>(options.device);
+        if (profile_requested("Q38_CUDA_PROFILE_DECODE"))
+            decode_profile = std::make_unique<CudaEventProfile>(
+                options.device, "decode");
+        if (profile_requested("Q38_CUDA_PROFILE_PREFILL"))
+            prefill_profile = std::make_unique<CudaEventProfile>(
+                options.device, "prefill");
     }
 
     void profile_mark(const char* label) {
         if (decode_profile && decode_profile->active())
             decode_profile->mark(label, workspace.stream);
+        if (prefill_profile && prefill_profile->active())
+            prefill_profile->mark(label, workspace.stream);
     }
 
     void cuda_gemv_bf16(const CudaMatrixViewV1& matrix,
@@ -1194,36 +1255,82 @@ struct CudaStageBackend::Impl {
         auto stream = reinterpret_cast<void*>(workspace.stream);
         cuda_gemv_bf16(layer.moe.router, workspace.mixed, workspace.small0,
                        tokens, stream, options.device);
-        if (tokens == 1) profile_mark("moe_router");
+        if (tokens == 1 ||
+            (prefill_profile && prefill_profile->active()))
+            profile_mark("moe_router");
         cuda_topk_router_bf16(workspace.small0, workspace.expert_ids,
                               workspace.expert_weights, tokens, kQ38MoeExperts,
                               kQ38MoeTopK, true, stream, options.device);
-        if (tokens == 1) profile_mark("moe_topk");
-        cuda_moe_routed_bf16(
-            layer.moe.gate_up_experts, layer.moe.down_experts, workspace.mixed,
-            workspace.expert_ids, workspace.expert_weights, tokens,
-            kQ38MoeTopK, workspace.moe_gate_up, workspace.moe_activated,
-            workspace.moe_accumulation, workspace.proj6, stream,
-            options.device);
-        if (tokens == 1) profile_mark("moe_routed");
+        if (tokens == 1 ||
+            (prefill_profile && prefill_profile->active()))
+            profile_mark("moe_topk");
+        const bool grouped_prefill =
+            tokens > 1 && workspace.moe_route_plan.header != nullptr;
+        if (grouped_prefill) {
+            cuda_moe_build_route_plan_v1(
+                workspace.expert_ids, tokens, workspace.moe_route_plan,
+                stream, options.device);
+            cuda_moe_pack_hidden_v1(
+                workspace.mixed, workspace.moe_route_plan.packed_assignment,
+                tokens * kQ38MoeTopK, workspace.moe_packed_hidden, stream,
+                options.device);
+            cuda_moe_grouped_gate_up_v1(
+                layer.moe.gate_up_experts, workspace.moe_packed_hidden,
+                workspace.moe_route_plan.packed_assignment,
+                workspace.expert_weights, workspace.moe_route_plan.tasks,
+                q38_moe_prefill_max_tasks_v1(tokens),
+                workspace.moe_weighted_mid, prefill_moe_mode(), stream,
+                options.device);
+            cuda_moe_grouped_down_v1(
+                layer.moe.down_experts, workspace.moe_weighted_mid,
+                workspace.moe_route_plan.tasks,
+                q38_moe_prefill_max_tasks_v1(tokens),
+                workspace.moe_route_output, prefill_moe_mode(), stream,
+                options.device);
+        } else {
+            cuda_moe_routed_bf16(
+                layer.moe.gate_up_experts, layer.moe.down_experts,
+                workspace.mixed, workspace.expert_ids,
+                workspace.expert_weights, tokens, kQ38MoeTopK,
+                workspace.moe_gate_up, workspace.moe_activated,
+                workspace.moe_accumulation, workspace.proj6, stream,
+                options.device);
+        }
+        if (tokens == 1 ||
+            (prefill_profile && prefill_profile->active()))
+            profile_mark("moe_routed");
         cuda_gemv_bf16(layer.moe.shared_gate, workspace.mixed,
                        workspace.small2, tokens, stream, options.device);
         cuda_gemv_bf16(layer.moe.shared_up, workspace.mixed,
                        workspace.small1, tokens, stream, options.device);
-        if (tokens == 1) profile_mark("moe_shared_gate_up");
+        if (tokens == 1 ||
+            (prefill_profile && prefill_profile->active()))
+            profile_mark("moe_shared_gate_up");
         cuda_silu_multiply_bf16(
             workspace.small2, workspace.small1, workspace.small0,
             static_cast<std::size_t>(tokens) * kQ38MoeIntermediate, stream,
             options.device);
         cuda_gemv_bf16(layer.moe.shared_down, workspace.small0,
                        workspace.proj5, tokens, stream, options.device);
-        if (tokens == 1) profile_mark("moe_shared_down");
+        if (tokens == 1 ||
+            (prefill_profile && prefill_profile->active()))
+            profile_mark("moe_shared_down");
         cuda_gemv_bf16(layer.moe.shared_output_gate, workspace.mixed,
                        workspace.small1, tokens, stream, options.device);
-        cuda_moe_combine_shared_bf16(
-            workspace.proj6, workspace.proj5, workspace.small1,
-            workspace.block_output, tokens, stream, options.device);
-        if (tokens == 1) profile_mark("moe_shared_combine");
+        if (grouped_prefill) {
+            cuda_moe_reduce_top10_and_combine_shared_v1(
+                workspace.moe_route_output,
+                workspace.moe_route_plan.assignment_to_packed,
+                workspace.proj5, workspace.small1, tokens,
+                workspace.block_output, stream, options.device);
+        } else {
+            cuda_moe_combine_shared_bf16(
+                workspace.proj6, workspace.proj5, workspace.small1,
+                workspace.block_output, tokens, stream, options.device);
+        }
+        if (tokens == 1 ||
+            (prefill_profile && prefill_profile->active()))
+            profile_mark("moe_shared_combine");
     }
 
     void check_cancelled() const {
@@ -1318,6 +1425,14 @@ struct CudaStageBackend::Impl {
             check_cancelled();
             const auto tokens =
                 std::min<std::uint32_t>(kPrefillTile, count - first);
+            // Profile two representative full tiles per chunk: one after the
+            // lazy matrix-cache warmup and one at the largest context in the
+            // chunk.  Tail tiles have different occupancy and are excluded.
+            const bool profile_prefill =
+                prefill_profile && tokens == kPrefillTile &&
+                (first == kPrefillTile || first + tokens == count);
+            if (profile_prefill)
+                prefill_profile->begin(workspace.stream);
             if (options.stage == Stage::kStage0) {
                 cuda_embedding_bf16(embedding, workspace.tokens + first,
                                     workspace.proj5, tokens, stream,
@@ -1336,6 +1451,7 @@ struct CudaStageBackend::Impl {
                           cudaMemcpyDeviceToDevice, workspace.stream),
                       "cudaMemcpyAsync(stage boundary tile)");
             }
+            if (profile_prefill) profile_mark("input");
             std::uint16_t* current = workspace.hyper_a;
             std::uint16_t* alternate = workspace.hyper_b;
             for (const auto& layer : layers) {
@@ -1344,8 +1460,10 @@ struct CudaStageBackend::Impl {
                     ensure_ple_ready(first, tokens);
                     run_ple_prefill(layer, current, alternate, first, tokens);
                     std::swap(current, alternate);
+                    if (profile_prefill) profile_mark("ple");
                 }
                 prepare_hyper(layer.attention_hyper, current, tokens);
+                if (profile_prefill) profile_mark("attention_hyper");
                 if (layer.qsa)
                     run_qsa_prefill(
                         layer,
@@ -1354,13 +1472,18 @@ struct CudaStageBackend::Impl {
                         tokens, *qsa_state);
                 else
                     run_gdn_prefill(layer, tokens);
+                if (profile_prefill)
+                    profile_mark(layer.qsa ? "qsa" : "gdn");
                 finish_hyper(current, alternate, tokens);
                 std::swap(current, alternate);
+                if (profile_prefill) profile_mark("attention_finish");
 
                 prepare_hyper(layer.moe_hyper, current, tokens);
+                if (profile_prefill) profile_mark("moe_hyper");
                 run_moe(layer, tokens);
                 finish_hyper(current, alternate, tokens);
                 std::swap(current, alternate);
+                if (profile_prefill) profile_mark("moe_finish");
             }
             if (options.stage == Stage::kStage0) {
                 if (write_result)
@@ -1396,6 +1519,14 @@ struct CudaStageBackend::Impl {
                         workspace.predictions + count - 1, stream,
                         options.device);
                 }
+            }
+            if (profile_prefill) {
+                profile_mark(options.stage == Stage::kStage0
+                                 ? "stage_output"
+                                 : "final_head");
+                prefill_profile->finish(
+                    options.stage, provisional_base + chunk_offset + first,
+                    workspace.stream);
             }
             check(cudaStreamSynchronize(workspace.stream),
                   "cudaStreamSynchronize(prefill cancellation tile)");
@@ -1754,7 +1885,8 @@ struct CudaStageBackend::Impl {
     bool ple_read_active = false;
     std::size_t ple_read_bytes = 0;
     std::size_t ple_read_scales = 0;
-    std::unique_ptr<DecodeEventProfile> decode_profile;
+    std::unique_ptr<CudaEventProfile> decode_profile;
+    std::unique_ptr<CudaEventProfile> prefill_profile;
     mutable std::uint64_t tracked_peak_bytes = 0;
     StageBackendMetricsV1 metrics{};
 };

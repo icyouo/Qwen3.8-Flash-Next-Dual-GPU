@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Reference HTTP/SSE control plane for the native Q38 executor.
+"""Built-in HTTP/SSE control plane for the native Q38 executor.
 
-SGLang can bypass the reference tokenizer by calling the token-native deep
-session endpoints.  The OpenAI endpoint is intentionally a replaceable front
-door and does not participate in model execution or state ownership.
+Token-native deep-session endpoints are the primary interface.  The optional
+OpenAI-compatible endpoint uses the official tokenizer codec.  Neither path
+participates in model execution or owns model state.
 """
 
 from __future__ import annotations

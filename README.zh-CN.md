@@ -2,147 +2,200 @@
 
 # Qwen3.8-Flash-Next-Dual-GPU
 
-面向 **Qwen3.8-Flash-Next** 和双 64 GiB CMP 170HX（SM80）的专用长上下文推理
-运行时。目标是在两张没有 GPU P2P、单卡仅 PCIe 2.0 x4 的 Ampere 卡上完整容纳模型，
-并让一个会话可以持续追加到 256K context，而不重新计算旧 prefix。
+一个为双 Ampere GPU 定制、完全独立的 **Qwen3.8-Flash-Next** 长上下文推理运行时。
+当前验证硬件为 2 × 64 GiB CMP 170HX（SM80）；不要求 CUDA P2P，即使每张卡只有
+PCIe 2.0 x4 也可以运行。
 
-本项目不是 vLLM、SGLang 或 llama.cpp 的 fork。模型数据面、离线量化、双卡调度、
-KV/循环状态、事务、SSD-PLE、artifact 格式及 CUDA kernels 均由本仓库实现。HTTP、
-tokenizer、chat template 和 SSE 是可替换的控制面；SGLang 不是运行时依赖。
+本项目自己负责完整推理路径：官方权重转换、W4/W8 混合量化、双 stage 执行、
+QSA/GDN/PLE 状态、SSD-PLE、CUDA kernels、事务与恢复，以及 HTTP/SSE 服务。它不是
+vLLM、SGLang、llama.cpp 或 DS4 的 fork，运行时也不依赖它们。`transformers` 只是可选
+的官方 tokenizer/chat template codec，不参与模型执行和状态所有权。
 
-仓库公开名称为 **Qwen3.8-Flash-Next-Dual-GPU**。`q38` 继续作为精简的内部工程前缀，
-用于可执行文件、ExecutorRPC ABI、artifact schema、环境变量与工具名称；它不限定未来
-支持的双卡型号。
+> **当前状态：research preview。** 双卡真实 CUDA 执行、自定义 artifact、事务化服务、
+> batch-1 decode 和 grouped-MMQ prefill 已通过验证；tokenizer/logit golden parity、
+> 32K/128K/严格 256K 真模型门禁、MTP 发布门禁及长时间故障测试仍未完成。当前数据证明
+> 运行时机制和性能，不代表最终模型质量，也不代表 256K 已达到生产发布标准。
 
-> **项目状态：research preview。** 双卡真机已建立可重复的 8K decode 性能基线，
-> 但 tokenizer golden parity、32K/128K/严格 256K、MTP 和长时间稳定性门禁尚未全部完成。
-> 当前结果不能作为模型质量或完整 256K 发布声明。权重不随本仓库分发，使用者须遵守
-> 上游模型许可。
+## 实测结果
 
-```text
-OpenAI / deep-session client
-            │
-            ▼
-SGLang or q38_sidecar.py
-tokenize / template / SSE / cancel
-            │  ExecutorRPC V1 over Unix socket
-            ▼
-single native process
-GPU0 layers 0..24 + SSD-PLE ── BF16 4H host ring ── GPU1 layers 25..47 + LM/MTP
-```
+以下 q38 数据均来自 Ubuntu 主机 `p3-ultra`：2 × 64 GiB CMP 170HX、driver
+610.43.02、CUDA 13.1、`sm_80`、已校验的 cut-25
+`Q38_AMPERE_QUANT_POLICY_V5` artifact、batch size 1、MTP 关闭。
 
-严格产品门禁是一个 262,080-token prompt 加 64 个 committed generation tokens，最终
-总长度正好 262,144。后续请求只能追加 exact suffix，旧 prefix 不会重新 prefill。
+### Prefill
 
-## 当前基线
+新的 prefill 数据面把 top-10-of-512 MoE 的不规则小任务转换成确定性的 expert-grouped
+矩阵任务，再让两张 GPU 以 512-token slab 流水执行。
 
-以下数据在 Ubuntu `p3-ultra` 上实测，使用两张 64 GiB CMP 170HX、驱动
-610.43.02、CUDA 13.1、`sm_80`、cut-25、自有 mixed W4/W8 artifact、batch 1、
-plain decode（MTP 关闭）。两个 stage 对单 token 串行执行；表中的 stage 数值为各自
-p50，并不表示两卡能够把同一个 token 并行算完。
+| Prefill 路径 | Boundary chunk | 4,096-token 总耗时 | Prefill |
+|---|---:|---:|---:|
+| 旧 route-wise atomic kernel | 4,096；内部 tile 32 | 54.66 s | 74.93 tok/s |
+| Grouped MMQ；内部 tile 32 | 4,096 | 22.36 s | 183.15 tok/s |
+| Grouped MMQ；512-token slab；双 stage 串行 | 4,096 | 8.62 s | 475.15 tok/s |
+| **Grouped MMQ；512-token slab；双 stage 流水** | **512** | **5.02 s** | **815.78 tok/s** |
+| 旧 DS4 参考 | 不适用 | 4,102 tokens 用时 5.27 s | 777.9 tok/s |
 
-| 运行 | 上下文与输出 | stage 0 | stage 1 + head | ITL p50 | 实测 decode |
+最后一行是同一机器上的历史数据，并非相同 artifact 的严格 A/B。最终 q38 路径相对最初
+native prefill 提升 **10.9×**，达到了此前 DS4 的性能级别。输入为重复的合成 token，
+因此它是真实 CUDA 与状态机性能测试，不是文本质量结论。
+
+### Decode
+
+Prefill 和 decode 有意使用两套不同 kernel family。完成流水 4K prefill 后继续生成 64
+tokens，实测 **27.89 tok/s**、ITL p50 35.01 ms。
+
+| 运行 | Context + output | Stage 0 | Stage 1 + head | ITL p50 | Decode |
 |---|---:|---:|---:|---:|---:|
-| q38 当前基线 | 8,195 + 32 | 19.08 ms | 19.21 ms | 43.87 ms | **22.84 tok/s** |
-| q38 当前基线 | 8 + 64 | 13.25 ms | 13.10 ms | 31.32 ms | **31.76 tok/s** |
-| q38 优化前 | 约 8K | 40.87 ms | 40.92 ms | 87.03 ms | 约 11.4 tok/s |
-| 旧 DS4 参考 | 约 8K | 25.5 ms（0–23） | 26.0 ms（24–47 + head） | 约 51.5 ms | 约 19.4 tok/s |
+| q38 高吞吐（`durability=off`） | 8,195 + 32 | 18.89 ms | 19.21 ms | 38.65 ms | **25.81 tok/s** |
+| q38 严格持久化 | 8,195 + 32 | 19.08 ms | 19.21 ms | 43.87 ms | **22.84 tok/s** |
+| q38 短上下文基线 | 8 + 64 | 13.25 ms | 13.10 ms | 31.32 ms | **31.76 tok/s** |
+| Decode 优化前的 native runtime | 约 8K | 40.87 ms | 40.92 ms | 87.03 ms | 约 11.4 tok/s |
+| 旧 DS4 参考 | 约 8K | 约 25.5 ms | 约 26.0 ms | 约 51.5 ms | 约 19.4 tok/s |
 
-当前 8K stage 合计为 38.29 ms，对应纯 GPU stage 上限约 26.1 tok/s；端到端 p50
-为 43.87 ms。其差值包含 RPC、事务提交以及启用 snapshot journal 时每个成功写请求的
-`fdatasync`。DS4 行仅是同一机器上的历史工程参考，并非相同 artifact、量化和服务路径的
-严格等价 A/B。
+8K 高吞吐模式下，两段 GPU 计算合计 38.10 ms，而端到端 p50 是 38.65 ms。严格模式更慢，
+是因为每个成功的变更 RPC 都要等待 `fdatasync`；所以任何性能数据都必须同时标明
+durability mode。
 
-这些基准使用合成 token 验证真实 CUDA 状态机、transport 和性能，不代表文本质量。
-原始构建、fixture、profile、fallback A/B 和端到端 JSON 见
-[`READINESS.md`](READINESS.md) 记录的 evidence 目录。
+原始证据、准确命令、已知限制和未完成门禁统一记录在 [READINESS.md](READINESS.md)。
 
-## 模型与量化格式
-
-artifact 必须由固定 commit 的官方 BF16 checkpoint 生成：
+## 架构
 
 ```text
-model          Qwen/Qwen3.8-Flash-Next
-source commit  de4b8e4d43b917e7706784d8bb445c9af86a3540
-policy         Q38_AMPERE_QUANT_POLICY_V5
-stage split    GPU0: layers 0..24; GPU1: layers 25..47 + LM head/MTP
-context limit  262,144 tokens
+OpenAI-compatible 或 token-native client
+                    │
+                    ▼
+       q38_sidecar.py — HTTP / SSE / cancel
+       tokenizer 与 chat template 为可选 codec
+                    │  ExecutorRPC V1 / Unix socket
+                    ▼
+            单 native process、单语义 writer
+                    │
+        ┌───────────┴───────────────────────────┐
+        │                                       │
+ GPU0 / stage 0                         GPU1 / stage 1
+ layers 0..24 + PLE                     layers 25..47 + LM head
+        │                                       ▲
+        └── BF16 4H via pinned-host ring ───────┘
+              不要求 NCCL，也不要求 P2P
 ```
 
-这不是 NVFP4、AWQ、GPTQ 或 GGUF。compiler 从官方 BF16/F32/I64 tensor 直接生成
-Q38 的 stage-owned artifact；量化权重在运行时不会先整体反量化，也不会 repack 成另一种
-框架格式。
+模型按连续层切分。单个 token 必须先经过 stage 0，再进入 stage 1，所以单会话 decode 在
+两卡之间仍是串行的；stage boundary payload 很小，实测 PCIe 带宽不是 decode 瓶颈。
 
-| 张量类别 | artifact 格式 | 运行精度/说明 |
+### 专用 prefill lane
+
+Qwen3.8-Flash-Next 的每个 token 都会路由到 512 个 experts 中的 10 个。旧路径逐 route
+发起大量小任务、重复加载 scale，并通过 FP32 atomic 累加结果。优化后的路径改为：
+
+1. 在 GPU 上构建确定性的 expert-major route plan；
+2. 按 expert 打包 assignment，执行直接 W4/W8-A16 Tensor Core MMQ；
+3. 把 router weight 折叠进中间 activation；
+4. 每个 assignment 单独写出 FP32 结果；
+5. 按固定顺序归约每个 token 的十条 route，不再使用 atomic。
+
+请求会被切成 512-token slabs。三个 pinned-host boundary buffers 按
+`free → GPU0 D2H → ready → GPU1 H2D/compute → free` 循环。当 GPU1 处理 slab *n*
+时，GPU0 可以同时生成 slab *n + 1*；第三个槽位用来保证 buffer ownership 并吸收传输
+时序抖动。这是“两张 GPU + 三个缓冲区”，不是三卡流水。
+
+```text
+时间 ─────────────────────────────────────────────────────────────►
+GPU0   slab 0     slab 1     slab 2     slab 3     ...
+GPU1              slab 0     slab 1     slab 2     ...
+ring      A           B          C          A
+```
+
+`grouped` 是默认 prefill 路径；`Q38_CUDA_PREFILL_MOE=legacy` 仅用于诊断回退，
+`Q38_CUDA_PROFILE_PREFILL=1` 用于 CUDA-event profile。Grouped 路径属于新的 numerical
+identity，不能复用旧算术路径创建的 session 或 READY identity。
+
+### 独立 decode lane
+
+Batch-1 decode 继续使用专用 GEMV/MoE/top-k kernels，不会为了复用 prefill 而把单行补成
+矩阵。QSA 为全部 value dimensions 复用一次 FP32 probability 计算；512-expert router
+使用确定性 stable top-k。诊断回退开关如下：
+
+```sh
+Q38_CUDA_DECODE_GEMV=scalar
+Q38_CUDA_DECODE_MOE=scalar
+Q38_CUDA_DECODE_TOPK=scalar
+Q38_CUDA_PROFILE_DECODE=1
+```
+
+## 模型 artifact 与内存分布
+
+唯一 source of truth 是固定 commit 的官方 BF16 checkpoint：
+
+```text
+repository      Qwen/Qwen3.8-Flash-Next
+source commit   de4b8e4d43b917e7706784d8bb445c9af86a3540
+policy          Q38_AMPERE_QUANT_POLICY_V5
+stage split     GPU0: layers 0..24；GPU1: layers 25..47 + LM head/MTP
+context target  262,144 tokens
+```
+
+这个 artifact **不是 NVFP4、AWQ、GPTQ 或 GGUF**。它由固定版本的官方 checkpoint 直接
+编译成面向 Ampere、版本化、content-addressed 且按 stage ownership 布局的格式。
+
+| Tensor 类别 | 存储格式 | 运行方式 |
 |---|---|---|
-| 第 2–45 层 routed expert gate/up/down | symmetric **W4A16 group-128** | batch-1 专用 W4 GEMV/MoE kernel，BF16 activation |
-| 第 0/1/46/47 层 routed experts | symmetric **W8A16 group-128** | 质量更敏感的边缘 experts |
-| always-active matrices，包括 embedding、LM head、attention/GDN projections、shared expert | symmetric **W8A16 group-128** | BF16 activation；每组 scale 以 BF16 保存 |
-| MTP matrices 与 routed experts | symmetric **W8A16 group-128** | MTP 默认不加载，需显式启用 |
-| SSD-PLE embedding table | row-scaled **FP8 E4M3FN** | 每行一个 BF16 scale；表位于 SSD，不整表常驻 GPU/DRAM |
-| router、norm、gate、hyper-connection、卷积与其他关键控制张量 | **preserve** | 保留上游 BF16/F32/I64 dtype |
-| main QSA K/V 与 compressed index | **BF16** | 256K 容量基线；尚未启用 INT8 KV |
-| GDN recurrent/累加状态 | **FP32** | 避免长序列状态误差累积 |
-| vision tensors | **skip** | 当前是 text-only runtime |
+| Layers 2–45 routed experts | symmetric W4，group 128 | Prefill 使用 W4A16 grouped MMQ；decode 使用 batch-1 W4 kernel |
+| Layers 0/1/46/47 routed experts | symmetric W8，group 128 | W8A16；边缘 experts 保留更高精度 |
+| Embedding、LM head、attention/GDN projections、shared experts 等 always-active matrices | symmetric W8，group 128 | BF16 activation + BF16 group scale |
+| MTP matrices 与 experts | symmetric W8，group 128 | 仅在 `--enable-mtp` 时加载 |
+| PLE embedding table | row-scaled FP8 E4M3FN | 约 47.68 GiB 常驻 SSD；每行一个 BF16 scale |
+| Router、norm、HC、convolution 等关键控制 tensors | 保留 BF16/F32/I64 | 不做一刀切量化 |
+| Main QSA K/V 与 compressed index | BF16 | 256K capacity baseline |
+| GDN recurrent/accumulator state | FP32 | 避免长序列循环误差累积 |
+| Vision tensors | 跳过 | 当前 runtime 仅支持文本 |
 
-具体匹配规则以 [`tools/q38_quant_policy.py`](tools/q38_quant_policy.py) 为唯一事实来源；
-policy digest 会进入 artifact/session identity，策略不匹配时启动器 fail closed。
+只有 PLE table 常驻 SSD。默认 host PLE cache 是 8 GiB，且有硬上限；完整 PLE 不会复制
+进内存或显存。读取路径是 `io_uring READ_FIXED + O_DIRECT → registered pinned host
+buffer → async H2D`，当前实现**没有使用 GPUDirect Storage**。各 stage 的权重与活跃模型
+状态常驻对应 GPU。
 
-## 已实现的关键合同
+[tools/q38_quant_policy.py](tools/q38_quant_policy.py) 中的规则是量化策略唯一真源。策略
+digest、source commit、tensor hashes、stage cut、runtime hash 和 state layout 都属于
+artifact/session identity，任何不一致都会 fail closed。
 
-- 单 semantic writer，append/decode/MTP 统一 prepare → execute → acknowledge → commit；
-- 跨 chunk 的请求级原子 append、双 stage rollback、取消/超时与 request-id 幂等；
-- prefill 的 stage0/stage1 流水，小 decode ring 与三槽大 prefill ring；
-- BF16 QSA KV、GDN/PLE/MTP provisional state，以及 stop-token-aware MTP commit；
-- 无 P2P 的 pinned D2H/handoff/H2D boundary，GPU0 payload checksum 在 GPU1
-  消费前对 pinned-host activation 复验；
-- official BF16 → Ampere W4A16/W8A16/FP8-PLE 的流式、可恢复 artifact compiler；
-- 4 KiB registered-buffer `io_uring READ_FIXED + O_DIRECT` PLE 路径和硬容量 cache；
-- 事务化 RNG/penalties、append-only cold-rebuild snapshot journal；
-- `SessionIdentityV1`、`MetricsSchemaV1`、直接 token 严格门禁和 HTTP/SSE adapter。
+## 运行时保证
 
-生产 CUDA backend 的执行异常会让 executor fail closed；cancel/deadline 仍走完整事务
-rollback。这样 OOM、illegal access、Xid 或 transport corruption 后不会在残留 device
-state 上继续服务。
+- Append、decode、MTP 共用一个 semantic writer 与 commit 顺序。
+- Chunked append 对整个请求保持原子性，并要求双 stage acknowledge；失败完整回滚。
+- 只允许 suffix continuation：不会静默重算或替换已有 prefix；发生 fork 必须 cold rebuild。
+- QSA/GDN/PLE/MTP/RNG provisional state 只在 commit 后发布。
+- 无 P2P 的 pinned-host transport，包含 position 与 payload integrity 校验。
+- 支持 cancellation、deadline、request-ID idempotency 和 stop-token-aware commit。
+- CUDA/device/transport fatal error 会在尝试 rollback 后使 executor 失效，不会在不确定状态
+  上继续执行。
+- Artifact 构建可流式、可恢复，source/output 均有 hash，READY 最后原子发布。
+- 持久化策略显式分为 `strict` 与 `off`，不能把两种模式的数据混在一起比较。
 
-架构与性能门槛见
-[`docs/qwen38-p3-ultra-dual-170hx-256k-optimal-runtime.md`](docs/qwen38-p3-ultra-dual-170hx-256k-optimal-runtime.md)。
-代码证据、未声明项和首轮真机顺序见 [`READINESS.md`](READINESS.md)。
+严格容量目标是 262,080-token prompt 加 64 个已提交输出，最终长度精确等于 262,144。
+这是尚待完成的 release gate，不是已经完成的发布声明。
 
-## Ubuntu 构建与验证
+## 在 Ubuntu 上构建与测试
 
-生产 CMP 170HX 在当前驱动下报告为 GA100（compute capability 8.0），
-默认目标因此固定为 `sm_80`；其他开发卡可用 `CUDA_ARCH=...` 覆盖：
+CUDA 编译与运行均应在 Ubuntu 完成。macOS 可以用来编辑源码，但不是受支持的 runtime
+host。
 
 ```sh
 make clean
 make -j2 build/q38_runtime_tests build/q38-runtime
 ./build/q38_runtime_tests
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
-make -j1 cuda-check cuda-runtime
+make -j1 cuda-check cuda-runtime cuda-test cuda-bench
 ```
 
-GPU 接通后再运行 kernel fixture：
+`make verify PYTHON=.venv/bin/python` 会运行 CPU、Python、CUDA compile 与 runtime build
+门禁；`cuda-test` 需要 GPU。Grouped-MMQ 已通过真实 SM80 fixtures；验证机目前没有安装
+`compute-sanitizer`，因此不能把它写成已通过门禁。
 
-```sh
-make -j1 cuda-test
-make -j1 cuda-bench
-```
+## 准备模型
 
-batch-1 decode 直接消费生产 artifact 的 BF16 activation 与 group-128 W4/W8
-布局。通用矩阵路径使用 warp-per-row GEMV；routed MoE 另有 top-10 gate/up、SiLU
-和 fused down/reduce 路径；512-expert router 使用稳定 tie-break 的并行 bitonic top-k。
-QSA softmax 概率只在 FP32 score scratch 中计算一次，再由 256 个 value 维度复用。
-这些路径都不会把单行 decode 填充成 16 行 WMMA。真机 A/B 或紧急回滚可分别设置
-`Q38_CUDA_DECODE_GEMV=scalar`、`Q38_CUDA_DECODE_MOE=scalar` 和
-`Q38_CUDA_DECODE_TOPK=scalar`；默认启用优化路径。`cuda-bench` 同时输出生产形状的
-GEMV 新旧对比和 routed-MoE 新旧对比。设置 `Q38_CUDA_PROFILE_DECODE=1` 可输出按
-hyper/GDN/QSA/MoE 子路径聚合的 CUDA-event decode profile；默认完全不创建 event。
+仓库不包含模型权重。
 
-`make verify PYTHON=.venv/bin/python` 可执行 CPU、Python 和 CUDA 编译门禁。所有测试与
-运行时都应在 Ubuntu 主机执行；macOS 工作区只用于编辑/同步源码。
-
-## 1. 下载固定的 official BF16 source
+### 1. 固定官方 source manifest
 
 ```sh
 python3 tools/q38_hf_fetch.py \
@@ -154,12 +207,7 @@ python3 tools/q38_hf_fetch.py \
   --manifest-only
 ```
 
-生产 commit 固定为 `de4b8e4d43b917e7706784d8bb445c9af86a3540`。下载器使用
-解析后的 commit URL（不会继续追随 `main`）、`.part` 文件、LFS size/SHA-256 和原子
-rename。这里先只发布固定 manifest；下一步按 shard 流式拉取和转换，避免源权重与最终
-artifact 同时占满本机 468 GB 根盘。
-
-## 2. 生成生产 artifact
+### 2. 流式编译 Q38 artifact
 
 ```sh
 .venv/bin/python tools/q38_prepare_artifact.py \
@@ -173,20 +221,13 @@ artifact 同时占满本机 468 GB 根盘。
   --prune-source-shards
 ```
 
-每个 shard 都按“固定 commit 下载与 LFS 校验 → 有界量化 → fragment/segment SHA-256
-复验 → 删除该 source shard”的顺序执行；中断后即使源 shard 已删除，也能根据 official
-tensor index、fetch manifest 和已验证 fragment 精确续跑。`--prune-source-shards` 是显式的
-磁盘回收开关；磁盘足够且希望保留 BF16 源时可省略。最终只有在两个 stage 的精确 tensor
-census、PLE layout、identity 全部通过后才原子发布 `READY.json`。
+每个 source shard 都会先校验，再以受限内存完成转换并重新 hash，发布成功后才允许删除；
+流程可以断点恢复。磁盘空间充足时可去掉 `--prune-source-shards` 以保留官方 BF16 source。
+只有两个 stage、PLE layout、tensor census 和 identity 全部通过后，才会出现 `READY.json`。
 
-默认精度策略：
+## 启动服务
 
-- routed experts：symmetric group-128 W4A16；
-- always-active 适合项：group-128 W8A16；
-- PLE table：row-scaled FP8 E4M3FN；
-- router/norm/critical state、QSA KV 等按合同保留 BF16/FP32。
-
-## 3. 一键 fail-closed 启动
+默认使用 strict durability：
 
 ```sh
 .venv/bin/python tools/q38_launch.py \
@@ -194,40 +235,31 @@ census、PLE layout、identity 全部通过后才原子发布 `READY.json`。
   --runtime build/q38-cuda-runtime \
   --socket /tmp/q38-executor.sock \
   --snapshot /var/lib/q38/session.q38j \
+  --durability strict \
   --host 127.0.0.1 \
   --port 30000
 ```
 
-启动器在执行 CUDA 前验证 pinned repo/commit/cut、顶层 digest、全部 segment SHA-256、
-identity checksum 及其 8 类输入 digest、context/sampling/parser/stop-token 合同。生产 PLE
-强制 `io_uring + O_DIRECT`；不能建立 direct lane 时启动失败，不静默退回 page cache。
+启动器会在执行 CUDA 前检查 source commit、quantization policy、全部 artifact segments、
+runtime identity、stage plan、state layout 与 context/sampling contracts。生产 PLE 必须成功
+建立 `io_uring + O_DIRECT` lane，不会静默回退到 buffered I/O。
 
-`GET /v1/q38/metrics` 使用固定的 `q38.metrics.v1` ABI，同时报告每 stage 的
-weight arena/上传/host-only、QSA/GDN/PLE/MTP state、workspace、prefill cache、
-boundary/workspace pinned bytes、CUDA tracked current/peak/free/total，以及 executor
-进程 RSS/peak/anon/file/swap、fault、context switch、MemAvailable、swap 与 cgroup
-current/peak/max/OOM。PLE 另外报告 cache current/cap、requested rows、每批去重后的
-page requests、useful/physical bytes（可直接计算 read amplification）、read count/batch/QD、
-io_uring/direct-I/O 状态、P50/P95/P99 与 FP8 row-scale 常驻字节。原始 `cudaMalloc` 路径没有 caching allocator，因此
-`cuda_allocator_retries` 和 `cuda_graph_held_bytes` 在当前实现中应保持 0；prefill
-优化因显存不足回退时由 `cuda_allocation_failures` 单独计数。
-
-启动默认是设计中的 plain/M1 lane：MTP 权重不会上传、draft QSA cache 与 target-HC
-workspace 也不会分配，省下的 artifact 字节通过 `weight_excluded_bytes` 报告。plain
-正确性与显存门禁通过后，给启动器增加 `--enable-mtp` 才会加载官方单层 MTP；该
-checkpoint 首轮只开放 1 个 draft token（即 width-2 target verify），更宽请求会 fail
-closed，不会假装执行 width-3。
-
-先检查而不启动：
+Benchmark 或客户端能够重放完整 canonical token history 时，可以只关闭 crash recovery：
 
 ```sh
-.venv/bin/python tools/q38_launch.py --ready /path/READY.json --dry-run
+.venv/bin/python tools/q38_launch.py \
+  --ready /data/models/Qwen3.8-Flash-Next-q38-cut25/READY.json \
+  --runtime build/q38-cuda-runtime \
+  --durability off
 ```
 
-## 4. Deep-session / SGLang adapter
+`durability=off` 只会移除 snapshot journal 及其 crash-rebuild 保证，不会弱化进程存活期间
+的 transaction、rollback 或 committed-token 语义。`--dry-run` 可只验证 artifact 而不
+启动；MTP 默认关闭，只有 plain lane 的正确性与显存门禁通过后才应使用 `--enable-mtp`。
 
-SGLang 应调用 token-native endpoint；这样其 tokenizer、chat template 和 parser 可以升级，
-executor ABI 不变。创建唯一 live session：
+## API
+
+创建唯一 live session：
 
 ```sh
 curl -sS -X POST http://127.0.0.1:30000/v1/q38/sessions \
@@ -235,7 +267,7 @@ curl -sS -X POST http://127.0.0.1:30000/v1/q38/sessions \
   -d '{"session_id":"deep-1"}'
 ```
 
-追加已 tokenized 的 delta 并生成：
+追加 token IDs 并流式接收已提交输出：
 
 ```sh
 curl -sS -N -X POST \
@@ -244,9 +276,7 @@ curl -sS -N -X POST \
   -d '{"append_token_ids":[1,2,3],"max_new_tokens":64,"stream":true}'
 ```
 
-使用 `full_token_ids` 时，sidecar 会验证它是服务器 canonical tokens 的精确扩展；分叉返回
-`cold_rebuild_required`，不会覆盖 live state。响应只流出 executor 已 commit 的 token event。
-取消、状态和指标入口分别是：
+如果提供 `full_token_ids`，它必须是 server canonical prefix 的精确 extension。运维接口：
 
 ```text
 POST /v1/q38/cancel
@@ -254,38 +284,26 @@ GET  /v1/q38/sessions/{id}
 GET  /v1/q38/metrics
 ```
 
-若安装了 `transformers` 并由启动器加载 official tokenizer，也提供
-`POST /v1/chat/completions`。该兼容路径会单独报告 tokenize 和 exact-prefix 验证耗时。
+配置官方 tokenizer 后，sidecar 还会提供 `POST /v1/chat/completions`。Codec 不进入
+ExecutorRPC ABI，也不拥有模型状态。
 
-## 5. 严格 262K 门禁
+## 验证与路线图
 
-executor 已启动后：
+接下来的发布顺序为：
 
-```sh
-.venv/bin/python tools/q38_strict_gate.py \
-  --socket /tmp/q38-executor.sock \
-  --session-hash 0x380025 \
-  --output out/strict-262080-plus-64.json
-```
+1. 发布 grouped-MMQ numerical identity，并从 cold state 启动；
+2. 固定 tokenizer 生成的 golden prompts，与可信官方 BF16 reference 对比 logits/tokens；
+3. 分别运行全新 32K、128K 和严格 262,080 + 64 门禁，并记录完整 GPU、host、transport
+   与 PLE metrics；
+4. 证明 near-256K suffix continuation 不会重放旧 prefix；
+5. 在每档 context 验证 rollback、cancel、duplicate request、crash recovery 与 fault injection；
+6. Plain lane 全部通过后，再验证 opt-in MTP；
+7. 完成长时间稳定性与 failure-injection soak。
 
-门禁不仅检查长度，还要求：
-
-- `canonical=262144`，`target=stage0=stage1=262143`；
-- exactly one append、63 plain decode transactions、64 published tokens；
-- evaluated/state-committed token census 精确一致；
-- failure、rollback、cancel、deadline 均为零；
-- 输出 prompt/output digest、TTFT/ITL P50/P95/P99、完整版本化 metrics 和主机/GPU 元数据。
-
-合成 tokens 只验证 transport/state。模型 correctness 门禁必须传入 tokenizer 生成的
-`--tokens-json`，并结合 marker/sentinel reference fixture；不能用合成结果声称模型质量通过。
-
-## 发布边界
-
-CPU/mock 的严格门禁证明协议、事务和 262K 容量路径；它不代表真实模型速度或数值正确性。
-真实发布仍必须在两张 170HX 与最终 artifact 上依次通过 8K、32K、128K、262K+64、
-near-256K suffix-only、reference parity、显存/主存门槛和 12 小时 fault-injection soak。
+完整实现/证据边界见 [READINESS.md](READINESS.md)，详细架构与发布门禁见
+[runtime architecture document](docs/qwen38-p3-ultra-dual-170hx-256k-optimal-runtime.md)。
 
 ## License
 
-运行时代码以 [MIT License](LICENSE) 发布。模型权重不属于本许可证；下载、转换和使用
-Qwen3.8-Flash-Next 时仍须遵守上游模型仓库的许可条款。
+运行时代码使用 [MIT License](LICENSE)。模型权重不属于本许可范围；下载、转换及使用模型
+仍须遵守上游仓库许可。

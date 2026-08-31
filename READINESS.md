@@ -37,11 +37,33 @@ Executed on Ubuntu `p3-ultra`, not on the macOS editing workspace:
   13.25 + 13.10 ms.
 - Final 8195+32 plain decode: 22.84 tok/s, ITL p50 43.87 ms, stage p50
   19.08 + 19.21 ms.  The original 8K native baseline was 11.4 tok/s.
+- The identical 8195+32 run with explicit `durability=off` reached 25.81 tok/s,
+  ITL p50 38.65 ms, and stage p50 18.89 + 19.21 ms.  Only about 0.55 ms
+  remained outside GPU execution; strict per-token journal sync accounted for
+  the remaining 5.22 ms difference.  These are separate durability contracts,
+  not interchangeable benchmark labels.
 - Both end-to-end runs reported zero executor failure/rollback/cancel/deadline,
   CUDA allocation failure, boundary wait, or PLE read error.  The ordered
   parallel top-k reproduced the scalar reference's initial short greedy tokens.
 - Raw build, fixture, profile, fallback A/B and end-to-end evidence is archived
   beside this worktree in `validation-native-decode/VALIDATION.md`.
+- The first grouped-MMQ prefill implementation passed W4/W8 fixtures on both
+  SM80 boards, including deterministic route-plan construction, stable inverse
+  mapping, exact task/workspace bounds, invalid-expert fail-closed behavior,
+  hidden packing, and bitwise equality of grouped/safe dispatches. The host does
+  not read the route plan between kernels.
+- On a fresh no-journal runtime, 4,096 synthetic append tokens improved from
+  54.66 s (74.93 tok/s) on the legacy tile-32 atomic path to 5.02 s
+  (**815.78 tok/s**) with 512-token grouped-MMQ slabs and the existing dual-stage
+  pipeline. A serialized-stage slab-512 run measured 8.62 s (475.15 tok/s),
+  isolating the scheduler overlap gain. The following 4K-context 64-step decode
+  probe measured 27.89 tok/s and 35.01 ms ITL p50.
+- Raw JSON and CUDA-event logs for the 54.66 s, 22.36 s, 8.62 s, 5.05 s and
+  clean 5.02 s runs are archived in the sibling
+  `.artifacts/q38-prefill-grouped-mmq-r1` evidence directory. This grouped
+  arithmetic still requires a new production identity and golden model-quality
+  validation; testing used an explicitly manual development launch because the
+  old READY correctly rejected the changed runtime hash.
 
 These synthetic-token runs prove real CUDA state mechanics and performance, but
 they do **not** by themselves prove model quality or the strict 262K release
