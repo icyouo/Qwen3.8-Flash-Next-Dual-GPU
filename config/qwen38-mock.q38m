@@ -1,0 +1,26 @@
+# ModelArtifactManifestV1 development fixture. Paths are identities only for the
+# mock backend; the production loader will verify their hashes before mapping.
+schema_version=1
+model_id=Qwen3.8-Flash-Next
+artifact_sha256=0000000000000000000000000000000000000000000000000000000000000000
+tokenizer_sha256=0000000000000000000000000000000000000000000000000000000000000000
+tensor_layout_version=q38-layout-v1
+stage_plan_id=mock-24-24
+context_limit=262144
+vocab_size=248320
+model_hidden_width=2560
+boundary_hidden_width=10240
+layer_count=48
+stage0_first=0
+stage0_count=24
+stage1_first=24
+stage1_count=24
+ple_layer=1
+qsa_layers=3,7,11,15,19,23,27,31,35,39,43,47
+qsa_main_dtype=bf16
+ple_storage_dtype=bf16
+stage0_weights=stage0.weights
+stage1_weights=stage1.weights
+mtp_weights=mtp.weights
+ple_manifest=ple/ple-manifest.json
+
