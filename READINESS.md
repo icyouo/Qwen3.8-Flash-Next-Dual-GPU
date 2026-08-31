@@ -1,4 +1,4 @@
-# Q38 runtime test readiness
+# Qwen3.8-Flash-Next-Dual-GPU test readiness
 
 This file records the boundary between implementation evidence and the first
 real dual-GPU/model run. It deliberately does not treat mock execution or a

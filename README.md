@@ -1,4 +1,4 @@
-# q38-runtime
+# Qwen3.8-Flash-Next-Dual-GPU
 
 面向 **Qwen3.8-Flash-Next** 和双 64 GiB CMP 170HX（SM80）的专用长上下文推理
 运行时。目标是在两张没有 GPU P2P、单卡仅 PCIe 2.0 x4 的 Ampere 卡上完整容纳模型，
@@ -7,6 +7,10 @@
 本项目不是 vLLM、SGLang 或 llama.cpp 的 fork。模型数据面、离线量化、双卡调度、
 KV/循环状态、事务、SSD-PLE、artifact 格式及 CUDA kernels 均由本仓库实现。HTTP、
 tokenizer、chat template 和 SSE 是可替换的控制面；SGLang 不是运行时依赖。
+
+仓库公开名称为 **Qwen3.8-Flash-Next-Dual-GPU**。`q38` 继续作为精简的内部工程前缀，
+用于可执行文件、ExecutorRPC ABI、artifact schema、环境变量与工具名称；它不限定未来
+支持的双卡型号。
 
 > **项目状态：research preview。** 双卡真机已建立可重复的 8K decode 性能基线，
 > 但 tokenizer golden parity、32K/128K/严格 256K、MTP 和长时间稳定性门禁尚未全部完成。
