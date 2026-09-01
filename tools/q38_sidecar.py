@@ -34,6 +34,50 @@ from q38_control_plane import (  # noqa: E402
 
 MAX_BODY_BYTES = 16 << 20
 FUNCTION_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
+OUTPUT_TOKEN_FIELDS = (
+    "max_completion_tokens",
+    "max_tokens",
+    "max_new_tokens",
+    "max_output_tokens",
+)
+
+
+def _resolve_output_tokens(
+    body: dict[str, Any],
+    *,
+    default_tokens: int | None,
+    maximum_tokens: int | None,
+    available_tokens: int,
+) -> int:
+    """Resolve OpenAI and common local-runtime output-length aliases."""
+
+    selected: str | None = None
+    value: object = available_tokens if default_tokens is None else default_tokens
+    for field in OUTPUT_TOKEN_FIELDS:
+        if field in body and body[field] is not None:
+            selected = field
+            value = body[field]
+            break
+    if available_tokens <= 0:
+        raise ControlPlaneError(
+            422,
+            "context_length_exceeded",
+            "the prompt leaves no context capacity for output tokens",
+        )
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ControlPlaneError(
+            400,
+            "invalid_max_tokens",
+            f"{selected or 'default output limit'} must be a positive integer",
+        )
+    if selected is not None and value > available_tokens:
+        raise ControlPlaneError(
+            422,
+            "context_length_exceeded",
+            f"{selected}={value} exceeds the {available_tokens} output tokens remaining in context",
+        )
+    server_limit = available_tokens if maximum_tokens is None else maximum_tokens
+    return min(value, server_limit, available_tokens)
 
 
 def _function_tools(value: object) -> list[dict[str, object]]:
@@ -251,10 +295,24 @@ class SidecarApplication:
         *,
         codec: HuggingFaceCodec | None,
         api_key: str | None,
+        default_max_tokens: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
+        if (
+            (default_max_tokens is not None and default_max_tokens <= 0)
+            or (max_output_tokens is not None and max_output_tokens <= 0)
+            or (
+                default_max_tokens is not None
+                and max_output_tokens is not None
+                and default_max_tokens > max_output_tokens
+            )
+        ):
+            raise ValueError("invalid sidecar output-token limits")
         self.control = control
         self.codec = codec
         self.api_key = api_key
+        self.default_max_tokens = default_max_tokens
+        self.max_output_tokens = max_output_tokens
 
 
 class Q38RequestHandler(BaseHTTPRequestHandler):
@@ -450,11 +508,31 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _token_execute(self, session_id: str, body: dict[str, Any]) -> None:
-        max_tokens = int(body.get("max_new_tokens", 1))
         timeout = body.get("timeout_ms")
         mode = str(body.get("mode", "plain"))
         width = int(body.get("mtp_width", 1))
         stream = bool(body.get("stream", False))
+        if "full_token_ids" in body:
+            full_tokens = body["full_token_ids"]
+            if not isinstance(full_tokens, list):
+                raise ControlPlaneError(
+                    400, "invalid_tokens", "full_token_ids must be a list"
+                )
+            available = self.app.control.context_limit - len(full_tokens)
+        else:
+            append = body.get("append_token_ids", [])
+            if not isinstance(append, list):
+                raise ControlPlaneError(
+                    400, "invalid_tokens", "append_token_ids must be a list"
+                )
+            session = self.app.control.session(session_id)
+            available = int(session["remaining_tokens"]) - len(append)
+        max_tokens = _resolve_output_tokens(
+            body,
+            default_tokens=self.app.default_max_tokens,
+            maximum_tokens=self.app.max_output_tokens,
+            available_tokens=available,
+        )
         if "full_token_ids" in body:
             iterator = (
                 event
@@ -517,7 +595,12 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
             reasoning_effort=reasoning_effort,
         )
         tokenize_ns = time.perf_counter_ns() - encode_started
-        max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 1)))
+        max_tokens = _resolve_output_tokens(
+            body,
+            default_tokens=self.app.default_max_tokens,
+            maximum_tokens=self.app.max_output_tokens,
+            available_tokens=self.app.control.context_limit - len(history),
+        )
         mode = str(body.get("q38_mode", "plain"))
         width = int(body.get("q38_mtp_width", 1))
         timeout = body.get("q38_timeout_ms")
@@ -748,11 +831,33 @@ def main() -> int:
     parser.add_argument("--tokenizer", type=Path)
     parser.add_argument("--api-key")
     parser.add_argument("--timeout-ms", type=int, default=3_600_000)
+    parser.add_argument(
+        "--default-max-tokens",
+        type=int,
+        default=0,
+        help="default output budget; 0 uses all context remaining after the prompt",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=0,
+        help="optional server output cap; 0 uses the model context limit",
+    )
     parser.add_argument("--stop-token-id", type=int, action="append", default=[])
     parser.add_argument("--enable-mtp", action="store_true")
     arguments = parser.parse_args()
     if arguments.host not in ("127.0.0.1", "::1", "localhost") and not arguments.api_key:
         parser.error("non-loopback binding requires --api-key")
+    if (
+        arguments.default_max_tokens < 0
+        or arguments.max_output_tokens < 0
+        or (
+            arguments.default_max_tokens
+            and arguments.max_output_tokens
+            and arguments.default_max_tokens > arguments.max_output_tokens
+        )
+    ):
+        parser.error("output-token limits must be nonnegative and default <= maximum")
     codec = HuggingFaceCodec(arguments.tokenizer) if arguments.tokenizer else None
     stop_tokens = set(arguments.stop_token_id)
     if codec is not None:
@@ -769,7 +874,13 @@ def main() -> int:
     )
     server = Q38HttpServer(
         (arguments.host, arguments.port),
-        SidecarApplication(control, codec=codec, api_key=arguments.api_key),
+        SidecarApplication(
+            control,
+            codec=codec,
+            api_key=arguments.api_key,
+            default_max_tokens=arguments.default_max_tokens or None,
+            max_output_tokens=arguments.max_output_tokens or None,
+        ),
     )
     print(
         json.dumps(

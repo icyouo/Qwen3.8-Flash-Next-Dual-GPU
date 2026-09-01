@@ -19,6 +19,7 @@ from q38_sidecar import (  # noqa: E402
     _function_tools,
     _normalize_messages,
     _parse_tool_output,
+    _resolve_output_tokens,
     _tool_choice,
     _validate_output_tools,
 )
@@ -168,6 +169,49 @@ class ToolProtocolTest(unittest.TestCase):
         with self.assertRaises(ControlPlaneError) as unavailable:
             _validate_output_tools(calls, tools, False)
         self.assertEqual(unavailable.exception.code, "unknown_tool_call")
+
+
+class OutputTokenLimitTest(unittest.TestCase):
+    def resolve(self, body: dict[str, object], available: int = 10_000) -> int:
+        return _resolve_output_tokens(
+            body,
+            default_tokens=None,
+            maximum_tokens=None,
+            available_tokens=available,
+        )
+
+    def test_default_uses_all_context_remaining_after_the_prompt(self) -> None:
+        self.assertEqual(self.resolve({}), 10_000)
+        self.assertEqual(self.resolve({}, available=64), 64)
+
+    def test_supports_common_aliases_with_openai_precedence(self) -> None:
+        self.assertEqual(self.resolve({"max_tokens": 512}), 512)
+        self.assertEqual(self.resolve({"max_new_tokens": 768}), 768)
+        self.assertEqual(self.resolve({"max_output_tokens": 1024}), 1024)
+        self.assertEqual(
+            self.resolve({"max_tokens": 512, "max_completion_tokens": 256}),
+            256,
+        )
+
+    def test_caps_explicit_output_at_the_server_limit(self) -> None:
+        self.assertEqual(
+            _resolve_output_tokens(
+                {"max_tokens": 50_000},
+                default_tokens=None,
+                maximum_tokens=32768,
+                available_tokens=60_000,
+            ),
+            32768,
+        )
+
+    def test_rejects_invalid_or_impossible_explicit_limits(self) -> None:
+        for value in (0, -1, True, 1.5, "64"):
+            with self.subTest(value=value), self.assertRaises(ControlPlaneError) as caught:
+                self.resolve({"max_tokens": value})
+            self.assertEqual(caught.exception.code, "invalid_max_tokens")
+        with self.assertRaises(ControlPlaneError) as exhausted:
+            self.resolve({"max_tokens": 65}, available=64)
+        self.assertEqual(exhausted.exception.status, 422)
 
 
 if __name__ == "__main__":

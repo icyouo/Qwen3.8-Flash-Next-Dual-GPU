@@ -356,6 +356,12 @@ assistant `tool_calls` 和后续 `role: tool`；Qwen 官方 XML tool syntax 会�
 `tool_calls`。Tool 模式的流式响应会先缓冲到完整调用通过结构校验，再输出
 `delta.tool_calls`。
 
+输出长度依次识别 `max_completion_tokens`、`max_tokens`、`max_new_tokens` 与
+`max_output_tokens`。全部缺省时，输出预算等于 prompt 之后剩余的完整模型上下文；EOS、
+stop token 或 tool completion 仍可提前结束。显式请求超过剩余上下文会返回 HTTP 422。
+可通过 `--default-max-tokens` 与 `--max-output-tokens` 设置更小的服务端默认值或硬上限；
+两者默认为 0，表示不施加低于模型上下文的额外限制。
+
 ## 验证与路线图
 
 接下来的发布顺序为：

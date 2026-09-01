@@ -405,6 +405,15 @@ syntax is parsed into OpenAI `tool_calls`; tool-enabled streaming buffers the
 candidate until the complete call is structurally valid, then emits
 `delta.tool_calls`.
 
+Output length accepts `max_completion_tokens`, `max_tokens`,
+`max_new_tokens`, and `max_output_tokens` in that precedence order. If none is
+provided, the budget is the full model context remaining after the prompt;
+EOS, stop tokens, and tool completion may still end generation earlier. An
+explicit request larger than the remaining context returns HTTP 422. Optional
+`--default-max-tokens` and `--max-output-tokens` server flags can impose a
+smaller default or hard cap; zero (the default) means no limit below the model
+context.
+
 ## Validation and roadmap
 
 The immediate release sequence is:
