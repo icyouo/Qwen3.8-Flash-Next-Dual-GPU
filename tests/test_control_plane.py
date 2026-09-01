@@ -165,6 +165,19 @@ class ControlPlaneTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "cold_rebuild_required")
         self.assertEqual(control.session(session)["committed_tokens"], 5)
 
+    def test_full_history_continues_after_generated_pending_token(self) -> None:
+        transport, control, session = self.make()
+        control.append_tokens(session, [1, 2, 3])
+        generated = list(control.generate(session, 2))
+        history = [1, 2, 3] + [
+            token for event in generated for token in event.token_ids
+        ]
+        state, timing = control.append_full_history(session, history + [4, 5, 6])
+        self.assertEqual(state["committed_tokens"], 8)
+        self.assertEqual(timing["prefix_tokens"], 5)
+        self.assertEqual(timing["suffix_tokens"], 3)
+        self.assertEqual(transport.target, 8)
+
     def test_budget_is_hard_and_non_mutating(self) -> None:
         _transport, control, session = self.make(limit=4)
         control.append_tokens(session, [1, 2, 3])

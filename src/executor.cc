@@ -201,7 +201,8 @@ struct DualStageExecutor::Impl {
     PairResult run_transaction(TxnKind kind,
                                const std::vector<std::int32_t>& eval_tokens,
                                std::uint32_t chunk_tokens,
-                               std::shared_ptr<CancellationToken> cancellation) {
+                               std::shared_ptr<CancellationToken> cancellation,
+                               std::uint32_t appended_count = 0) {
         ensure_healthy();
         if (cancellation) cancellation->throw_if_requested();
         if (eval_tokens.empty())
@@ -213,7 +214,7 @@ struct DualStageExecutor::Impl {
         const auto evaluated = static_cast<std::uint32_t>(eval_tokens.size());
         const bool prepared =
             kind == TxnKind::kAppendKnown
-                ? engine.prepare_append_known(evaluated, &error)
+                ? engine.prepare_append_known(appended_count, evaluated, &error)
                 : engine.prepare(kind, evaluated, &error);
         if (!prepared)
             throw std::runtime_error("prepare failed: " + error);
@@ -476,9 +477,18 @@ void DualStageExecutor::append(
                                std::min<std::uint64_t>(
                                    canonical, impl_->options.context_limit))
         throw std::length_error("append exceeds the configured context limit");
-    auto result = impl_->run_transaction(TxnKind::kAppendKnown, token_ids,
-                                         impl_->options.append_chunk_tokens,
-                                         std::move(cancellation));
+    const auto& frontiers = impl_->engine.frontiers();
+    const auto pending = frontiers.canonical - frontiers.target;
+    if (pending > 1)
+        throw std::runtime_error("append has more than one pending token");
+    std::vector<std::int32_t> evaluated;
+    evaluated.reserve(token_ids.size() + static_cast<std::size_t>(pending));
+    if (pending == 1)
+        evaluated.push_back(impl_->tokens.at(frontiers.target));
+    evaluated.insert(evaluated.end(), token_ids.begin(), token_ids.end());
+    auto result = impl_->run_transaction(
+        TxnKind::kAppendKnown, evaluated, impl_->options.append_chunk_tokens,
+        std::move(cancellation), static_cast<std::uint32_t>(token_ids.size()));
     impl_->tokens.insert(impl_->tokens.end(), token_ids.begin(), token_ids.end());
     impl_->sampler.commit_tokens(token_ids);
     impl_->last_sample = result.stage1.next_token;

@@ -26,8 +26,13 @@ public:
 
     bool append_known(std::uint32_t count, std::string* error);
     // Atomically reserves a known suffix and prepares one request-wide
-    // transaction.  Rollback restores the pre-request canonical frontier.
+    // transaction. evaluated_count may include the one already-canonical
+    // pending model token that must be evaluated before the new suffix.
+    // Rollback restores the pre-request canonical frontier.
     bool prepare_append_known(std::uint32_t count, std::string* error);
+    bool prepare_append_known(std::uint32_t appended_count,
+                              std::uint32_t evaluated_count,
+                              std::string* error);
     bool seed_decode_pending(std::string* error);
     bool prepare(TxnKind kind, std::uint32_t evaluated_count,
                  std::string* error);

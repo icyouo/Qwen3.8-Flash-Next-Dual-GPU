@@ -11,6 +11,7 @@
 #include "q38/transaction.h"
 #include "q38/tensor_index.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -227,6 +228,31 @@ void test_transactions() {
         CHECK(atomic.frontiers().epoch == 1);
     }
 
+    {
+        q38::SessionTxnEngine continuation(0x171);
+        std::string continuation_error;
+        CHECK(continuation.prepare_append_known(4, &continuation_error));
+        ack_and_decide(&continuation, 4);
+        q38::CommitEventV1 continuation_event;
+        CHECK(continuation.commit(&continuation_event, &continuation_error));
+        CHECK(continuation.seed_decode_pending(&continuation_error));
+        CHECK(continuation.frontiers().canonical == 5);
+        CHECK(continuation.frontiers().target == 4);
+        CHECK(continuation.prepare_append_known(3, 4, &continuation_error));
+        CHECK(continuation.active_transaction().base_target == 4);
+        CHECK(continuation.active_transaction().base_canonical == 5);
+        CHECK(continuation.active_transaction().evaluated_count == 4);
+        CHECK(continuation.frontiers().canonical == 8);
+        CHECK(continuation.rollback(&continuation_error));
+        CHECK(continuation.frontiers().canonical == 5);
+        CHECK(continuation.frontiers().target == 4);
+        CHECK(continuation.prepare_append_known(3, 4, &continuation_error));
+        ack_and_decide(&continuation, 4);
+        CHECK(continuation.commit(&continuation_event, &continuation_error));
+        CHECK(continuation.frontiers().canonical == 8);
+        CHECK(continuation.frontiers().target == 8);
+    }
+
     q38::SessionTxnEngine engine(0x1234);
     std::string error;
     CHECK(engine.append_known(8, &error));
@@ -338,6 +364,15 @@ void test_mock_executor() {
     const auto plain = executor->decode_one();
     CHECK(plain.published_tokens.size() == 1);
     CHECK(executor->frontiers().canonical - executor->frontiers().target == 1);
+    const auto before_suffix = executor->canonical_tokens();
+    executor->append({90, 91, 92, 93});
+    CHECK(executor->frontiers().canonical == before_suffix.size() + 4);
+    CHECK(executor->frontiers().target == executor->frontiers().canonical);
+    CHECK(executor->canonical_tokens().size() == before_suffix.size() + 4);
+    CHECK(std::equal(before_suffix.begin(), before_suffix.end(),
+                     executor->canonical_tokens().begin()));
+    CHECK(executor->canonical_tokens()[before_suffix.size()] == 90);
+    (void)executor->seed_decode();
     for (int i = 0; i < 50; ++i) {
         const auto speculative = executor->speculative_step(5);
         CHECK(!speculative.published_tokens.empty());

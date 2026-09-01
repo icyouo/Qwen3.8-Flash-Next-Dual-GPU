@@ -28,13 +28,24 @@ bool SessionTxnEngine::append_known(std::uint32_t count, std::string* error) {
 
 bool SessionTxnEngine::prepare_append_known(std::uint32_t count,
                                             std::string* error) {
+    return prepare_append_known(count, count, error);
+}
+
+bool SessionTxnEngine::prepare_append_known(std::uint32_t appended_count,
+                                            std::uint32_t evaluated_count,
+                                            std::string* error) {
     if (active_) return fail(error, "transaction already active");
-    if (count == 0) return fail(error, "cannot append zero known tokens");
-    if (frontiers_.canonical != frontiers_.target)
-        return fail(error, "append request requires no prior pending suffix");
+    if (appended_count == 0)
+        return fail(error, "cannot append zero known tokens");
+    if (!validate_frontiers(frontiers_, error)) return false;
+    const auto pending = frontiers_.canonical - frontiers_.target;
+    if (pending > 1)
+        return fail(error, "append request has too many pending tokens");
+    if (evaluated_count != appended_count + pending)
+        return fail(error, "append evaluated range does not cover pending suffix");
     const auto base_canonical = frontiers_.canonical;
-    if (!add_checked(&frontiers_.canonical, count, error)) return false;
-    if (!prepare(TxnKind::kAppendKnown, count, error)) {
+    if (!add_checked(&frontiers_.canonical, appended_count, error)) return false;
+    if (!prepare(TxnKind::kAppendKnown, evaluated_count, error)) {
         frontiers_.canonical = base_canonical;
         return false;
     }
