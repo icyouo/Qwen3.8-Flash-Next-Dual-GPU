@@ -45,11 +45,11 @@ across both GPUs.
 | Grouped MMQ; internal tile 32 | 4,096 | 22.36 s | 183.15 tok/s |
 | Grouped MMQ; 512-token slabs; serialized stages | 4,096 | 8.62 s | 475.15 tok/s |
 | **Grouped MMQ; 512-token slabs; pipelined stages** | **512** | **5.02 s** | **815.78 tok/s** |
-| **Current: pipelined + GDN precompute + W4/QSA caches** | **512** | **3.09 s** | **1,327.58 tok/s** |
+| **Current: + resident GDN state + tiled QSA reuse** | **512** | **2.74 s** | **1,497.04 tok/s** |
 | Historical DS4 reference | n/a | 5.27 s for 4,102 tokens | 777.9 tok/s |
 
 The final row is a historical measurement from the same machine, not a strict
-artifact-for-artifact comparison. The current q38 result is **17.7×** the
+artifact-for-artifact comparison. The current q38 result is **20.0×** the
 original native prefill baseline and exceeds the prior DS4 performance class.
 The input was a repeated synthetic token sequence, so this is a real CUDA and
 state-machine benchmark, not a text-quality result.
@@ -60,9 +60,32 @@ other two rows do not.
 
 | Actual prefill tokens | Profiling | Append time | Prefill |
 |---:|---|---:|---:|
-| 4,096 | off | 3.085 s | **1,327.58 tok/s** |
-| 32,768 | detailed | 22.605 s | **1,449.60 tok/s** |
-| 262,080 | off | 197.479 s | **1,327.13 tok/s** |
+| 4,096 | off | 2.736 s | **1,497.04 tok/s** |
+| 32,768 | detailed | 19.640 s | **1,668.40 tok/s** |
+| 262,080 | off | 174.363 s | **1,503.07 tok/s** |
+
+The 32K gate repeated at 1,668.40--1,668.72 tok/s. Relative to the preceding
+published checkpoint, the three rows improved by 12.8%, 15.1%, and 13.3%,
+respectively. In the final 256K run, the following five decode steps reached
+26.82 tok/s with 34.24 ms ITL p50; decode kernels were not changed by this
+prefill revision.
+
+The same build also passed a five-turn coding-style continuation probe. The
+first turn was a cold 4K prefill; each later turn reused the live recurrent and
+QSA state and appended a fresh 1,024-token suffix. The extra evaluated token is
+the previously generated continuation at the session frontier.
+
+| Turn | New user tokens | Newly evaluated | Prefill / suffix | Decode |
+|---:|---:|---:|---:|---:|
+| 0, cold | 4,096 | 4,096 | **1,497.04 tok/s** | 29.75 tok/s |
+| 1, incremental | 1,024 | 1,025 | **1,182.22 tok/s** | 30.69 tok/s |
+| 2, incremental | 1,024 | 1,025 | **1,167.95 tok/s** | 30.84 tok/s |
+| 3, incremental | 1,024 | 1,025 | **1,166.96 tok/s** | 30.56 tok/s |
+| 4, incremental | 1,024 | 1,025 | **1,159.85 tok/s** | 30.70 tok/s |
+
+Conditions: single concurrency, `durability=off`, MTP disabled, and five
+measured decode steps per turn. These are live-session incremental hits, not
+radix-cache or prompt-cache simulations.
 
 ### Decode
 
@@ -225,6 +248,20 @@ with FP32 atomics. The optimized lane instead:
 3. folds router weights into the intermediate activation;
 4. writes one FP32 output per assignment; and
 5. reduces each token's ten routes in a fixed order without atomics.
+
+The recurrent GDN prefill kernel assigns each CTA one 128x32 state-column tile.
+Every thread keeps four FP32 state cells in registers for the entire 512-token
+slab, loads them once, reuses each normalized key for both recurrent phases,
+and writes the cells back once. The last-slab GDN recurrent time fell from
+69.47 to 34.95 ms on stage 0 and from 62.35 to 30.78 ms on stage 1.
+
+Grouped QSA uses a 32-position score key tile to reduce score-CTA shared memory
+from about 38 KiB to 22 KiB. Its value kernel stages 64 selected positions and
+all twelve shared-query-head scores so 256 value-dimension threads reuse them;
+last-slab `qsa_value` fell from 22.17 to about 13.15 ms. Both changes retain the
+existing FP32 operation order. A full-vocabulary parity gate compared all
+248,320 BF16 logits against the preceding path with zero mismatches and the
+same selected token.
 
 The request is divided into 512-token slabs. Three pinned-host boundary buffers
 rotate through `free → GPU0 D2H → ready → GPU1 H2D/compute → free`. While GPU1

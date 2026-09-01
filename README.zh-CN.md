@@ -38,11 +38,11 @@ MTP。
 | Grouped MMQ；内部 tile 32 | 4,096 | 22.36 s | 183.15 tok/s |
 | Grouped MMQ；512-token slab；双 stage 串行 | 4,096 | 8.62 s | 475.15 tok/s |
 | **Grouped MMQ；512-token slab；双 stage 流水** | **512** | **5.02 s** | **815.78 tok/s** |
-| **当前版：流水 + GDN 预计算 + W4/QSA 缓存** | **512** | **3.09 s** | **1,327.58 tok/s** |
+| **当前版：+ GDN 状态驻留 + QSA 分块复用** | **512** | **2.74 s** | **1,497.04 tok/s** |
 | 旧 DS4 参考 | 不适用 | 4,102 tokens 用时 5.27 s | 777.9 tok/s |
 
 最后一行是同一机器上的历史数据，并非相同 artifact 的严格 A/B。当前 q38 路径相对最初
-native prefill 提升 **17.7×**，超过了此前 DS4 的性能级别。输入为重复的合成 token，
+native prefill 提升 **20.0×**，超过了此前 DS4 的性能级别。输入为重复的合成 token，
 因此它是真实 CUDA 与状态机性能测试，不是文本质量结论。
 
 最新版普通模式（关闭 MTP）的实测如下。32K 一行有意开启了细粒度 CUDA stage profiling，
@@ -50,9 +50,28 @@ native prefill 提升 **17.7×**，超过了此前 DS4 的性能级别。输入�
 
 | 实际 prefill tokens | Profiling | Append 时间 | Prefill |
 |---:|---|---:|---:|
-| 4,096 | 关闭 | 3.085 s | **1,327.58 tok/s** |
-| 32,768 | 细粒度 | 22.605 s | **1,449.60 tok/s** |
-| 262,080 | 关闭 | 197.479 s | **1,327.13 tok/s** |
+| 4,096 | 关闭 | 2.736 s | **1,497.04 tok/s** |
+| 32,768 | 细粒度 | 19.640 s | **1,668.40 tok/s** |
+| 262,080 | 关闭 | 174.363 s | **1,503.07 tok/s** |
+
+32K 门禁复测结果稳定在 1,668.40--1,668.72 tok/s。相较上一版已发布 checkpoint，三档
+分别提升 12.8%、15.1% 和 13.3%。最终 256K 测试后的五步 decode 为 26.82 tok/s、
+ITL p50 34.24 ms；本次 prefill 修改没有改变 decode kernels。
+
+同一 build 还通过了五轮 coding 风格增量测试。首轮冷启动 prefill 4K，随后每一轮都复用
+在线 recurrent/QSA 状态并追加一段新的 1,024-token suffix。多计算的一个 token 是会话
+frontier 上一轮已生成的 continuation。
+
+| 轮次 | 新增用户 tokens | 实际新计算 | Prefill / suffix | Decode |
+|---:|---:|---:|---:|---:|
+| 0，冷启动 | 4,096 | 4,096 | **1,497.04 tok/s** | 29.75 tok/s |
+| 1，增量 | 1,024 | 1,025 | **1,182.22 tok/s** | 30.69 tok/s |
+| 2，增量 | 1,024 | 1,025 | **1,167.95 tok/s** | 30.84 tok/s |
+| 3，增量 | 1,024 | 1,025 | **1,166.96 tok/s** | 30.56 tok/s |
+| 4，增量 | 1,024 | 1,025 | **1,159.85 tok/s** | 30.70 tok/s |
+
+测试条件：单并发、`durability=off`、关闭 MTP，每轮测五步 decode。这是实时会话的
+incremental hit，不是 radix cache 或 prompt cache 模拟。
 
 ### Decode
 
@@ -192,6 +211,18 @@ Qwen3.8-Flash-Next 的每个 token 都会路由到 512 个 experts 中的 10 个
 3. 把 router weight 折叠进中间 activation；
 4. 每个 assignment 单独写出 FP32 结果；
 5. 按固定顺序归约每个 token 的十条 route，不再使用 atomic。
+
+GDN prefill recurrent kernel 为每个 CTA 分配一块 128x32 state-column tile。每个 thread
+在整个 512-token slab 内把四个 FP32 state cell 驻留在寄存器中：只加载一次、让每个
+normalized key 同时复用于两个 recurrent phase，最后只写回一次。末个 slab 的 GDN
+recurrent 耗时在 stage 0 从 69.47 ms 降至 34.95 ms，在 stage 1 从 62.35 ms 降至
+30.78 ms。
+
+Grouped QSA 把 score key tile 调为 32 个位置，使 score CTA 的 shared memory 从约
+38 KiB 降至 22 KiB。Value kernel 则一次暂存 64 个 selected position 及其全部 12 个
+共享 query head 的 score，让 256 个 value-dimension thread 复用；末个 slab 的
+`qsa_value` 从 22.17 ms 降至约 13.15 ms。两项修改都保留原有 FP32 运算顺序。全词表
+parity 门禁逐一比较了 248,320 个 BF16 logits，结果零 mismatch，最终 token 也完全一致。
 
 请求会被切成 512-token slabs。三个 pinned-host boundary buffers 按
 `free → GPU0 D2H → ready → GPU1 H2D/compute → free` 循环。当 GPU1 处理 slab *n*

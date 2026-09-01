@@ -487,6 +487,21 @@ __global__ void gdn_recurrent_prefill_precomputed_kernel(
     __shared__ float partial[kQ38GdnHeadWidth * kGdnPartitionColumns];
     __shared__ float deltas[kGdnPartitionColumns];
 
+    // One 1024-thread CTA owns a complete 128x32 state-column tile.  Each
+    // thread is therefore responsible for exactly four key rows.  Keep those
+    // FP32 cells resident for the entire slab instead of round-tripping the
+    // whole recurrent state through global memory twice per token.
+    float resident_state[4];
+#pragma unroll
+    for (std::uint32_t item = 0; item < 4; ++item) {
+        const auto key_element = key_lane + item * 32;
+        const auto state_index =
+            state_base + static_cast<std::uint64_t>(key_element) *
+                             kQ38GdnHeadWidth +
+            output_element;
+        resident_state[item] = state[state_index];
+    }
+
     for (std::uint32_t token = 0; token < tokens; ++token) {
         const auto token_base =
             static_cast<std::uint64_t>(token) * kQ38GdnQkvWidth;
@@ -501,18 +516,16 @@ __global__ void gdn_recurrent_prefill_precomputed_kernel(
         const float beta = betas[value_index];
 
         float memory_partial = 0.0f;
-        for (std::uint32_t key_element = key_lane;
-             key_element < kQ38GdnHeadWidth; key_element += 32) {
-            const auto state_index =
-                state_base + static_cast<std::uint64_t>(key_element) *
-                                 kQ38GdnHeadWidth +
-                output_element;
-            const float decayed = state[state_index] * decay;
-            state[state_index] = decayed;
-            const float key =
+        float normalized_keys[4];
+#pragma unroll
+        for (std::uint32_t item = 0; item < 4; ++item) {
+            const auto key_element = key_lane + item * 32;
+            const float decayed = resident_state[item] * decay;
+            resident_state[item] = decayed;
+            normalized_keys[item] =
                 bf16_load(qkv, token_base + key_local + key_element) *
                 key_scale;
-            memory_partial += decayed * key;
+            memory_partial += decayed * normalized_keys[item];
         }
         partial[key_lane * kGdnPartitionColumns + lane] = memory_partial;
         __syncthreads();
@@ -529,17 +542,12 @@ __global__ void gdn_recurrent_prefill_precomputed_kernel(
 
         float core_partial = 0.0f;
         const float delta = deltas[lane];
-        for (std::uint32_t key_element = key_lane;
-             key_element < kQ38GdnHeadWidth; key_element += 32) {
-            const auto state_index =
-                state_base + static_cast<std::uint64_t>(key_element) *
-                                 kQ38GdnHeadWidth +
-                output_element;
-            const float key =
-                bf16_load(qkv, token_base + key_local + key_element) *
-                key_scale;
-            const float updated = state[state_index] + key * delta;
-            state[state_index] = updated;
+#pragma unroll
+        for (std::uint32_t item = 0; item < 4; ++item) {
+            const auto key_element = key_lane + item * 32;
+            const float updated =
+                resident_state[item] + normalized_keys[item] * delta;
+            resident_state[item] = updated;
             const float query =
                 bf16_load(qkv, token_base + query_local + key_element) *
                 query_scale;
@@ -559,6 +567,16 @@ __global__ void gdn_recurrent_prefill_precomputed_kernel(
                        core);
         }
         __syncthreads();
+    }
+
+#pragma unroll
+    for (std::uint32_t item = 0; item < 4; ++item) {
+        const auto key_element = key_lane + item * 32;
+        const auto state_index =
+            state_base + static_cast<std::uint64_t>(key_element) *
+                             kQ38GdnHeadWidth +
+            output_element;
+        state[state_index] = resident_state[item];
     }
 }
 

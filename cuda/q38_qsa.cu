@@ -800,10 +800,11 @@ __global__ void qsa_attention_output_prefill_kernel(
 
 constexpr std::uint32_t kQsaQueriesPerKv =
     kQ38QsaHeads / kQ38QsaKvHeads;
-constexpr std::uint32_t kQsaGroupedKeyTile = 64;
+constexpr std::uint32_t kQsaGroupedKeyTile = 32;
+constexpr std::uint32_t kQsaGroupedValueTile = 64;
 
 // One CTA owns all query heads that share a KV head.  K is staged once for a
-// 64-position tile and reused by all twelve query heads, replacing twelve
+// 32-position tile and reused by all twelve query heads, replacing twelve
 // independent CTAs that merely hoped L2 would retain the same rows.
 __global__ void qsa_attention_scores_grouped_prefill_kernel(
     const std::uint16_t* query, const std::uint16_t* keys,
@@ -942,24 +943,49 @@ __global__ void qsa_attention_value_grouped_prefill_kernel(
     const auto* token_selected =
         selected + static_cast<std::uint64_t>(token) *
                        kQ38QsaMaximumSelected;
+    __shared__ float
+        shared_scores[kQsaQueriesPerKv * kQsaGroupedValueTile];
+    __shared__ std::int32_t shared_positions[kQsaGroupedValueTile];
     float accumulators[kQsaQueriesPerKv] = {};
-    for (std::uint32_t index = 0; index < selected_count; ++index) {
-        const auto source_position = token_selected[index];
-        const float value = bf16_load(
-            values,
-            (static_cast<std::uint64_t>(source_position) * kQ38QsaKvHeads +
-             kv_head) *
-                    kQ38QsaHeadWidth +
-                element);
-#pragma unroll
-        for (std::uint32_t query_local = 0;
-             query_local < kQsaQueriesPerKv; ++query_local) {
+    for (std::uint32_t tile_base = 0; tile_base < selected_count;
+         tile_base += kQsaGroupedValueTile) {
+        const auto tile_count =
+            min(kQsaGroupedValueTile, selected_count - tile_base);
+        if (threadIdx.x < tile_count)
+            shared_positions[threadIdx.x] =
+                token_selected[tile_base + threadIdx.x];
+        for (std::uint32_t flat = threadIdx.x;
+             flat < kQsaQueriesPerKv * kQsaGroupedValueTile;
+             flat += blockDim.x) {
+            const auto query_local = flat / kQsaGroupedValueTile;
+            const auto tile_index = flat % kQsaGroupedValueTile;
+            if (tile_index >= tile_count) continue;
             const auto head = kv_head * kQsaQueriesPerKv + query_local;
             const auto score_base =
                 (static_cast<std::uint64_t>(token) * kQ38QsaHeads + head) *
                 kQ38QsaMaximumSelected;
-            accumulators[query_local] += scores[score_base + index] * value;
+            shared_scores[flat] = scores[score_base + tile_base + tile_index];
         }
+        __syncthreads();
+        for (std::uint32_t tile_index = 0; tile_index < tile_count;
+             ++tile_index) {
+            const auto source_position = shared_positions[tile_index];
+            const float value = bf16_load(
+                values,
+                (static_cast<std::uint64_t>(source_position) *
+                     kQ38QsaKvHeads +
+                 kv_head) *
+                        kQ38QsaHeadWidth +
+                    element);
+#pragma unroll
+            for (std::uint32_t query_local = 0;
+                 query_local < kQsaQueriesPerKv; ++query_local)
+                accumulators[query_local] +=
+                    shared_scores[query_local * kQsaGroupedValueTile +
+                                  tile_index] *
+                    value;
+        }
+        __syncthreads();
     }
 #pragma unroll
     for (std::uint32_t query_local = 0; query_local < kQsaQueriesPerKv;
