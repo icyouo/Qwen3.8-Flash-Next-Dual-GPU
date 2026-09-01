@@ -137,8 +137,8 @@ class CancelAfterRetainedDraftBackend final : public q38::StageBackend {
 public:
     CancelAfterRetainedDraftBackend(
         std::unique_ptr<q38::StageBackend> inner,
-        std::shared_ptr<std::atomic<std::uint32_t>> abandoned)
-        : inner_(std::move(inner)), abandoned_(std::move(abandoned)) {}
+        std::shared_ptr<std::atomic<std::uint32_t>> rolled_back)
+        : inner_(std::move(inner)), rolled_back_(std::move(rolled_back)) {}
 
     q38::Stage stage() const override { return inner_->stage(); }
     q38::StageOutput execute(q38::StageInput input) override {
@@ -163,9 +163,53 @@ public:
         }
         return result;
     }
-    void abandon_retained_draft(std::uint64_t epoch) override {
-        abandoned_->fetch_add(1, std::memory_order_relaxed);
-        inner_->abandon_retained_draft(epoch);
+    void commit(std::uint64_t epoch, std::uint32_t count) override {
+        inner_->commit(epoch, count);
+    }
+    void rollback(std::uint64_t epoch) override {
+        inner_->rollback(epoch);
+        rolled_back_->fetch_add(1, std::memory_order_relaxed);
+    }
+    q38::StageBackendMetricsV1 metrics() const override {
+        return inner_->metrics();
+    }
+
+private:
+    std::unique_ptr<q38::StageBackend> inner_;
+    std::shared_ptr<std::atomic<std::uint32_t>> rolled_back_;
+    bool cancelled_once_ = false;
+};
+
+struct DraftStage0OverlapState {
+    std::atomic<bool> armed{false};
+    std::atomic<bool> stage0_entered{false};
+    std::atomic<bool> draft_entered{false};
+};
+
+void wait_for_overlap_peer(const std::atomic<bool>& peer) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(2);
+    while (!peer.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error(
+                "retained draft and stage0 did not overlap");
+        std::this_thread::yield();
+    }
+}
+
+class OverlapStage0Backend final : public q38::StageBackend {
+public:
+    OverlapStage0Backend(std::unique_ptr<q38::StageBackend> inner,
+                         std::shared_ptr<DraftStage0OverlapState> state)
+        : inner_(std::move(inner)), state_(std::move(state)) {}
+
+    q38::Stage stage() const override { return inner_->stage(); }
+    q38::StageOutput execute(q38::StageInput input) override {
+        if (state_->armed.load(std::memory_order_acquire)) {
+            state_->stage0_entered.store(true, std::memory_order_release);
+            wait_for_overlap_peer(state_->draft_entered);
+        }
+        return inner_->execute(std::move(input));
     }
     void commit(std::uint64_t epoch, std::uint32_t count) override {
         inner_->commit(epoch, count);
@@ -177,8 +221,49 @@ public:
 
 private:
     std::unique_ptr<q38::StageBackend> inner_;
-    std::shared_ptr<std::atomic<std::uint32_t>> abandoned_;
-    bool cancelled_once_ = false;
+    std::shared_ptr<DraftStage0OverlapState> state_;
+};
+
+class OverlapDraftBackend final : public q38::StageBackend {
+public:
+    OverlapDraftBackend(std::unique_ptr<q38::StageBackend> inner,
+                        std::shared_ptr<DraftStage0OverlapState> state)
+        : inner_(std::move(inner)), state_(std::move(state)) {}
+
+    q38::Stage stage() const override { return inner_->stage(); }
+    q38::StageOutput execute(q38::StageInput input) override {
+        return inner_->execute(std::move(input));
+    }
+    std::vector<std::int32_t> draft(
+        std::int32_t pending_token, std::uint64_t position,
+        std::uint32_t max_draft,
+        std::shared_ptr<q38::CancellationToken> cancellation = {}) override {
+        return inner_->draft(pending_token, position, max_draft,
+                             std::move(cancellation));
+    }
+    std::vector<std::int32_t> draft_retained(
+        std::int32_t pending_token, std::uint64_t position,
+        std::uint64_t transaction_epoch,
+        std::shared_ptr<q38::CancellationToken> cancellation = {}) override {
+        if (state_->armed.load(std::memory_order_acquire)) {
+            state_->draft_entered.store(true, std::memory_order_release);
+            wait_for_overlap_peer(state_->stage0_entered);
+        }
+        return inner_->draft_retained(pending_token, position,
+                                      transaction_epoch,
+                                      std::move(cancellation));
+    }
+    void commit(std::uint64_t epoch, std::uint32_t count) override {
+        inner_->commit(epoch, count);
+    }
+    void rollback(std::uint64_t epoch) override { inner_->rollback(epoch); }
+    q38::StageBackendMetricsV1 metrics() const override {
+        return inner_->metrics();
+    }
+
+private:
+    std::unique_ptr<q38::StageBackend> inner_;
+    std::shared_ptr<DraftStage0OverlapState> state_;
 };
 
 #define CHECK(expr)                                                          \
@@ -463,15 +548,15 @@ void test_width_one_speculative_pipeline() {
     CHECK(saw_reject);
 }
 
-void test_retained_draft_is_abandoned_before_prepare() {
+void test_retained_draft_cancellation_rolls_back_transaction() {
     q38::ExecutorOptions options;
-    auto abandoned = std::make_shared<std::atomic<std::uint32_t>>(0);
+    auto rolled_back = std::make_shared<std::atomic<std::uint32_t>>(0);
     auto stage0 = std::make_unique<q38::MockStageBackend>(
         q38::Stage::kStage0, options.hidden_width, options.vocab_size);
     auto stage1 = std::make_unique<CancelAfterRetainedDraftBackend>(
         std::make_unique<q38::MockStageBackend>(
             q38::Stage::kStage1, options.hidden_width, options.vocab_size),
-        abandoned);
+        rolled_back);
     q38::DualStageExecutor executor(options, std::move(stage0),
                                     std::move(stage1));
     executor.append({1, 2, 3, 4});
@@ -485,11 +570,33 @@ void test_retained_draft_is_abandoned_before_prepare() {
         cancelled = true;
     }
     CHECK(cancelled);
-    CHECK(abandoned->load(std::memory_order_relaxed) == 1);
+    CHECK(rolled_back->load(std::memory_order_relaxed) == 1);
     CHECK(executor.frontiers().canonical == before.canonical);
     CHECK(executor.frontiers().target == before.target);
     const auto retry = executor.speculative_step(1);
     CHECK(!retry.published_tokens.empty());
+}
+
+void test_retained_draft_overlaps_first_stage0_row() {
+    q38::ExecutorOptions options;
+    auto state = std::make_shared<DraftStage0OverlapState>();
+    auto stage0 = std::make_unique<OverlapStage0Backend>(
+        std::make_unique<q38::MockStageBackend>(
+            q38::Stage::kStage0, options.hidden_width, options.vocab_size),
+        state);
+    auto stage1 = std::make_unique<OverlapDraftBackend>(
+        std::make_unique<q38::MockStageBackend>(
+            q38::Stage::kStage1, options.hidden_width, options.vocab_size),
+        state);
+    q38::DualStageExecutor executor(options, std::move(stage0),
+                                    std::move(stage1));
+    executor.append({5, 6, 7, 8});
+    (void)executor.seed_decode();
+    state->armed.store(true, std::memory_order_release);
+    const auto result = executor.speculative_step(1);
+    CHECK(!result.published_tokens.empty());
+    CHECK(state->stage0_entered.load(std::memory_order_acquire));
+    CHECK(state->draft_entered.load(std::memory_order_acquire));
 }
 
 void test_speculative_stop_token_is_transactionally_truncated() {
@@ -1373,7 +1480,8 @@ int main() {
     test_randomized_frontiers();
     test_mock_executor();
     test_width_one_speculative_pipeline();
-    test_retained_draft_is_abandoned_before_prepare();
+    test_retained_draft_cancellation_rolls_back_transaction();
+    test_retained_draft_overlaps_first_stage0_row();
     test_speculative_stop_token_is_transactionally_truncated();
     test_executor_context_limit();
     test_executor_rpc_service();

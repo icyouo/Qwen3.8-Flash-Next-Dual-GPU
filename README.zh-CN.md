@@ -81,17 +81,18 @@ durability mode。
 microbatch，并让下一行的 stage 0 与当前行的 stage 1 流水执行。它只在
 `--enable-mtp --mtp-width 1` 下启用；普通 `decode_one()` 和 width 大于 1 的行为不变。
 
-| Context | 新二进制 plain decode | MTP width 1 | MTP 有效 ITL | 相对 plain 提升 |
+| Context | Plain decode 基线 | MTP width 1 | MTP 有效 ITL | 相对 plain 提升 |
 |---:|---:|---:|---:|---:|
-| 32,768 | 28.84 tok/s | **35.88 tok/s** | 27.87 ms | **24.4%** |
-| 131,072 | 26.05 tok/s | **32.91 tok/s** | 30.38 ms | **26.3%** |
-| 262,080 | 22.61 tok/s | **28.88 tok/s** | 34.62 ms | **27.7%** |
+| 32,768 | 28.84 tok/s | **40.44 tok/s** | 24.73 ms | **40.2%** |
+| 131,072 | 26.05 tok/s | **35.05 tok/s** | 28.53 ms | **34.5%** |
+| 262,080 | 22.61 tok/s | **30.62 tok/s** | 32.66 ms | **35.4%** |
 
 条件与上面的 exact-QSA 测试一致：单并发、`durability=off`、一个 seed token、五次被测
 transaction。每档 fixture 的 draft 都恰好 5/5 接受；这个小型确定性样本只能证明
-retained-row fast path 和吞吐有效，不能代表一般 acceptance rate 或模型质量。相同新二进制
-的 plain mode 在 128K/256K 相对旧基线波动不超过 0.3%，32K 快 3.6%，通过了 1% 无回退
-门禁。
+retained-row fast path 和吞吐有效，不能代表一般 acceptance rate 或模型质量。Plain 数据
+来自前一版 retained-row revision：128K/256K 相对旧基线波动不超过 0.3%，32K 快 3.6%。
+后续 overlap revision 只修改非空 retained-draft request 分支；runtime tests 验证普通 decode
+不会进入该分支，因此有意跳过了重复且耗时很长的完整 256K plain 重跑。
 
 原始证据、准确命令、已知限制和未完成门禁统一记录在 [READINESS.md](READINESS.md)。
 
@@ -165,15 +166,12 @@ Q38_CUDA_PROFILE_DECODE=1
 
 ### Retained-draft MTP lane
 
-Width-one MTP 在 target 验证后不会再次执行 draft token。Backend 会把 provisional QSA row
-保留在 target epoch 下；target 接受 draft 时，commit 直接消费这行。两个 target row 以单
-token chunk 进入既有 stage scheduler，从而让 GPU0 的 row `n+1` 与 GPU1 的 row `n`
+Width-one MTP 在 target 验证后不会再次执行 draft token。Transaction 建立 epoch 后，GPU1
+开始 retained draft，同时 GPU0 开始 target row 0。Backend 会把 provisional draft QSA row
+保留在同一个 epoch 下；target 接受 draft 时，commit 直接消费这行。两个 target row 随后
+以单 token chunk 进入既有 stage scheduler，从而让 GPU0 的 row `n+1` 与 GPU1 的 row `n`
 重叠。Reject、cancel、rollback 和 partial replay 都会先丢弃或重建 provisional state，之后
-才允许发布 canonical state。
-
-当前 draft generation 仍发生在两行 target pipeline 之前；进一步让 draft 本身与 target
-verification 重叠属于后续优化。MTP 默认关闭，plain scheduler 完全不进入 retained-state
-路径。
+才允许发布 canonical state。MTP 默认关闭，plain scheduler 完全不进入 retained-state 路径。
 
 ## 模型 artifact 与内存分布
 

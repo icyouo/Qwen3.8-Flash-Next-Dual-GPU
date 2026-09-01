@@ -93,19 +93,22 @@ rows as one-token microbatches, and pipelines stage 0 of the next row against
 stage 1 of the current row. It is isolated behind `--enable-mtp --mtp-width 1`;
 ordinary `decode_one()` and width-greater-than-one behavior are unchanged.
 
-| Context | Plain decode, new binary | MTP width 1 | MTP effective ITL | Gain over plain |
+| Context | Plain decode baseline | MTP width 1 | MTP effective ITL | Gain over plain |
 |---:|---:|---:|---:|---:|
-| 32,768 | 28.84 tok/s | **35.88 tok/s** | 27.87 ms | **24.4%** |
-| 131,072 | 26.05 tok/s | **32.91 tok/s** | 30.38 ms | **26.3%** |
-| 262,080 | 22.61 tok/s | **28.88 tok/s** | 34.62 ms | **27.7%** |
+| 32,768 | 28.84 tok/s | **40.44 tok/s** | 24.73 ms | **40.2%** |
+| 131,072 | 26.05 tok/s | **35.05 tok/s** | 28.53 ms | **34.5%** |
+| 262,080 | 22.61 tok/s | **30.62 tok/s** | 32.66 ms | **35.4%** |
 
 Conditions match the exact-QSA probe above: single concurrency,
 `durability=off`, one seed token, and five measured transactions. All 5/5 draft
 tokens happened to be accepted in each fixture. That small deterministic sample
 validates the retained-row fast path and its throughput; it is not a general
-acceptance-rate or model-quality claim. Plain-mode measurements from the same
-new binary stayed within 0.3% of the prior baseline at 128K and 256K (and were
-3.6% faster at 32K), satisfying the 1% no-regression gate.
+acceptance-rate or model-quality claim. The plain figures were measured for the
+preceding retained-row revision, where they stayed within 0.3% of the prior
+baseline at 128K and 256K (and were 3.6% faster at 32K). The subsequent overlap
+revision changes only the non-null retained-draft request branch; runtime tests
+verify that ordinary decode never enters it. A redundant full 256K plain rerun
+was intentionally skipped.
 
 Raw evidence, exact commands, known limitations, and the remaining release
 gates are tracked in [READINESS.md](READINESS.md).
@@ -188,16 +191,15 @@ Q38_CUDA_PROFILE_DECODE=1
 
 ### Retained-draft MTP lane
 
-Width-one MTP does not rerun the draft token after verification. The backend
-keeps its provisional QSA row under the target epoch, then consumes it at
-commit if the target accepts the draft. The two target rows travel through the
-existing stage scheduler as one-token chunks, allowing GPU0 row `n+1` to
-overlap GPU1 row `n`. Rejection, cancellation, rollback, and partial replay
-discard or rebuild provisional state before anything becomes canonical.
-
-Draft generation currently precedes the two-row target pipeline; overlapping
-the draft itself with target verification remains future work. MTP is opt-in,
-and the plain scheduler takes none of this retained-state path.
+Width-one MTP does not rerun the draft token after verification. After the
+transaction establishes its epoch, GPU1 starts the retained draft while GPU0
+starts target row 0. The backend keeps the provisional draft QSA row under that
+epoch and consumes it at commit if the target accepts the draft. The two target
+rows then travel through the existing stage scheduler as one-token chunks,
+allowing GPU0 row `n+1` to overlap GPU1 row `n`. Rejection, cancellation,
+rollback, and partial replay discard or rebuild provisional state before
+anything becomes canonical. MTP is opt-in, and the plain scheduler takes none
+of this retained-state path.
 
 ## Model artifact and memory placement
 
