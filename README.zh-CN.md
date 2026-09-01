@@ -12,15 +12,17 @@ vLLM、SGLang、llama.cpp 或 DS4 的 fork，运行时也不依赖它们。`tran
 的官方 tokenizer/chat template codec，不参与模型执行和状态所有权。
 
 > **当前状态：research preview。** 双卡真实 CUDA 执行、自定义 artifact、事务化服务、
-> batch-1 decode 和 grouped-MMQ prefill 已通过验证；tokenizer/logit golden parity、
-> 32K/128K/严格 256K 真模型门禁、MTP 发布门禁及长时间故障测试仍未完成。当前数据证明
-> 运行时机制和性能，不代表最终模型质量，也不代表 256K 已达到生产发布标准。
+> batch-1 decode 和 grouped-MMQ prefill 已通过验证；可选的 width-one MTP 流水也已经通过
+> 32K/128K/256K 方向性性能与状态一致性测试。完整 tokenizer/logit golden parity、严格
+> 262,080 + 64、覆盖 accept/reject 的 MTP 质量门禁及长时间故障测试仍未完成。当前数据
+> 证明运行时机制和性能，不代表最终模型质量，也不代表 256K 已达到生产发布标准。
 
 ## 实测结果
 
 以下 q38 数据均来自 Ubuntu 主机 `p3-ultra`：2 × 64 GiB CMP 170HX、driver
 610.43.02、CUDA 13.1、`sm_80`、已校验的 cut-25
-`Q38_AMPERE_QUANT_POLICY_V5` artifact、batch size 1、MTP 关闭。
+`Q38_AMPERE_QUANT_POLICY_V5` artifact、batch size 1。除非表格明确标注 MTP，否则均关闭
+MTP。
 
 ### Prefill
 
@@ -72,6 +74,24 @@ durability mode。
 五次真实 GPU decode。五个样本只用于方向性吞吐基线，不用于解释 p95/p99。128K 与
 256K fixture 会在 69,579 个唯一语料 token 后重复，因此不代表最差 PLE locality，也不
 构成模型质量 parity 结论。
+
+#### 可选 width-one MTP
+
+首版优化 MTP lane 会保留 draft 的 QSA row，把两个 target row 拆成两个单 token
+microbatch，并让下一行的 stage 0 与当前行的 stage 1 流水执行。它只在
+`--enable-mtp --mtp-width 1` 下启用；普通 `decode_one()` 和 width 大于 1 的行为不变。
+
+| Context | 新二进制 plain decode | MTP width 1 | MTP 有效 ITL | 相对 plain 提升 |
+|---:|---:|---:|---:|---:|
+| 32,768 | 28.84 tok/s | **35.88 tok/s** | 27.87 ms | **24.4%** |
+| 131,072 | 26.05 tok/s | **32.91 tok/s** | 30.38 ms | **26.3%** |
+| 262,080 | 22.61 tok/s | **28.88 tok/s** | 34.62 ms | **27.7%** |
+
+条件与上面的 exact-QSA 测试一致：单并发、`durability=off`、一个 seed token、五次被测
+transaction。每档 fixture 的 draft 都恰好 5/5 接受；这个小型确定性样本只能证明
+retained-row fast path 和吞吐有效，不能代表一般 acceptance rate 或模型质量。相同新二进制
+的 plain mode 在 128K/256K 相对旧基线波动不超过 0.3%，32K 快 3.6%，通过了 1% 无回退
+门禁。
 
 原始证据、准确命令、已知限制和未完成门禁统一记录在 [READINESS.md](READINESS.md)。
 
@@ -142,6 +162,18 @@ Q38_CUDA_DECODE_MOE=scalar
 Q38_CUDA_DECODE_TOPK=scalar
 Q38_CUDA_PROFILE_DECODE=1
 ```
+
+### Retained-draft MTP lane
+
+Width-one MTP 在 target 验证后不会再次执行 draft token。Backend 会把 provisional QSA row
+保留在 target epoch 下；target 接受 draft 时，commit 直接消费这行。两个 target row 以单
+token chunk 进入既有 stage scheduler，从而让 GPU0 的 row `n+1` 与 GPU1 的 row `n`
+重叠。Reject、cancel、rollback 和 partial replay 都会先丢弃或重建 provisional state，之后
+才允许发布 canonical state。
+
+当前 draft generation 仍发生在两行 target pipeline 之前；进一步让 draft 本身与 target
+verification 重叠属于后续优化。MTP 默认关闭，plain scheduler 完全不进入 retained-state
+路径。
 
 ## 模型 artifact 与内存分布
 
@@ -318,7 +350,8 @@ ExecutorRPC ABI，也不拥有模型状态。
    与 PLE metrics；
 4. 证明 near-256K suffix continuation 不会重放旧 prefix；
 5. 在每档 context 验证 rollback、cancel、duplicate request、crash recovery 与 fault injection；
-6. Plain lane 全部通过后，再验证 opt-in MTP；
+6. 扩展 opt-in width-one MTP 的 accept/reject、cancel、parity 与长生成门禁，再优化更宽
+   draft width；
 7. 完成长时间稳定性与 failure-injection soak。
 
 完整实现/证据边界见 [READINESS.md](READINESS.md)，详细架构与发布门禁见

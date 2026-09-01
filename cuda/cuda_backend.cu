@@ -1344,12 +1344,13 @@ struct CudaStageBackend::Impl {
             provisional_cancellation->throw_if_requested();
     }
 
-    void run_one(std::uint32_t token_index, std::uint32_t position,
+    void run_one(std::uint32_t data_index, std::uint32_t ple_index,
+                 std::uint32_t result_index, std::uint32_t position,
                  bool write_result) {
         check_cancelled();
         auto stream = reinterpret_cast<void*>(workspace.stream);
         if (options.stage == Stage::kStage0) {
-            cuda_embedding_bf16(embedding, workspace.tokens + token_index,
+            cuda_embedding_bf16(embedding, workspace.tokens + data_index,
                                 workspace.proj5, 1, stream, options.device);
             cuda_hyper_repeat_embedding_bf16(
                 workspace.proj5, workspace.hyper_a, 1, stream, options.device);
@@ -1357,7 +1358,7 @@ struct CudaStageBackend::Impl {
             check(cudaMemcpyAsync(
                       workspace.hyper_a,
                       workspace.boundary +
-                          static_cast<std::uint64_t>(token_index) *
+                          static_cast<std::uint64_t>(data_index) *
                               kQ38HyperWidth,
                       kQ38HyperWidth * sizeof(std::uint16_t),
                       cudaMemcpyDeviceToDevice, workspace.stream),
@@ -1369,8 +1370,8 @@ struct CudaStageBackend::Impl {
         for (const auto& layer : layers) {
             check_cancelled();
             if (layer.has_ple) {
-                ensure_ple_ready(token_index, 1);
-                run_ple(layer, current, alternate, token_index);
+                ensure_ple_ready(ple_index, 1);
+                run_ple(layer, current, alternate, ple_index);
                 std::swap(current, alternate);
                 profile_mark("ple");
             }
@@ -1396,7 +1397,7 @@ struct CudaStageBackend::Impl {
             if (write_result)
                 check(cudaMemcpyAsync(
                           workspace.boundary +
-                              static_cast<std::uint64_t>(token_index) *
+                              static_cast<std::uint64_t>(ple_index) *
                                   kQ38HyperWidth,
                           current, kQ38HyperWidth * sizeof(std::uint16_t),
                           cudaMemcpyDeviceToDevice, workspace.stream),
@@ -1405,7 +1406,7 @@ struct CudaStageBackend::Impl {
             if (mtp)
                 check(cudaMemcpyAsync(
                           workspace.final_hc +
-                              static_cast<std::uint64_t>(token_index) *
+                              static_cast<std::uint64_t>(result_index) *
                                   kQ38HyperWidth,
                           current, kQ38HyperWidth * sizeof(std::uint16_t),
                           cudaMemcpyDeviceToDevice, workspace.stream),
@@ -1415,7 +1416,7 @@ struct CudaStageBackend::Impl {
                 cuda_gemv_bf16(output, workspace.mixed, workspace.logits, 1,
                                stream, options.device);
                 cuda_argmax_bf16(workspace.logits, kVocabulary,
-                                 workspace.predictions + token_index, stream,
+                                 workspace.predictions + result_index, stream,
                                  options.device);
             }
         }
@@ -1547,11 +1548,16 @@ struct CudaStageBackend::Impl {
             run_prefill(count, chunk_offset, write_result);
             return;
         }
-        for (std::uint32_t token = 0; token < count; ++token)
-            run_one(token,
+        for (std::uint32_t token = 0; token < count; ++token) {
+            const auto data_index =
+                provisional_kind == TxnKind::kSpeculative
+                    ? chunk_offset + token
+                    : token;
+            run_one(data_index, token, chunk_offset + token,
                     static_cast<std::uint32_t>(provisional_base +
                                                chunk_offset + token),
                     write_result);
+        }
         qsa_state->mark_evaluated(provisional_epoch, chunk_offset + count);
     }
 
@@ -1602,6 +1608,65 @@ struct CudaStageBackend::Impl {
                            stream, options.device);
             cuda_argmax_bf16(workspace.logits, kVocabulary,
                              workspace.predictions, stream, options.device);
+        }
+    }
+
+    std::vector<std::int32_t> run_mtp_draft(
+        std::int32_t pending_token, std::uint64_t position,
+        std::uint64_t retained_epoch,
+        const std::shared_ptr<CancellationToken>& cancellation) {
+        if (cancellation) cancellation->throw_if_requested();
+        if (options.stage != Stage::kStage1)
+            throw std::runtime_error("stage0 cannot draft tokens");
+        if (!mtp)
+            throw std::logic_error("MTP is disabled for this executor");
+        if (pending_token < 0 ||
+            static_cast<std::uint32_t>(pending_token) >= kVocabulary ||
+            position != committed_frontier || provisional_epoch != 0 ||
+            !mtp_pending_valid || !mtp_qsa_state ||
+            mtp_qsa_state->committed_tokens() + 1 != position ||
+            mtp_transaction_active)
+            throw std::runtime_error("MTP draft frontier is not ready");
+
+        check(cudaSetDevice(options.device), "cudaSetDevice(MTP draft)");
+        constexpr std::uint64_t kEphemeralDraftEpoch =
+            std::numeric_limits<std::uint64_t>::max();
+        const auto epoch = retained_epoch == 0 ? kEphemeralDraftEpoch
+                                                : retained_epoch;
+        bool active = false;
+        try {
+            check(cudaMemcpyAsync(workspace.tokens, &pending_token,
+                                  sizeof(pending_token), cudaMemcpyHostToDevice,
+                                  workspace.stream),
+                  "cudaMemcpyAsync(MTP token)");
+            mtp_qsa_state->begin(epoch);
+            active = true;
+            run_mtp_step(workspace.mtp_pending_hc, workspace.tokens,
+                         static_cast<std::uint32_t>(
+                             mtp_qsa_state->committed_tokens()),
+                         true);
+            mtp_qsa_state->mark_evaluated(epoch, 1);
+            check(cudaMemcpyAsync(workspace.host_predictions,
+                                  workspace.predictions,
+                                  sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                  workspace.stream),
+                  "cudaMemcpyAsync(MTP prediction)");
+            check(cudaStreamSynchronize(workspace.stream),
+                  "cudaStreamSynchronize(MTP draft)");
+            if (cancellation) cancellation->throw_if_requested();
+            if (retained_epoch != 0) {
+                mtp_transaction_active = true;
+                mtp_transaction_epoch = retained_epoch;
+                mtp_transaction_rows = 1;
+                active = false;
+            } else {
+                mtp_qsa_state->rollback(epoch);
+                active = false;
+            }
+            return {workspace.host_predictions[0]};
+        } catch (...) {
+            if (active) mtp_qsa_state->rollback(epoch);
+            throw;
         }
     }
 
@@ -1709,10 +1774,20 @@ struct CudaStageBackend::Impl {
 
         const std::uint32_t evaluated =
             accepted - (mtp_pending_valid ? 0u : 1u);
-        mtp_transaction_rows = 0;
-        if (evaluated != 0) {
+        const bool retained_draft = mtp_transaction_active;
+        if (retained_draft) {
+            if (mtp_transaction_epoch != epoch ||
+                mtp_transaction_rows != 1 || !mtp_pending_valid ||
+                evaluated < mtp_transaction_rows)
+                throw std::runtime_error(
+                    "retained MTP draft does not match target commit");
+        } else {
+            mtp_transaction_rows = 0;
+        }
+        if (evaluated != 0 && !retained_draft) {
             mtp_qsa_state->begin(epoch);
             mtp_transaction_active = true;
+            mtp_transaction_epoch = epoch;
             try {
                 run_mtp_prefill(prior_pairs, evaluated, mtp_pending_valid);
                 mtp_qsa_state->mark_evaluated(epoch, evaluated);
@@ -1720,6 +1795,33 @@ struct CudaStageBackend::Impl {
             } catch (...) {
                 mtp_qsa_state->rollback(epoch);
                 mtp_transaction_active = false;
+                mtp_transaction_epoch = 0;
+                throw;
+            }
+        } else if (retained_draft && evaluated > mtp_transaction_rows) {
+            try {
+                for (std::uint32_t row = mtp_transaction_rows;
+                     row < evaluated; ++row) {
+                    const auto token = provisional_tokens.at(row);
+                    check(cudaMemcpyAsync(workspace.tokens, &token,
+                                          sizeof(token), cudaMemcpyHostToDevice,
+                                          workspace.stream),
+                          "cudaMemcpyAsync(retained MTP token)");
+                    run_mtp_step(
+                        workspace.final_hc +
+                            static_cast<std::uint64_t>(row - 1) *
+                                kQ38HyperWidth,
+                        workspace.tokens,
+                        static_cast<std::uint32_t>(prior_pairs + row), false);
+                    mtp_transaction_rows = row + 1;
+                    mtp_qsa_state->mark_evaluated(
+                        mtp_transaction_epoch, mtp_transaction_rows);
+                }
+            } catch (...) {
+                mtp_qsa_state->rollback(mtp_transaction_epoch);
+                mtp_transaction_active = false;
+                mtp_transaction_epoch = 0;
+                mtp_transaction_rows = 0;
                 throw;
             }
         }
@@ -1737,8 +1839,9 @@ struct CudaStageBackend::Impl {
                   "cudaStreamSynchronize(MTP commit preparation)");
         } catch (...) {
             if (mtp_transaction_active) {
-                mtp_qsa_state->rollback(epoch);
+                mtp_qsa_state->rollback(mtp_transaction_epoch);
                 mtp_transaction_active = false;
+                mtp_transaction_epoch = 0;
                 mtp_transaction_rows = 0;
             }
             throw;
@@ -1765,6 +1868,7 @@ struct CudaStageBackend::Impl {
             if (!mtp_transaction_active) {
                 mtp_qsa_state->begin(epoch);
                 mtp_transaction_active = true;
+                mtp_transaction_epoch = epoch;
             }
             run_mtp_prefill(prior_pairs + mtp_transaction_rows, evaluated,
                             mtp_candidate_pending_valid);
@@ -1887,6 +1991,7 @@ struct CudaStageBackend::Impl {
     bool mtp_pending_valid = false;
     bool mtp_candidate_pending_valid = false;
     bool mtp_transaction_active = false;
+    std::uint64_t mtp_transaction_epoch = 0;
     std::uint32_t mtp_transaction_rows = 0;
     bool ple_read_active = false;
     std::size_t ple_read_bytes = 0;
@@ -1949,8 +2054,20 @@ StageOutput CudaStageBackend::execute(StageInput input) {
         state.candidate_ple_hashes.clear();
         if (state.committed_ple_hash)
             state.candidate_ple_hashes.reserve(input.txn.evaluated_count);
-        state.mtp_transaction_active = false;
-        state.mtp_transaction_rows = 0;
+        const bool retained_mtp_draft =
+            state.options.stage == Stage::kStage1 && state.mtp &&
+            input.txn.kind == TxnKind::kSpeculative &&
+            state.mtp_transaction_active &&
+            state.mtp_transaction_epoch == input.txn.epoch &&
+            state.mtp_transaction_rows == 1;
+        if (state.mtp_transaction_active && !retained_mtp_draft)
+            throw std::runtime_error(
+                "retained MTP draft does not match target transaction");
+        if (!retained_mtp_draft) {
+            state.mtp_transaction_active = false;
+            state.mtp_transaction_epoch = 0;
+            state.mtp_transaction_rows = 0;
+        }
         state.mtp_candidate_pending_valid = false;
         state.gdn_state->begin(input.txn.epoch, state.workspace.stream);
         state.qsa_state->begin(input.txn.epoch);
@@ -1989,7 +2106,12 @@ StageOutput CudaStageBackend::execute(StageInput input) {
             input.boundary.frame.token_count != count ||
             input.boundary.frame.hidden_width != kQ38HyperWidth)
             throw std::runtime_error("CUDA stage1 boundary invalid: " + error);
-        cuda_copy_boundary_to_device(input.boundary, state.workspace.boundary,
+        auto* boundary_destination = state.workspace.boundary;
+        if (input.txn.kind == TxnKind::kSpeculative)
+            boundary_destination +=
+                static_cast<std::uint64_t>(input.chunk_offset) *
+                kQ38HyperWidth;
+        cuda_copy_boundary_to_device(input.boundary, boundary_destination,
                                      reinterpret_cast<void*>(
                                          state.workspace.stream),
                                      state.options.device);
@@ -2001,7 +2123,10 @@ StageOutput CudaStageBackend::execute(StageInput input) {
                                     input.token_ids.begin(),
                                     input.token_ids.end());
     try {
-        check(cudaMemcpyAsync(state.workspace.tokens, input.token_ids.data(),
+        auto* token_destination = state.workspace.tokens;
+        if (input.txn.kind == TxnKind::kSpeculative)
+            token_destination += input.chunk_offset;
+        check(cudaMemcpyAsync(token_destination, input.token_ids.data(),
                               input.token_ids.size() * sizeof(std::int32_t),
                               cudaMemcpyHostToDevice, state.workspace.stream),
               "cudaMemcpyAsync(tokens)");
@@ -2046,8 +2171,13 @@ StageOutput CudaStageBackend::execute(StageInput input) {
             result.state_commit_count = state.provisional_processed;
             return result;
         }
+        const auto prediction_offset =
+            input.txn.kind == TxnKind::kSpeculative
+                ? input.chunk_offset
+                : 0u;
         check(cudaMemcpyAsync(
-                  state.workspace.host_predictions, state.workspace.predictions,
+                  state.workspace.host_predictions + prediction_offset,
+                  state.workspace.predictions + prediction_offset,
                   count * sizeof(std::int32_t),
                   cudaMemcpyDeviceToHost, state.workspace.stream),
               "cudaMemcpyAsync(predictions)");
@@ -2074,12 +2204,15 @@ StageOutput CudaStageBackend::execute(StageInput input) {
                 state.workspace.stream);
         std::uint32_t accepted = count;
         if (input.txn.kind == TxnKind::kSpeculative) {
-            if (!first || input.chunk_offset != 0 || !input.final_chunk)
-                throw std::runtime_error(
-                    "CUDA speculative verification cannot be chunked");
+            if (!input.final_chunk) {
+                result.state_commit_count = state.provisional_processed;
+                result.next_token = state.workspace.host_predictions[
+                    state.provisional_processed - 1];
+                return result;
+            }
             accepted = 1;
-            while (accepted < count &&
-                   input.token_ids[accepted] ==
+            while (accepted < state.provisional_processed &&
+                   state.provisional_tokens[accepted] ==
                        state.workspace.host_predictions[accepted - 1])
                 ++accepted;
         }
@@ -2087,7 +2220,9 @@ StageOutput CudaStageBackend::execute(StageInput input) {
             input.txn.kind == TxnKind::kSpeculative
                 ? accepted
                 : state.provisional_processed;
-        result.next_token = state.workspace.host_predictions[accepted - 1];
+        result.next_token = state.workspace.host_predictions[
+            input.txn.kind == TxnKind::kSpeculative ? accepted - 1
+                                                     : count - 1];
         return result;
     } catch (...) {
         state.drain_ple_read();
@@ -2100,55 +2235,33 @@ std::vector<std::int32_t> CudaStageBackend::draft(
     std::uint32_t max_draft,
     std::shared_ptr<CancellationToken> cancellation) {
     auto& state = *impl_;
-    if (cancellation) cancellation->throw_if_requested();
-    if (state.options.stage != Stage::kStage1)
-        throw std::runtime_error("stage0 cannot draft tokens");
-    if (!state.mtp)
-        throw std::logic_error("MTP is disabled for this executor");
     if (max_draft == 0) return {};
-    check(cudaSetDevice(state.options.device), "cudaSetDevice(MTP draft)");
-    if (pending_token < 0 ||
-        static_cast<std::uint32_t>(pending_token) >= kVocabulary ||
-        position != state.committed_frontier || state.provisional_epoch != 0 ||
-        !state.mtp_pending_valid || !state.mtp_qsa_state ||
-        state.mtp_qsa_state->committed_tokens() + 1 != position)
-        throw std::runtime_error("MTP draft frontier is not ready");
+    return state.run_mtp_draft(pending_token, position, 0, cancellation);
+}
 
-    // Draft writes the append-only cache row at the next logical position,
-    // reads the proposal, then rolls the logical length back.  Target commit
-    // later recomputes this row using only the accepted prefix, so a rejected
-    // proposal can never leak into semantic state.
-    constexpr std::uint64_t kDraftEpoch =
-        std::numeric_limits<std::uint64_t>::max();
-    bool active = false;
-    try {
-        check(cudaMemcpyAsync(state.workspace.tokens, &pending_token,
-                              sizeof(pending_token), cudaMemcpyHostToDevice,
-                              state.workspace.stream),
-              "cudaMemcpyAsync(MTP token)");
-        state.mtp_qsa_state->begin(kDraftEpoch);
-        active = true;
-        state.run_mtp_step(
-            state.workspace.mtp_pending_hc, state.workspace.tokens,
-            static_cast<std::uint32_t>(
-                state.mtp_qsa_state->committed_tokens()),
-            true);
-        state.mtp_qsa_state->mark_evaluated(kDraftEpoch, 1);
-        check(cudaMemcpyAsync(state.workspace.host_predictions,
-                              state.workspace.predictions,
-                              sizeof(std::int32_t), cudaMemcpyDeviceToHost,
-                              state.workspace.stream),
-              "cudaMemcpyAsync(MTP prediction)");
-        check(cudaStreamSynchronize(state.workspace.stream),
-              "cudaStreamSynchronize(MTP draft)");
-        if (cancellation) cancellation->throw_if_requested();
-        state.mtp_qsa_state->rollback(kDraftEpoch);
-        active = false;
-        return {state.workspace.host_predictions[0]};
-    } catch (...) {
-        if (active) state.mtp_qsa_state->rollback(kDraftEpoch);
-        throw;
-    }
+std::vector<std::int32_t> CudaStageBackend::draft_retained(
+    std::int32_t pending_token, std::uint64_t position,
+    std::uint64_t transaction_epoch,
+    std::shared_ptr<CancellationToken> cancellation) {
+    if (transaction_epoch == 0)
+        throw std::invalid_argument("retained MTP draft epoch is zero");
+    return impl_->run_mtp_draft(pending_token, position, transaction_epoch,
+                                cancellation);
+}
+
+void CudaStageBackend::abandon_retained_draft(
+    std::uint64_t transaction_epoch) {
+    auto& state = *impl_;
+    check(cudaSetDevice(state.options.device),
+          "cudaSetDevice(abandon MTP draft)");
+    if (!state.mtp_transaction_active) return;
+    if (state.mtp_transaction_epoch != transaction_epoch ||
+        state.mtp_transaction_rows != 1)
+        throw std::runtime_error("retained MTP draft epoch mismatch");
+    state.mtp_qsa_state->rollback(state.mtp_transaction_epoch);
+    state.mtp_transaction_active = false;
+    state.mtp_transaction_epoch = 0;
+    state.mtp_transaction_rows = 0;
 }
 
 void CudaStageBackend::commit(std::uint64_t epoch,
@@ -2163,6 +2276,13 @@ void CudaStageBackend::commit(std::uint64_t epoch,
     if (state_commit_count < state.provisional_processed) {
         state.gdn_state->restore(state.workspace.stream);
         if (state.ple_state) state.ple_state->restore(state.workspace.stream);
+        if (state.options.stage == Stage::kStage0 && state.ple_reader) {
+            state.drain_ple_read();
+            state.candidate_ple_hashes.clear();
+            state.start_ple_read(std::vector<std::int32_t>(
+                state.provisional_tokens.begin(),
+                state.provisional_tokens.begin() + state_commit_count));
+        }
         state.run_tokens(state_commit_count, 0, false);
         check(cudaStreamSynchronize(state.workspace.stream),
               "cudaStreamSynchronize(partial replay)");
@@ -2185,8 +2305,10 @@ void CudaStageBackend::commit(std::uint64_t epoch,
             state.candidate_ple_hashes[state_commit_count - 1];
     }
     if (state.mtp_transaction_active) {
-        state.mtp_qsa_state->commit(epoch, state.mtp_transaction_rows);
+        state.mtp_qsa_state->commit(state.mtp_transaction_epoch,
+                                    state.mtp_transaction_rows);
         state.mtp_transaction_active = false;
+        state.mtp_transaction_epoch = 0;
         state.mtp_transaction_rows = 0;
     }
     if (state.options.stage == Stage::kStage1 && state.mtp) {
@@ -2218,6 +2340,15 @@ void CudaStageBackend::rollback(std::uint64_t epoch) {
     auto& state = *impl_;
     check(cudaSetDevice(state.options.device), "cudaSetDevice(stage rollback)");
     if (state.provisional_epoch == 0) {
+        if (state.mtp_transaction_active) {
+            if (state.mtp_transaction_epoch != epoch)
+                throw std::runtime_error(
+                    "retained MTP rollback epoch mismatch");
+            state.mtp_qsa_state->rollback(state.mtp_transaction_epoch);
+            state.mtp_transaction_active = false;
+            state.mtp_transaction_epoch = 0;
+            state.mtp_transaction_rows = 0;
+        }
         if (epoch <= state.committed_epoch)
             throw std::runtime_error("CUDA backend rollback epoch is stale");
         state.committed_epoch = epoch;
@@ -2232,8 +2363,9 @@ void CudaStageBackend::rollback(std::uint64_t epoch) {
         if (state.ple_state) state.ple_state->rollback(epoch);
     }
     if (state.mtp_transaction_active) {
-        state.mtp_qsa_state->rollback(epoch);
+        state.mtp_qsa_state->rollback(state.mtp_transaction_epoch);
         state.mtp_transaction_active = false;
+        state.mtp_transaction_epoch = 0;
         state.mtp_transaction_rows = 0;
     }
     state.committed_epoch = epoch;

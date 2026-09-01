@@ -9,6 +9,7 @@
 #include <deque>
 #include <future>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -558,32 +559,60 @@ DecodeResult DualStageExecutor::speculative_step(
     if (capped_draft == 0) return decode_one(std::move(cancellation));
     const auto pending = impl_->tokens.at(f.target);
     const auto draft_start = std::chrono::steady_clock::now();
+    const bool retained_draft = capped_draft == 1;
+    if (retained_draft &&
+        f.epoch == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("retained MTP draft epoch overflows");
+    const auto retained_epoch = retained_draft ? f.epoch + 1 : 0;
     auto drafts = impl_->worker1.submit(
         [pending, position = f.target, capped_draft,
-         cancellation](StageBackend& backend) {
-            return backend.draft(pending, position, capped_draft,
-                                 cancellation);
+         retained_epoch, cancellation](StageBackend& backend) {
+            return retained_epoch != 0
+                       ? backend.draft_retained(pending, position,
+                                                retained_epoch, cancellation)
+                       : backend.draft(pending, position, capped_draft,
+                                       cancellation);
         }).get();
     const auto draft_ns = elapsed_ns(draft_start);
     impl_->stats.draft_ns += draft_ns;
     impl_->draft_latency.record(draft_ns);
-    if (cancellation) cancellation->throw_if_requested();
-    impl_->stats.drafted_tokens += drafts.size();
-    if (drafts.size() > capped_draft)
-        throw std::runtime_error("draft backend exceeded the requested width");
-    for (const auto token : drafts) {
-        if (token < 0 || static_cast<std::uint32_t>(token) >=
-                             impl_->options.vocab_size)
-            throw std::runtime_error(
-                "draft backend returned a token outside the vocabulary");
-    }
     std::vector<std::int32_t> eval;
-    eval.reserve(drafts.size() + 1);
-    eval.push_back(pending);
-    eval.insert(eval.end(), drafts.begin(), drafts.end());
-    auto pair = impl_->run_transaction(
-        TxnKind::kSpeculative, eval, static_cast<std::uint32_t>(eval.size()),
-        std::move(cancellation));
+    PairResult pair;
+    try {
+        if (cancellation) cancellation->throw_if_requested();
+        impl_->stats.drafted_tokens += drafts.size();
+        if ((retained_draft && drafts.size() != 1) ||
+            drafts.size() > capped_draft)
+            throw std::runtime_error(
+                "draft backend exceeded the requested width");
+        for (const auto token : drafts) {
+            if (token < 0 || static_cast<std::uint32_t>(token) >=
+                                 impl_->options.vocab_size)
+                throw std::runtime_error(
+                    "draft backend returned a token outside the vocabulary");
+        }
+        eval.reserve(drafts.size() + 1);
+        eval.push_back(pending);
+        eval.insert(eval.end(), drafts.begin(), drafts.end());
+        pair = impl_->run_transaction(
+            TxnKind::kSpeculative, eval,
+            retained_draft ? 1u
+                           : static_cast<std::uint32_t>(eval.size()),
+            std::move(cancellation));
+    } catch (...) {
+        if (retained_draft) {
+            try {
+                impl_->worker1
+                    .submit([retained_epoch](StageBackend& backend) {
+                        backend.abandon_retained_draft(retained_epoch);
+                    })
+                    .get();
+            } catch (...) {
+                impl_->poisoned = true;
+            }
+        }
+        throw;
+    }
 
     DecodeResult result;
     result.commit = pair.commit;

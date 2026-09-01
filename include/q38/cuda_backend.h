@@ -38,6 +38,12 @@ public:
                                     std::uint32_t max_draft,
                                     std::shared_ptr<CancellationToken>
                                         cancellation = {}) override;
+    std::vector<std::int32_t> draft_retained(
+        std::int32_t pending_token, std::uint64_t position,
+        std::uint64_t transaction_epoch,
+        std::shared_ptr<CancellationToken> cancellation = {}) override;
+    void abandon_retained_draft(
+        std::uint64_t transaction_epoch) override;
     void commit(std::uint64_t epoch,
                 std::uint32_t state_commit_count) override;
     void rollback(std::uint64_t epoch) override;

@@ -133,6 +133,54 @@ private:
     std::shared_ptr<std::atomic<bool>> entered_;
 };
 
+class CancelAfterRetainedDraftBackend final : public q38::StageBackend {
+public:
+    CancelAfterRetainedDraftBackend(
+        std::unique_ptr<q38::StageBackend> inner,
+        std::shared_ptr<std::atomic<std::uint32_t>> abandoned)
+        : inner_(std::move(inner)), abandoned_(std::move(abandoned)) {}
+
+    q38::Stage stage() const override { return inner_->stage(); }
+    q38::StageOutput execute(q38::StageInput input) override {
+        return inner_->execute(std::move(input));
+    }
+    std::vector<std::int32_t> draft(
+        std::int32_t pending_token, std::uint64_t position,
+        std::uint32_t max_draft,
+        std::shared_ptr<q38::CancellationToken> cancellation = {}) override {
+        return inner_->draft(pending_token, position, max_draft,
+                             std::move(cancellation));
+    }
+    std::vector<std::int32_t> draft_retained(
+        std::int32_t pending_token, std::uint64_t position,
+        std::uint64_t transaction_epoch,
+        std::shared_ptr<q38::CancellationToken> cancellation = {}) override {
+        auto result = inner_->draft_retained(
+            pending_token, position, transaction_epoch, cancellation);
+        if (!cancelled_once_ && cancellation) {
+            cancelled_once_ = true;
+            (void)cancellation->request_cancel();
+        }
+        return result;
+    }
+    void abandon_retained_draft(std::uint64_t epoch) override {
+        abandoned_->fetch_add(1, std::memory_order_relaxed);
+        inner_->abandon_retained_draft(epoch);
+    }
+    void commit(std::uint64_t epoch, std::uint32_t count) override {
+        inner_->commit(epoch, count);
+    }
+    void rollback(std::uint64_t epoch) override { inner_->rollback(epoch); }
+    q38::StageBackendMetricsV1 metrics() const override {
+        return inner_->metrics();
+    }
+
+private:
+    std::unique_ptr<q38::StageBackend> inner_;
+    std::shared_ptr<std::atomic<std::uint32_t>> abandoned_;
+    bool cancelled_once_ = false;
+};
+
 #define CHECK(expr)                                                          \
     do {                                                                     \
         if (!(expr)) {                                                       \
@@ -383,6 +431,65 @@ void test_mock_executor() {
         CHECK(executor->canonical_tokens().size() ==
               executor->frontiers().canonical);
     }
+}
+
+void test_width_one_speculative_pipeline() {
+    q38::ExecutorOptions options;
+    options.append_chunk_tokens = 4;
+    auto executor = q38::make_mock_executor(options);
+    executor->append({11, 12, 13, 14, 15, 16, 17});
+    (void)executor->seed_decode();
+
+    bool saw_accept = false;
+    bool saw_reject = false;
+    for (int step = 0; step < 128 && !(saw_accept && saw_reject); ++step) {
+        const auto before = executor->metrics();
+        const auto result = executor->speculative_step(1);
+        const auto after = executor->metrics();
+        CHECK(after.stage0.execute_calls == before.stage0.execute_calls + 2);
+        CHECK(after.stage1.execute_calls == before.stage1.execute_calls + 2);
+        CHECK(result.published_tokens.size() == 1 ||
+              result.published_tokens.size() == 2);
+        saw_reject = saw_reject || result.published_tokens.size() == 1;
+        saw_accept = saw_accept || result.published_tokens.size() == 2;
+        CHECK(executor->frontiers().canonical -
+                  executor->frontiers().target ==
+              1);
+        CHECK(executor->frontiers().stage0 == executor->frontiers().target);
+        CHECK(executor->frontiers().stage1 == executor->frontiers().target);
+        CHECK(executor->frontiers().draft == executor->frontiers().target);
+    }
+    CHECK(saw_accept);
+    CHECK(saw_reject);
+}
+
+void test_retained_draft_is_abandoned_before_prepare() {
+    q38::ExecutorOptions options;
+    auto abandoned = std::make_shared<std::atomic<std::uint32_t>>(0);
+    auto stage0 = std::make_unique<q38::MockStageBackend>(
+        q38::Stage::kStage0, options.hidden_width, options.vocab_size);
+    auto stage1 = std::make_unique<CancelAfterRetainedDraftBackend>(
+        std::make_unique<q38::MockStageBackend>(
+            q38::Stage::kStage1, options.hidden_width, options.vocab_size),
+        abandoned);
+    q38::DualStageExecutor executor(options, std::move(stage0),
+                                    std::move(stage1));
+    executor.append({1, 2, 3, 4});
+    (void)executor.seed_decode();
+    const auto before = executor.frontiers();
+    auto cancellation = std::make_shared<q38::CancellationToken>();
+    bool cancelled = false;
+    try {
+        (void)executor.speculative_step(1, cancellation);
+    } catch (const q38::ExecutionCancelled&) {
+        cancelled = true;
+    }
+    CHECK(cancelled);
+    CHECK(abandoned->load(std::memory_order_relaxed) == 1);
+    CHECK(executor.frontiers().canonical == before.canonical);
+    CHECK(executor.frontiers().target == before.target);
+    const auto retry = executor.speculative_step(1);
+    CHECK(!retry.published_tokens.empty());
 }
 
 void test_speculative_stop_token_is_transactionally_truncated() {
@@ -1265,6 +1372,8 @@ int main() {
     test_rejects_bad_ack();
     test_randomized_frontiers();
     test_mock_executor();
+    test_width_one_speculative_pipeline();
+    test_retained_draft_is_abandoned_before_prepare();
     test_speculative_stop_token_is_transactionally_truncated();
     test_executor_context_limit();
     test_executor_rpc_service();

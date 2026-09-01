@@ -38,6 +38,7 @@ private:
     std::uint32_t provisional_processed_ = 0;
     TxnKind provisional_kind_ = TxnKind::kInvalid;
     std::uint64_t provisional_digest_ = 0;
+    std::vector<std::int32_t> provisional_tokens_;
     StageBackendMetricsV1 metrics_{};
 };
 

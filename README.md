@@ -15,8 +15,10 @@ and chat template.
 
 > **Status: research preview.** Real dual-GPU CUDA execution, the custom
 > artifact, transactional serving, batch-1 decode, and the grouped-MMQ prefill
-> path have been validated. Tokenizer/logit golden parity, 32K/128K/strict-256K
-> model runs, MTP release gates, and long-duration fault testing are still in
+> path have been validated. The opt-in width-one MTP pipeline has also passed
+> directional 32K/128K/256K performance and state-consistency probes. Full
+> tokenizer/logit golden parity, strict 262,080 + 64 runs, broad MTP
+> accept/reject quality gates, and long-duration fault testing are still in
 > progress. The current numbers prove runtime mechanics and speed, not final
 > model quality or a production-ready 256K release.
 
@@ -24,7 +26,8 @@ and chat template.
 
 All q38 results below were measured on Ubuntu `p3-ultra` with two 64 GiB CMP
 170HX GPUs, driver 610.43.02, CUDA 13.1, `sm_80`, the verified cut-25
-`Q38_AMPERE_QUANT_POLICY_V5` artifact, batch size 1, and MTP disabled.
+`Q38_AMPERE_QUANT_POLICY_V5` artifact, and batch size 1. MTP is disabled unless
+the table explicitly labels an MTP run.
 
 ### Prefill
 
@@ -82,6 +85,27 @@ one seed token for TTFT followed by exactly five measured GPU decode steps.
 Five samples establish a directional throughput baseline, not p95/p99. The
 128K and 256K fixtures repeat after 69,579 unique corpus tokens, so they do not
 claim worst-case PLE locality or model-quality parity.
+
+#### Opt-in width-one MTP
+
+The first optimized MTP lane retains the draft QSA row, verifies two target
+rows as one-token microbatches, and pipelines stage 0 of the next row against
+stage 1 of the current row. It is isolated behind `--enable-mtp --mtp-width 1`;
+ordinary `decode_one()` and width-greater-than-one behavior are unchanged.
+
+| Context | Plain decode, new binary | MTP width 1 | MTP effective ITL | Gain over plain |
+|---:|---:|---:|---:|---:|
+| 32,768 | 28.84 tok/s | **35.88 tok/s** | 27.87 ms | **24.4%** |
+| 131,072 | 26.05 tok/s | **32.91 tok/s** | 30.38 ms | **26.3%** |
+| 262,080 | 22.61 tok/s | **28.88 tok/s** | 34.62 ms | **27.7%** |
+
+Conditions match the exact-QSA probe above: single concurrency,
+`durability=off`, one seed token, and five measured transactions. All 5/5 draft
+tokens happened to be accepted in each fixture. That small deterministic sample
+validates the retained-row fast path and its throughput; it is not a general
+acceptance-rate or model-quality claim. Plain-mode measurements from the same
+new binary stayed within 0.3% of the prior baseline at 128K and 256K (and were
+3.6% faster at 32K), satisfying the 1% no-regression gate.
 
 Raw evidence, exact commands, known limitations, and the remaining release
 gates are tracked in [READINESS.md](READINESS.md).
@@ -161,6 +185,19 @@ Q38_CUDA_DECODE_MOE=scalar
 Q38_CUDA_DECODE_TOPK=scalar
 Q38_CUDA_PROFILE_DECODE=1
 ```
+
+### Retained-draft MTP lane
+
+Width-one MTP does not rerun the draft token after verification. The backend
+keeps its provisional QSA row under the target epoch, then consumes it at
+commit if the target accepts the draft. The two target rows travel through the
+existing stage scheduler as one-token chunks, allowing GPU0 row `n+1` to
+overlap GPU1 row `n`. Rejection, cancellation, rollback, and partial replay
+discard or rebuild provisional state before anything becomes canonical.
+
+Draft generation currently precedes the two-row target pipeline; overlapping
+the draft itself with target verification remains future work. MTP is opt-in,
+and the plain scheduler takes none of this retained-state path.
 
 ## Model artifact and memory placement
 
@@ -356,7 +393,8 @@ The immediate release sequence is:
 4. prove near-256K suffix continuation without prefix replay;
 5. validate rollback, cancellation, duplicate requests, crash recovery, and
    fault injection at every context level;
-6. validate opt-in MTP only after the plain lane passes; and
+6. expand the opt-in width-one MTP accept/reject, cancellation, parity, and
+   long-generation gates, then optimize wider draft widths; and
 7. complete the long-duration stability and failure-injection soak.
 
 For the full implementation/evidence boundary, see [READINESS.md](READINESS.md).

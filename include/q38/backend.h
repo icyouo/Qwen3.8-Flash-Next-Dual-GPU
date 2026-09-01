@@ -151,6 +151,16 @@ public:
                                             std::uint32_t max_draft,
                                             std::shared_ptr<CancellationToken>
                                                 cancellation = {});
+    // Width-one MTP may retain the provisional draft-model state under the
+    // target transaction epoch.  That row is semantically the current
+    // pending target token and can be committed after either acceptance or
+    // rejection, avoiding a replay in the commit path.  Backends without
+    // retained draft state fall back to ordinary one-token drafting.
+    virtual std::vector<std::int32_t> draft_retained(
+        std::int32_t pending_token, std::uint64_t position,
+        std::uint64_t transaction_epoch,
+        std::shared_ptr<CancellationToken> cancellation = {});
+    virtual void abandon_retained_draft(std::uint64_t transaction_epoch);
     virtual void commit(std::uint64_t epoch,
                         std::uint32_t state_commit_count) = 0;
     virtual void rollback(std::uint64_t epoch) = 0;

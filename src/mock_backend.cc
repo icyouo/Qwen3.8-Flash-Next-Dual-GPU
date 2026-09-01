@@ -41,6 +41,17 @@ std::vector<std::int32_t> StageBackend::draft(std::int32_t,
     throw std::runtime_error("draft is only valid on the final stage");
 }
 
+std::vector<std::int32_t> StageBackend::draft_retained(
+    std::int32_t pending_token, std::uint64_t position,
+    std::uint64_t transaction_epoch,
+    std::shared_ptr<CancellationToken> cancellation) {
+    if (transaction_epoch == 0)
+        throw std::invalid_argument("retained draft epoch is zero");
+    return draft(pending_token, position, 1, std::move(cancellation));
+}
+
+void StageBackend::abandon_retained_draft(std::uint64_t) {}
+
 StageBackendMetricsV1 StageBackend::metrics() const { return {}; }
 
 MockStageBackend::MockStageBackend(Stage stage, std::uint32_t hidden_width,
@@ -81,6 +92,8 @@ StageOutput MockStageBackend::execute(StageInput input) {
         provisional_expected_ = input.txn.evaluated_count;
         provisional_processed_ = 0;
         provisional_kind_ = input.txn.kind;
+        provisional_tokens_.clear();
+        provisional_tokens_.reserve(input.txn.evaluated_count);
         provisional_digest_ =
             input.txn.epoch ^ static_cast<std::uint8_t>(stage_);
     } else if (input.txn.epoch != provisional_epoch_ ||
@@ -92,6 +105,8 @@ StageOutput MockStageBackend::execute(StageInput input) {
     }
 
     provisional_digest_ = digest_tokens(input.token_ids, provisional_digest_);
+    provisional_tokens_.insert(provisional_tokens_.end(),
+                               input.token_ids.begin(), input.token_ids.end());
     provisional_processed_ += count;
 
     StageOutput output;
@@ -138,24 +153,28 @@ StageOutput MockStageBackend::execute(StageInput input) {
             static_cast<std::size_t>(hidden_width_) * count)
         throw std::runtime_error("stage1 boundary identity mismatch");
 
-    std::uint32_t committed = count;
+    std::uint32_t committed = provisional_processed_;
     if (input.txn.kind == TxnKind::kSpeculative) {
-        if (!first || input.chunk_offset != 0 || !input.final_chunk)
-            throw std::runtime_error("speculative verify cannot be chunked");
+        if (!input.final_chunk) {
+            output.state_commit_count = provisional_processed_;
+            output.next_token = predict(
+                provisional_tokens_[provisional_processed_ - 1],
+                input.txn.base_target + provisional_processed_);
+            return output;
+        }
         committed = 1;
-        for (std::uint32_t i = 1; i < count; ++i) {
-            const auto expected = predict(input.token_ids[i - 1],
+        for (std::uint32_t i = 1; i < provisional_processed_; ++i) {
+            const auto expected = predict(provisional_tokens_[i - 1],
                                           input.txn.base_target + i);
-            if (input.token_ids[i] != expected) break;
+            if (provisional_tokens_[i] != expected) break;
             ++committed;
         }
     }
     output.state_commit_count = input.txn.kind == TxnKind::kSpeculative
                                     ? committed
                                     : provisional_processed_;
-    output.next_token = predict(input.token_ids[committed - 1],
-                                input.txn.base_target + input.chunk_offset +
-                                    committed);
+    output.next_token = predict(provisional_tokens_[committed - 1],
+                                input.txn.base_target + committed);
     if (input.need_logits) {
         if (!input.final_chunk || input.txn.kind == TxnKind::kSpeculative)
             throw std::runtime_error("mock logits requested for invalid lane");
@@ -207,6 +226,7 @@ void MockStageBackend::commit(std::uint64_t epoch,
     provisional_processed_ = 0;
     provisional_kind_ = TxnKind::kInvalid;
     provisional_digest_ = 0;
+    provisional_tokens_.clear();
     ++metrics_.commits;
 }
 
@@ -226,6 +246,7 @@ void MockStageBackend::rollback(std::uint64_t epoch) {
     provisional_processed_ = 0;
     provisional_kind_ = TxnKind::kInvalid;
     provisional_digest_ = 0;
+    provisional_tokens_.clear();
     ++metrics_.rollbacks;
 }
 
