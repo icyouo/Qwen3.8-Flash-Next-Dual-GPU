@@ -1186,7 +1186,7 @@ void test_qsa_prefill(cudaStream_t stream) {
 
 void test_qsa_radix_selection(cudaStream_t stream) {
     constexpr std::uint32_t position =
-        (q38::kQ38QsaBlockBudget + 2) * q38::kQ38QsaBlockTokens - 1;
+        (q38::kQ38QsaBlockBudget + 1024) * q38::kQ38QsaBlockTokens - 1;
     constexpr std::uint32_t capacity = position + 1;
     constexpr std::uint32_t score_stride =
         (capacity + q38::kQ38QsaBlockTokens - 1) /
@@ -1304,6 +1304,53 @@ void test_qsa_radix_selection(cudaStream_t stream) {
     (void)cudaFree(query);
 }
 
+void test_qsa_radix_tie_selection(cudaStream_t stream) {
+    constexpr std::uint32_t complete_blocks = q38::kQ38QsaBlockBudget + 32;
+    constexpr std::uint32_t capacity =
+        complete_blocks * q38::kQ38QsaBlockTokens;
+    constexpr std::uint32_t position = capacity - 1;
+    q38::CudaQsaStateBank state(0, 1, capacity);
+    state.begin(1);
+    const auto cache = state.working(0);
+    check(cudaMemsetAsync(cache.pooled_index_keys, 0,
+                          static_cast<std::size_t>(complete_blocks) *
+                              q38::kQ38QsaIndexerWidth *
+                              sizeof(std::uint16_t),
+                          stream),
+          "cudaMemset(QSA radix tie keys)");
+    auto* query = allocate<std::uint16_t>(
+        q38::kQ38QsaIndexerHeads * q38::kQ38QsaIndexerWidth);
+    check(cudaMemsetAsync(query, 0,
+                          q38::kQ38QsaIndexerHeads *
+                              q38::kQ38QsaIndexerWidth *
+                              sizeof(std::uint16_t),
+                          stream),
+          "cudaMemset(QSA radix tie query)");
+    auto* scores = allocate<float>(complete_blocks);
+    auto* selected =
+        allocate<std::int32_t>(q38::kQ38QsaMaximumSelected);
+    const auto selected_count = q38::cuda_qsa_select_decode(
+        query, cache, position, scores, selected,
+        reinterpret_cast<void*>(stream), 0);
+    if (selected_count !=
+        q38::kQ38QsaBlockBudget * q38::kQ38QsaBlockTokens)
+        throw std::runtime_error("QSA radix tie count differs");
+    std::vector<std::int32_t> host_selected(selected_count);
+    check(cudaMemcpyAsync(host_selected.data(), selected,
+                          selected_count * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(QSA radix tie selection)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(QSA radix tie test)");
+    for (std::uint32_t index = 0; index < selected_count; ++index) {
+        if (host_selected[index] != static_cast<std::int32_t>(index))
+            throw std::runtime_error("QSA radix tie stability differs");
+    }
+    (void)cudaFree(selected);
+    (void)cudaFree(scores);
+    (void)cudaFree(query);
+}
+
 }  // namespace
 
 int main() {
@@ -1373,6 +1420,7 @@ int main() {
         test_ple_prefill(stream);
         test_qsa_prefill(stream);
         test_qsa_radix_selection(stream);
+        test_qsa_radix_tie_selection(stream);
 
         (void)cudaFree(device_norm_weight);
         (void)cudaFree(device_output);

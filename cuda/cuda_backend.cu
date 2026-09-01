@@ -1194,6 +1194,7 @@ struct CudaStageBackend::Impl {
                        stream, options.device);
         cuda_gemv_bf16(layer.sparse.index_qk, workspace.mixed,
                        workspace.small2, 1, stream, options.device);
+        profile_mark("qsa_project");
         cuda_qsa_prepare_main_decode_bf16(
             workspace.proj0, workspace.small0, workspace.small1,
             layer.sparse.q_norm, layer.sparse.k_norm, workspace.proj3,
@@ -1202,18 +1203,23 @@ struct CudaStageBackend::Impl {
             workspace.small2, layer.sparse.index_q_norm,
             layer.sparse.index_k_norm, workspace.small0, state, position,
             stream, options.device);
+        profile_mark("qsa_prepare");
         const auto selected = cuda_qsa_select_decode(
             workspace.small0, state, position, workspace.block_scores,
             workspace.selected_indices, stream, options.device);
+        profile_mark("qsa_select");
         cuda_qsa_attention_decode_bf16(
             workspace.proj3, state, workspace.selected_indices, selected,
             workspace.attention_scores, workspace.proj0, stream,
             options.device);
+        profile_mark("qsa_attention");
         cuda_sigmoid_multiply_bf16(
             workspace.proj0, workspace.proj4, workspace.proj3,
             kQ38GdnValueWidth, stream, options.device);
+        profile_mark("qsa_gate");
         cuda_gemv_bf16(layer.sparse.output, workspace.proj3,
                        workspace.block_output, 1, stream, options.device);
+        profile_mark("qsa_output");
     }
 
     void run_qsa_prefill(const LayerWeights& layer,

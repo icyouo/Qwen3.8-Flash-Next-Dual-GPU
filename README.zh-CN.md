@@ -56,6 +56,23 @@ tokens，实测 **27.89 tok/s**、ITL p50 35.01 ms。
 是因为每个成功的变更 RPC 都要等待 `fdatasync`；所以任何性能数据都必须同时标明
 durability mode。
 
+#### 长上下文 exact-QSA R2
+
+精确并行 selector 与 tiled attention 消除了此前的长上下文 decode 崩塌，同时没有修改
+512-block 选择预算或 tie 语义。
+
+| Context | 优化前 decode | Exact-QSA R2 | 加速 | ITL p50，优化前 → R2 |
+|---:|---:|---:|---:|---:|
+| 32,768 | 20.11 tok/s | **27.84 tok/s** | **1.38×** | 47.88 → 32.79 ms |
+| 131,072 | 10.71 tok/s | **26.03 tok/s** | **2.43×** | 91.58 → 36.33 ms |
+| 262,080 | 6.21 tok/s | **22.67 tok/s** | **3.65×** | 159.19 → 42.61 ms |
+
+条件：双 64 GiB CMP 170HX、单并发、`durability=off`、关闭 MTP、使用官方 tokenizer
+处理源码语料、排除模型启动；每组先单独生成一个 seed token 计算 TTFT，再严格测量后续
+五次真实 GPU decode。五个样本只用于方向性吞吐基线，不用于解释 p95/p99。128K 与
+256K fixture 会在 69,579 个唯一语料 token 后重复，因此不代表最差 PLE locality，也不
+构成模型质量 parity 结论。
+
 原始证据、准确命令、已知限制和未完成门禁统一记录在 [READINESS.md](READINESS.md)。
 
 ## 架构
@@ -113,7 +130,11 @@ identity，不能复用旧算术路径创建的 session 或 READY identity。
 
 Batch-1 decode 继续使用专用 GEMV/MoE/top-k kernels，不会为了复用 prefill 而把单行补成
 矩阵。QSA 为全部 value dimensions 复用一次 FP32 probability 计算；512-expert router
-使用确定性 stable top-k。诊断回退开关如下：
+使用确定性 stable top-k。长上下文 QSA 同样保持精确：历史不超过 512 个 block 时直接
+跳过打分；更长历史使用全 GPU 并行的四头 score 扫描、四轮 byte-wide 并行 radix，以及
+稳定的升序 gather。Attention 的 score 与 value 计算按每个 head 四个 tile 展开，让 24 个
+head 最多占用 96 个 CTA，不再把工作集中在 24 个 SM 上。这些修改保留原来的 FP32 归约
+顺序和 threshold tie 规则，并不是近似最近邻检索。诊断回退开关如下：
 
 ```sh
 Q38_CUDA_DECODE_GEMV=scalar

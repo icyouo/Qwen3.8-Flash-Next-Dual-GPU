@@ -65,6 +65,24 @@ ms end-to-end p50. Strict mode is slower because every successful mutating RPC
 waits for `fdatasync`. Benchmark results must therefore always name their
 durability mode.
 
+#### Long-context exact-QSA R2
+
+The exact parallel selector and tiled attention path remove the earlier decode
+collapse without changing the 512-block selection budget or tie semantics.
+
+| Context | Previous decode | Exact-QSA R2 | Speedup | ITL p50, before → R2 |
+|---:|---:|---:|---:|---:|
+| 32,768 | 20.11 tok/s | **27.84 tok/s** | **1.38×** | 47.88 → 32.79 ms |
+| 131,072 | 10.71 tok/s | **26.03 tok/s** | **2.43×** | 91.58 → 36.33 ms |
+| 262,080 | 6.21 tok/s | **22.67 tok/s** | **3.65×** | 159.19 → 42.61 ms |
+
+Conditions: two 64 GiB CMP 170HX cards, single concurrency, `durability=off`,
+MTP disabled, official-tokenizer source-code corpus, model startup excluded,
+one seed token for TTFT followed by exactly five measured GPU decode steps.
+Five samples establish a directional throughput baseline, not p95/p99. The
+128K and 256K fixtures repeat after 69,579 unique corpus tokens, so they do not
+claim worst-case PLE locality or model-quality parity.
+
 Raw evidence, exact commands, known limitations, and the remaining release
 gates are tracked in [READINESS.md](READINESS.md).
 
@@ -128,6 +146,13 @@ or READY identity created for the old arithmetic path.
 Batch-1 decode keeps its purpose-built GEMV/MoE/top-k kernels instead of padding
 one row into a prefill matrix. QSA reuses one FP32 probability vector across all
 value dimensions, and the 512-expert router uses deterministic stable top-k.
+The long-context QSA lane is also exact: histories within the 512-block budget
+bypass scoring, while larger histories use a grid-parallel four-head score scan,
+four byte-wide parallel radix passes, and a stable ascending gather. Attention
+score and value work is split into four tiles per head so the 24 heads occupy up
+to 96 CTAs instead of concentrating work on 24 SMs. These changes preserve the
+existing FP32 reduction order and threshold-tie rule; they are not approximate
+nearest-neighbor retrieval.
 Diagnostic fallbacks are available through:
 
 ```sh

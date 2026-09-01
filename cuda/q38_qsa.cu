@@ -10,6 +10,10 @@
 #include <string>
 #include <utility>
 
+#ifndef Q38_QSA_MAX_SCORE_CTAS
+#define Q38_QSA_MAX_SCORE_CTAS 1024
+#endif
+
 namespace q38 {
 
 namespace {
@@ -227,14 +231,16 @@ __global__ void qsa_attention_scores_kernel(
     const std::int32_t* selected, std::uint32_t selected_count,
     float* scores) {
     const auto head = blockIdx.x;
+    const auto tile = blockIdx.y;
     const auto warp = threadIdx.x >> 5;
     const auto lane = threadIdx.x & 31;
     constexpr std::uint32_t kWarpsPerBlock = 256 / 32;
     const auto kv_head = head / (kQ38QsaHeads / kQ38QsaKvHeads);
     const auto query_base = head * kQ38QsaHeadWidth;
-    for (std::uint32_t selected_index = warp;
+    for (std::uint32_t selected_index =
+             tile * kWarpsPerBlock + warp;
          selected_index < selected_count;
-         selected_index += kWarpsPerBlock) {
+         selected_index += gridDim.y * kWarpsPerBlock) {
         const auto position = selected[selected_index];
         const auto key_base =
             (static_cast<std::uint64_t>(position) * kQ38QsaKvHeads +
@@ -257,13 +263,9 @@ __global__ void qsa_attention_scores_kernel(
     }
 }
 
-__global__ void qsa_attention_output_kernel(
-    const std::uint16_t* values, const std::int32_t* selected,
-    std::uint32_t selected_count, float* scores,
-    std::uint16_t* output) {
+__global__ void qsa_attention_softmax_kernel(
+    std::uint32_t selected_count, float* scores) {
     const auto head = blockIdx.x;
-    const auto element = threadIdx.x;
-    const auto kv_head = head / (kQ38QsaHeads / kQ38QsaKvHeads);
     const auto score_base = static_cast<std::uint64_t>(head) * selected_count;
     float local_max = -3.402823466e+38F;
     for (std::uint32_t index = threadIdx.x; index < selected_count;
@@ -283,7 +285,17 @@ __global__ void qsa_attention_output_kernel(
          index += blockDim.x)
         scores[score_base + index] =
             expf(scores[score_base + index] - maximum) / denominator;
-    __syncthreads();
+}
+
+__global__ void qsa_attention_output_kernel(
+    const std::uint16_t* values, const std::int32_t* selected,
+    std::uint32_t selected_count, const float* scores,
+    std::uint16_t* output) {
+    const auto head = blockIdx.x;
+    const auto element = blockIdx.y * blockDim.x + threadIdx.x;
+    if (element >= kQ38QsaHeadWidth) return;
+    const auto kv_head = head / (kQ38QsaHeads / kQ38QsaKvHeads);
+    const auto score_base = static_cast<std::uint64_t>(head) * selected_count;
     float value = 0.0f;
     for (std::uint32_t index = 0; index < selected_count; ++index) {
         const auto position = selected[index];
@@ -318,9 +330,32 @@ __device__ int block_sum_int(int value) {
     return partial[0];
 }
 
-// Eight warps cooperatively scan the complete pooled blocks for one query.
-// Keeping a token in one block avoids millions of tiny score-kernel launches
-// at 256K while preserving the exact four-head positive-dot index score.
+__device__ __forceinline__ float qsa_index_block_score(
+    const std::uint16_t* query, std::uint64_t query_base,
+    const std::uint16_t* pooled_keys, std::uint32_t block) {
+    const auto lane = threadIdx.x & 31;
+    const auto key_base =
+        static_cast<std::uint64_t>(block) * kQ38QsaIndexerWidth;
+    float dots[kQ38QsaIndexerHeads] = {};
+    for (std::uint32_t element = lane; element < kQ38QsaIndexerWidth;
+         element += 32) {
+        const float key = bf16_load(pooled_keys, key_base + element);
+#pragma unroll
+        for (std::uint32_t head = 0; head < kQ38QsaIndexerHeads; ++head)
+            dots[head] +=
+                bf16_load(query,
+                          query_base + head * kQ38QsaIndexerWidth + element) *
+                key;
+    }
+    float score = 0.0f;
+#pragma unroll
+    for (std::uint32_t head = 0; head < kQ38QsaIndexerHeads; ++head)
+        score += fmaxf(warp_sum(dots[head]), 0.0f);
+    return score * rsqrtf(static_cast<float>(kQ38QsaIndexerWidth));
+}
+
+// Prefill assigns one cooperative block to each query token.  The token block
+// walks its causal pooled history so hundreds of queries can run concurrently.
 __global__ void qsa_index_scores_prefill_kernel(
     const std::uint16_t* query, const std::uint16_t* pooled_keys,
     std::uint32_t first_position, float* scores,
@@ -333,27 +368,185 @@ __global__ void qsa_index_scores_prefill_kernel(
     const auto query_base = static_cast<std::uint64_t>(token) *
                             kQ38QsaIndexerHeads * kQ38QsaIndexerWidth;
     for (std::uint32_t block = warp; block < complete_blocks; block += 8) {
-        float score = 0.0f;
-        for (std::uint32_t head = 0; head < kQ38QsaIndexerHeads; ++head) {
-            float dot = 0.0f;
-            for (std::uint32_t element = lane;
-                 element < kQ38QsaIndexerWidth; element += 32) {
-                dot += bf16_load(
-                           query,
-                           query_base + head * kQ38QsaIndexerWidth + element) *
-                       bf16_load(
-                           pooled_keys,
-                           static_cast<std::uint64_t>(block) *
-                                   kQ38QsaIndexerWidth +
-                               element);
-            }
-            dot = warp_sum(dot);
-            if (lane == 0) score += fmaxf(dot, 0.0f);
-        }
+        const float score =
+            qsa_index_block_score(query, query_base, pooled_keys, block);
         if (lane == 0)
             scores[static_cast<std::uint64_t>(token) * score_stride + block] =
+                score;
+    }
+}
+
+// Decode has only one query, so assigning the whole scan to one CTA leaves the
+// GPU almost idle and makes latency linear in context.  Spread one pooled block
+// over each warp instead; the score remains bit-for-bit equivalent to the
+// prefill path.
+__global__ void qsa_index_scores_decode_kernel(
+    const std::uint16_t* query, const std::uint16_t* pooled_keys,
+    std::uint32_t complete_blocks, float* scores) {
+    constexpr std::uint32_t kWarpsPerCta = 256 / 32;
+    const auto warp = threadIdx.x >> 5;
+    const auto lane = threadIdx.x & 31;
+    float query_values[kQ38QsaIndexerHeads][kQ38QsaIndexerWidth / 32];
+#pragma unroll
+    for (std::uint32_t head = 0; head < kQ38QsaIndexerHeads; ++head) {
+#pragma unroll
+        for (std::uint32_t item = 0; item < kQ38QsaIndexerWidth / 32;
+             ++item)
+            query_values[head][item] = bf16_load(
+                query, head * kQ38QsaIndexerWidth + item * 32 + lane);
+    }
+    const auto first_block = blockIdx.x * kWarpsPerCta + warp;
+    const auto block_stride = gridDim.x * kWarpsPerCta;
+    for (std::uint32_t block = first_block; block < complete_blocks;
+         block += block_stride) {
+        float dots[kQ38QsaIndexerHeads] = {};
+#pragma unroll
+        for (std::uint32_t item = 0; item < kQ38QsaIndexerWidth / 32;
+             ++item) {
+            const float key = bf16_load(
+                pooled_keys,
+                static_cast<std::uint64_t>(block) * kQ38QsaIndexerWidth +
+                    item * 32 + lane);
+#pragma unroll
+            for (std::uint32_t head = 0; head < kQ38QsaIndexerHeads; ++head)
+                dots[head] += query_values[head][item] * key;
+        }
+        float score = 0.0f;
+#pragma unroll
+        for (std::uint32_t head = 0; head < kQ38QsaIndexerHeads; ++head)
+            score += fmaxf(warp_sum(dots[head]), 0.0f);
+        if (lane == 0)
+            scores[block] =
                 score * rsqrtf(static_cast<float>(kQ38QsaIndexerWidth));
     }
+}
+
+__global__ void qsa_select_all_decode_kernel(
+    std::uint32_t visible, std::int32_t* selected) {
+    for (std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < visible; index += blockDim.x * gridDim.x)
+        selected[index] = static_cast<std::int32_t>(index);
+}
+
+constexpr std::uint32_t kQsaRadixPrefixSlot = 256;
+constexpr std::uint32_t kQsaRadixMaskSlot = 257;
+constexpr std::uint32_t kQsaRadixRankSlot = 258;
+
+__global__ void qsa_radix8_init_decode_kernel(std::uint32_t* scratch) {
+    scratch[threadIdx.x] = 0;
+    if (threadIdx.x == 0) {
+        scratch[kQsaRadixPrefixSlot] = 0;
+        scratch[kQsaRadixMaskSlot] = 0;
+        scratch[kQsaRadixRankSlot] = kQ38QsaBlockBudget;
+    }
+}
+
+__global__ void qsa_radix8_histogram_decode_kernel(
+    const float* scores, std::uint32_t complete_blocks, int shift,
+    std::uint32_t* scratch) {
+    __shared__ std::uint32_t local[256];
+    local[threadIdx.x] = 0;
+    __syncthreads();
+    const auto prefix = scratch[kQsaRadixPrefixSlot];
+    const auto mask = scratch[kQsaRadixMaskSlot];
+    for (std::uint32_t block = blockIdx.x * blockDim.x + threadIdx.x;
+         block < complete_blocks; block += blockDim.x * gridDim.x) {
+        const auto bits = __float_as_uint(scores[block]);
+        if ((bits & mask) == prefix)
+            atomicAdd(&local[(bits >> shift) & 0xffu], 1u);
+    }
+    __syncthreads();
+    if (local[threadIdx.x] != 0)
+        atomicAdd(&scratch[threadIdx.x], local[threadIdx.x]);
+}
+
+__global__ void qsa_radix8_choose_decode_kernel(
+    int shift, std::uint32_t* scratch) {
+    __shared__ std::uint32_t histogram[256];
+    histogram[threadIdx.x] = scratch[threadIdx.x];
+    scratch[threadIdx.x] = 0;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        auto prefix = scratch[kQsaRadixPrefixSlot];
+        auto rank = scratch[kQsaRadixRankSlot];
+        for (int bucket = 255; bucket >= 0; --bucket) {
+            const auto count = histogram[bucket];
+            if (rank <= count) {
+                prefix |= static_cast<std::uint32_t>(bucket) << shift;
+                break;
+            }
+            rank -= count;
+        }
+        scratch[kQsaRadixPrefixSlot] = prefix;
+        scratch[kQsaRadixMaskSlot] |= 0xffu << shift;
+        scratch[kQsaRadixRankSlot] = rank;
+    }
+}
+
+// After the four parallel byte-wide histogram passes, gather in ascending block
+// order.  Loading the threshold into shared memory first allows selected[] to
+// serve as radix scratch without changing the public workspace contract.
+__global__ void qsa_radix8_gather_decode_kernel(
+    const float* scores, std::uint32_t complete_blocks,
+    std::uint32_t position, std::int32_t* selected) {
+    __shared__ std::uint32_t threshold;
+    if (threadIdx.x == 0)
+        threshold = reinterpret_cast<const std::uint32_t*>(selected)[
+            kQsaRadixPrefixSlot];
+    __syncthreads();
+    __shared__ std::uint16_t offsets[256];
+    __shared__ std::uint16_t chunk_count_shared;
+    __shared__ std::uint32_t written;
+    if (threadIdx.x == 0) written = 0;
+    __syncthreads();
+    for (int pass = 0; pass < 2; ++pass) {
+        for (std::uint32_t base = 0; base < complete_blocks;
+             base += blockDim.x) {
+            const auto block = base + threadIdx.x;
+            bool take = false;
+            if (block < complete_blocks) {
+                const auto bits = __float_as_uint(scores[block]);
+                take = pass == 0 ? bits > threshold : bits == threshold;
+            }
+            offsets[threadIdx.x] = take ? 1 : 0;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                std::uint16_t offset = 0;
+                for (std::uint32_t lane = 0; lane < blockDim.x; ++lane) {
+                    const auto flag = offsets[lane];
+                    offsets[lane] = offset;
+                    offset = static_cast<std::uint16_t>(offset + flag);
+                }
+                chunk_count_shared = offset;
+            }
+            __syncthreads();
+            const auto chunk_count = chunk_count_shared;
+            if (take) {
+                const auto slot = written + offsets[threadIdx.x];
+                if (slot < kQ38QsaBlockBudget) {
+#pragma unroll
+                    for (std::uint32_t row = 0; row < kQ38QsaBlockTokens;
+                         ++row)
+                        selected[slot * kQ38QsaBlockTokens + row] =
+                            static_cast<std::int32_t>(
+                                block * kQ38QsaBlockTokens + row);
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0)
+                written = min(static_cast<std::uint32_t>(kQ38QsaBlockBudget),
+                              written + chunk_count);
+            __syncthreads();
+            if (written == kQ38QsaBlockBudget) break;
+        }
+        if (written == kQ38QsaBlockBudget) break;
+    }
+    const auto tail = (position + 1) % kQ38QsaBlockTokens;
+    for (std::uint32_t index = threadIdx.x; index < tail;
+         index += blockDim.x)
+        selected[kQ38QsaBlockBudget * kQ38QsaBlockTokens + index] =
+            static_cast<std::int32_t>(complete_blocks * kQ38QsaBlockTokens +
+                                      index);
 }
 
 __global__ void qsa_select_prefill_kernel(
@@ -731,15 +924,44 @@ std::uint32_t cuda_qsa_select_decode(
     const auto selected_blocks =
         std::min<std::uint32_t>(complete_blocks, kQ38QsaBlockBudget);
     const auto tail = visible % kQ38QsaBlockTokens;
-    constexpr std::uint32_t score_stride =
-        kQ38ContextLimit / kQ38QsaBlockTokens;
-    qsa_index_scores_prefill_kernel<<<1, 256, 0,
-                                      reinterpret_cast<cudaStream_t>(stream)>>>(
-        index_query, cache.pooled_index_keys, position, scratch_block_scores,
-        score_stride);
-    qsa_select_prefill_kernel<<<1, 256, 0,
-                                reinterpret_cast<cudaStream_t>(stream)>>>(
-        scratch_block_scores, score_stride, position, selected_indices);
+    const auto stream_value = reinterpret_cast<cudaStream_t>(stream);
+    if (complete_blocks <= kQ38QsaBlockBudget) {
+        const auto selected_count = selected_blocks * kQ38QsaBlockTokens + tail;
+        qsa_select_all_decode_kernel<<<
+            (selected_count + 255) / 256, 256, 0, stream_value>>>(
+            selected_count, selected_indices);
+    } else {
+        constexpr std::uint32_t kWarpsPerCta = 256 / 32;
+        // Keep enough independent warps to cover GA100 while still reusing the
+        // fixed query across several history blocks at 128K and 256K.
+        constexpr std::uint32_t kMaximumScoreCtas =
+            Q38_QSA_MAX_SCORE_CTAS;
+        const auto score_ctas = std::min<std::uint32_t>(
+            (complete_blocks + kWarpsPerCta - 1) / kWarpsPerCta,
+            kMaximumScoreCtas);
+        qsa_index_scores_decode_kernel<<<
+            score_ctas, 256, 0, stream_value>>>(
+            index_query, cache.pooled_index_keys, complete_blocks,
+            scratch_block_scores);
+        auto* radix_scratch =
+            reinterpret_cast<std::uint32_t*>(selected_indices);
+        qsa_radix8_init_decode_kernel<<<1, 256, 0, stream_value>>>(
+            radix_scratch);
+        constexpr std::uint32_t kMaximumRadixCtas = 64;
+        const auto radix_ctas = std::min<std::uint32_t>(
+            (complete_blocks + 255) / 256, kMaximumRadixCtas);
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            qsa_radix8_histogram_decode_kernel<<<
+                radix_ctas, 256, 0, stream_value>>>(
+                scratch_block_scores, complete_blocks, shift,
+                radix_scratch);
+            qsa_radix8_choose_decode_kernel<<<1, 256, 0, stream_value>>>(
+                shift, radix_scratch);
+        }
+        qsa_radix8_gather_decode_kernel<<<1, 256, 0, stream_value>>>(
+            scratch_block_scores, complete_blocks, position,
+            selected_indices);
+    }
     check(cudaPeekAtLastError(), "QSA token selection");
     return selected_blocks * kQ38QsaBlockTokens + tail;
 }
@@ -755,12 +977,16 @@ void cuda_qsa_attention_decode_bf16(
         !scratch_attention_scores || !output || !stream)
         throw std::invalid_argument("invalid QSA attention buffers");
     select_device(device);
-    qsa_attention_scores_kernel<<<kQ38QsaHeads, 256, 0,
-                                  reinterpret_cast<cudaStream_t>(stream)>>>(
+    constexpr std::uint32_t kAttentionTiles = 4;
+    const auto stream_value = reinterpret_cast<cudaStream_t>(stream);
+    qsa_attention_scores_kernel<<<dim3(kQ38QsaHeads, kAttentionTiles), 256, 0,
+                                  stream_value>>>(
         query, cache.main_keys, selected_indices, selected_count,
         scratch_attention_scores);
-    qsa_attention_output_kernel<<<kQ38QsaHeads, kQ38QsaHeadWidth, 0,
-                                  reinterpret_cast<cudaStream_t>(stream)>>>(
+    qsa_attention_softmax_kernel<<<kQ38QsaHeads, 256, 0, stream_value>>>(
+        selected_count, scratch_attention_scores);
+    qsa_attention_output_kernel<<<dim3(kQ38QsaHeads, kAttentionTiles), 64, 0,
+                                  stream_value>>>(
         cache.main_values, selected_indices, selected_count,
         scratch_attention_scores, output);
     check(cudaPeekAtLastError(), "QSA sparse attention");
