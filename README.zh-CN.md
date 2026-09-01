@@ -335,8 +335,9 @@ GET  /v1/q38/sessions/{id}
 GET  /v1/q38/metrics
 ```
 
-配置官方 tokenizer 后，sidecar 还会提供 `POST /v1/chat/completions`。Codec 不进入
-ExecutorRPC ABI，也不拥有模型状态。
+配置官方 tokenizer 后，sidecar 还会提供 `GET /v1/models`、
+`GET /v1/models/{id}` 和 `POST /v1/chat/completions`。Codec 不进入 ExecutorRPC ABI，
+也不拥有模型状态。
 
 ## 验证与路线图
 

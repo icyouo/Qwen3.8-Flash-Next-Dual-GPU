@@ -14,6 +14,7 @@ import struct
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Protocol, Sequence
@@ -556,6 +557,13 @@ class HuggingFaceCodec:
         values = self.tokenizer.apply_chat_template(
             list(messages), tokenize=True, add_generation_prompt=True
         )
+        # transformers 5 returns BatchEncoding here, while transformers 4
+        # returned the token list directly. Keep the codec independent of
+        # that packaging change.
+        if isinstance(values, Mapping):
+            if "input_ids" not in values:
+                raise RuntimeError("chat template result has no input_ids")
+            values = values["input_ids"]
         return [int(token) for token in values]
 
     def decode(self, tokens: Sequence[int]) -> str:

@@ -380,8 +380,9 @@ GET  /v1/q38/metrics
 ```
 
 When the official tokenizer is configured, the sidecar also exposes
-`POST /v1/chat/completions`. The codec does not enter the ExecutorRPC ABI or own
-model state.
+`GET /v1/models`, `GET /v1/models/{id}`, and
+`POST /v1/chat/completions`. The codec does not enter the ExecutorRPC ABI or
+own model state.
 
 ## Validation and roadmap
 

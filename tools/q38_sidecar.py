@@ -17,7 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
@@ -126,6 +126,23 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 raise ControlPlaneError(401, "unauthorized", "invalid API key")
             path = urlparse(self.path).path
+            model = self.app.control.model
+            model_card = {
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "q38",
+            }
+            if path in ("/v1/models", "/v1/models/"):
+                self._json(200, {"object": "list", "data": [model_card]})
+                return
+            model_prefix = "/v1/models/"
+            if path.startswith(model_prefix):
+                requested = unquote(path[len(model_prefix) :]).rstrip("/")
+                if requested == model:
+                    self._json(200, model_card)
+                    return
+                raise ControlPlaneError(404, "model_not_found", "model not found")
             if path == "/healthz":
                 self._json(200, {"status": "ok", "session": self.app.control.active_session()})
                 return
