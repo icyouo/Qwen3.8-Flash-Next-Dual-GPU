@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure plain decode over one persistent ExecutorRPC connection."""
+"""Measure plain or retained-draft decode over one RPC connection."""
 
 from __future__ import annotations
 
@@ -29,7 +29,10 @@ def main() -> int:
     parser.add_argument("--socket", required=True)
     parser.add_argument("--session-hash", type=lambda value: int(value, 0), required=True)
     parser.add_argument("--steps", type=int, default=64)
+    parser.add_argument("--mode", choices=("plain", "mtp"), default="plain")
+    parser.add_argument("--mtp-width", type=int, default=1)
     parser.add_argument("--append", nargs="*", type=lambda value: int(value, 0))
+    parser.add_argument("--append-json", type=Path)
     parser.add_argument("--append-count", type=int, default=0)
     parser.add_argument("--append-token", type=lambda value: int(value, 0), default=42)
     arguments = parser.parse_args()
@@ -37,17 +40,28 @@ def main() -> int:
         parser.error("steps must be positive")
     if arguments.append_count < 0:
         parser.error("append-count cannot be negative")
-    if arguments.append and arguments.append_count:
-        parser.error("append and append-count are mutually exclusive")
+    if sum(bool(value) for value in (
+        arguments.append, arguments.append_json, arguments.append_count
+    )) > 1:
+        parser.error("append, append-json and append-count are mutually exclusive")
+    if not 1 <= arguments.mtp_width <= 64:
+        parser.error("mtp-width must be 1..64")
 
     latencies_ms: list[float] = []
     output_tokens: list[int] = []
+    output_tokens_per_step: list[int] = []
     append_seconds = 0.0
     with Client(arguments.socket, arguments.session_hash) as client:
         state = client.call(OPCODES["state"])
         if state.status != 0:
             raise RuntimeError(f"state failed: {state.message}")
         append_tokens = arguments.append
+        if arguments.append_json:
+            parsed = json.loads(arguments.append_json.read_text())
+            append_tokens = parsed["tokens"] if isinstance(parsed, dict) else parsed
+            if not isinstance(append_tokens, list):
+                raise ValueError("append-json must contain a token list")
+            append_tokens = [int(token) for token in append_tokens]
         if arguments.append_count:
             append_tokens = [arguments.append_token] * arguments.append_count
         if append_tokens:
@@ -64,10 +78,16 @@ def main() -> int:
             if canonical == target:
                 response = client.call(OPCODES["seed"])
             else:
-                response = client.call(OPCODES["decode"], argument0=1)
+                response = client.call(
+                    OPCODES["spec" if arguments.mode == "mtp" else "decode"],
+                    argument0=1,
+                    argument1=(arguments.mtp_width
+                               if arguments.mode == "mtp" else 0),
+                )
             latencies_ms.append((time.perf_counter() - step_started) * 1000.0)
             if response.status != 0:
                 raise RuntimeError(f"decode failed: {response.message}")
+            output_tokens_per_step.append(len(response.tokens))
             output_tokens.extend(response.tokens)
             final = response
             state = response
@@ -79,6 +99,8 @@ def main() -> int:
     assert final is not None
     result = {
         "schema": "Q38_DECODE_PROBE_V1",
+        "mode": arguments.mode,
+        "mtp_width": arguments.mtp_width if arguments.mode == "mtp" else 0,
         "steps": arguments.steps,
         "tokens": len(output_tokens),
         "append_tokens": len(append_tokens or []),
@@ -93,6 +115,7 @@ def main() -> int:
             "maximum": max(latencies_ms),
         },
         "frontiers": final.as_dict()["frontiers"],
+        "output_tokens_per_step": output_tokens_per_step,
         "output_tokens": output_tokens,
         "metrics": metrics,
     }

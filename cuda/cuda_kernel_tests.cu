@@ -69,6 +69,31 @@ void require_close(const std::vector<std::uint16_t>& left,
     }
 }
 
+std::vector<std::uint8_t> tile_w4_16x16(
+    const std::vector<std::uint8_t>& row_major, std::uint32_t rows,
+    std::uint32_t columns) {
+    if (rows % 16 != 0 || columns % 16 != 0 ||
+        row_major.size() != static_cast<std::size_t>(rows) * columns / 2)
+        throw std::invalid_argument("invalid W4 tile test fixture");
+    std::vector<std::uint8_t> tiled(row_major.size());
+    std::size_t output = 0;
+    for (std::uint32_t row_base = 0; row_base < rows; row_base += 16) {
+        for (std::uint32_t column_base = 0; column_base < columns;
+             column_base += 16) {
+            for (std::uint32_t row = 0; row < 16; ++row) {
+                const auto source =
+                    static_cast<std::size_t>(row_base + row) *
+                        (columns / 2) +
+                    column_base / 2;
+                std::copy_n(row_major.begin() + source, 8,
+                            tiled.begin() + output);
+                output += 8;
+            }
+        }
+    }
+    return tiled;
+}
+
 void test_quantized_decode_gemv(q38::DeviceWeightFormatV1 format,
                                 cudaStream_t stream) {
     constexpr std::uint32_t rows = 13;
@@ -698,25 +723,28 @@ void test_grouped_moe_prefill(q38::DeviceWeightFormatV1 format,
         device_hidden, plan.packed_assignment, routes, device_packed_hidden,
         reinterpret_cast<void*>(stream), 0);
 
-    const auto run_mode = [&](q38::Q38PrefillMoeModeV1 mode,
+    const auto run_mode = [&](const q38::CudaTensorViewV1& selected_gate,
+                              const q38::CudaTensorViewV1& selected_down,
+                              q38::Q38PrefillMoeModeV1 mode,
                               std::uint16_t* weighted_mid,
                               float* route_output,
                               std::uint16_t* output) {
         q38::cuda_moe_grouped_gate_up_v1(
-            gate_view, device_packed_hidden, plan.packed_assignment,
+            selected_gate, device_packed_hidden, plan.packed_assignment,
             device_route_weights, plan.tasks, header.task_count, weighted_mid,
             mode, reinterpret_cast<void*>(stream), 0);
         q38::cuda_moe_grouped_down_v1(
-            down_view, weighted_mid, plan.tasks, header.task_count,
+            selected_down, weighted_mid, plan.tasks, header.task_count,
             route_output, mode, reinterpret_cast<void*>(stream), 0);
         q38::cuda_moe_reduce_top10_and_combine_shared_v1(
             route_output, plan.assignment_to_packed, device_shared_output,
             device_shared_gate, tokens, output,
             reinterpret_cast<void*>(stream), 0);
     };
-    run_mode(q38::Q38PrefillMoeModeV1::kGroupedMmq, device_weighted_mid,
-             device_route_output, device_output);
-    run_mode(q38::Q38PrefillMoeModeV1::kGroupedMmqSafe,
+    run_mode(gate_view, down_view, q38::Q38PrefillMoeModeV1::kGroupedMmq,
+             device_weighted_mid, device_route_output, device_output);
+    run_mode(gate_view, down_view,
+             q38::Q38PrefillMoeModeV1::kGroupedMmqSafe,
              device_weighted_mid_safe, device_route_output_safe,
              device_output_safe);
 
@@ -755,12 +783,43 @@ void test_grouped_moe_prefill(q38::DeviceWeightFormatV1 format,
                           output_safe.size() * sizeof(output_safe.front()),
                           cudaMemcpyDeviceToHost, stream),
           "cudaMemcpy(grouped MoE safe output)");
+
+    std::uint8_t* device_gate_tiled = nullptr;
+    std::uint8_t* device_down_tiled = nullptr;
+    std::vector<std::uint16_t> output_tiled;
+    if (!w8) {
+        const auto gate_tiled =
+            tile_w4_16x16(gate_data, gate_rows, gate_columns);
+        const auto down_tiled =
+            tile_w4_16x16(down_data, down_rows, down_columns);
+        device_gate_tiled = upload(gate_tiled);
+        device_down_tiled = upload(down_tiled);
+        const q38::CudaTensorViewV1 tiled_gate_view{
+            &gate_descriptor, device_gate_tiled, device_gate_scales,
+            q38::CudaWeightLayoutV1::kMoeW4Tile16x16};
+        const q38::CudaTensorViewV1 tiled_down_view{
+            &down_descriptor, device_down_tiled, device_down_scales,
+            q38::CudaWeightLayoutV1::kMoeW4Tile16x16};
+        run_mode(tiled_gate_view, tiled_down_view,
+                 q38::Q38PrefillMoeModeV1::kGroupedMmq,
+                 device_weighted_mid_safe, device_route_output_safe,
+                 device_output_safe);
+        output_tiled.resize(output.size());
+        check(cudaMemcpyAsync(output_tiled.data(), device_output_safe,
+                              output_tiled.size() *
+                                  sizeof(output_tiled.front()),
+                              cudaMemcpyDeviceToHost, stream),
+              "cudaMemcpy(tiled grouped MoE output)");
+    }
     check(cudaStreamSynchronize(stream),
           "cudaStreamSynchronize(grouped MoE fixture)");
     if (weighted_mid != weighted_mid_safe ||
         route_output != route_output_safe || output != output_safe)
         throw std::runtime_error(
             "grouped and safe MoE modes are not bitwise equal");
+    if (!w8 && output != output_tiled)
+        throw std::runtime_error(
+            "row-major and tiled W4 grouped MoE are not bitwise equal");
     for (std::uint32_t token = 0; token < tokens; ++token) {
         const float gate = fp32(hidden[static_cast<std::size_t>(token) *
                                          gate_columns]);
@@ -804,6 +863,8 @@ void test_grouped_moe_prefill(q38::DeviceWeightFormatV1 format,
     (void)cudaFree(device_gate_scales);
     (void)cudaFree(device_down_data);
     (void)cudaFree(device_gate_data);
+    if (device_down_tiled) (void)cudaFree(device_down_tiled);
+    if (device_gate_tiled) (void)cudaFree(device_gate_tiled);
 }
 
 void test_boundary_transport_checksum(cudaStream_t stream) {
@@ -901,6 +962,8 @@ void test_gdn_prefill(cudaStream_t stream) {
     auto* state_conv_batch = allocate<std::uint16_t>(conv_words, true);
     auto* state_conv_decode = allocate<std::uint16_t>(conv_words, true);
     auto* state_rec_batch = allocate<float>(recurrent_values, true);
+    auto* state_rec_partitioned = allocate<float>(recurrent_values, true);
+    auto* state_rec_precomputed = allocate<float>(recurrent_values, true);
     auto* state_rec_decode = allocate<float>(recurrent_values, true);
     const auto qkv_values =
         static_cast<std::size_t>(tokens) * q38::kQ38GdnQkvWidth;
@@ -909,9 +972,15 @@ void test_gdn_prefill(cudaStream_t stream) {
     auto* activated_batch = allocate<std::uint16_t>(qkv_values);
     auto* activated_decode = allocate<std::uint16_t>(qkv_values);
     auto* core_batch = allocate<std::uint16_t>(core_values);
+    auto* core_partitioned = allocate<std::uint16_t>(core_values);
+    auto* core_precomputed = allocate<std::uint16_t>(core_values);
     auto* core_decode = allocate<std::uint16_t>(core_values);
     auto* output_batch = allocate<std::uint16_t>(core_values);
+    auto* output_partitioned = allocate<std::uint16_t>(core_values);
+    auto* output_precomputed = allocate<std::uint16_t>(core_values);
     auto* output_decode = allocate<std::uint16_t>(core_values);
+    auto* gdn_parameters = allocate<float>(
+        q38::q38_gdn_prefill_parameter_floats(tokens));
 
     q38::cuda_gdn_conv_prefill_bf16(
         d_projected, d_conv, state_conv_batch, activated_batch, tokens,
@@ -919,9 +988,23 @@ void test_gdn_prefill(cudaStream_t stream) {
     q38::cuda_gdn_recurrent_prefill_bf16(
         activated_batch, d_b, d_a, d_a_log, d_dt, state_rec_batch,
         core_batch, tokens, reinterpret_cast<void*>(stream), 0);
+    q38::cuda_gdn_recurrent_prefill_partitioned_bf16(
+        activated_batch, d_b, d_a, d_a_log, d_dt,
+        state_rec_partitioned, core_partitioned, tokens,
+        reinterpret_cast<void*>(stream), 0);
+    q38::cuda_gdn_recurrent_prefill_precomputed_bf16(
+        activated_batch, d_b, d_a, d_a_log, d_dt,
+        state_rec_precomputed, gdn_parameters, core_precomputed, tokens,
+        reinterpret_cast<void*>(stream), 0);
     q38::cuda_gdn_output_norm_prefill_bf16(
         core_batch, d_gate, d_norm, output_batch, tokens, 1.0e-6f,
         reinterpret_cast<void*>(stream), 0);
+    q38::cuda_gdn_output_norm_prefill_bf16(
+        core_partitioned, d_gate, d_norm, output_partitioned, tokens,
+        1.0e-6f, reinterpret_cast<void*>(stream), 0);
+    q38::cuda_gdn_output_norm_prefill_bf16(
+        core_precomputed, d_gate, d_norm, output_precomputed, tokens,
+        1.0e-6f, reinterpret_cast<void*>(stream), 0);
     for (std::uint32_t token = 0; token < tokens; ++token) {
         q38::cuda_gdn_conv_decode_bf16(
             d_projected + static_cast<std::size_t>(token) *
@@ -950,6 +1033,8 @@ void test_gdn_prefill(cudaStream_t stream) {
             1.0e-6f, reinterpret_cast<void*>(stream), 0);
     }
     std::vector<std::uint16_t> host_batch(core_values);
+    std::vector<std::uint16_t> host_partitioned(core_values);
+    std::vector<std::uint16_t> host_precomputed(core_values);
     std::vector<std::uint16_t> host_decode(core_values);
     check(cudaMemcpyAsync(host_batch.data(), output_batch,
                           core_values * sizeof(std::uint16_t),
@@ -959,16 +1044,36 @@ void test_gdn_prefill(cudaStream_t stream) {
                           core_values * sizeof(std::uint16_t),
                           cudaMemcpyDeviceToHost, stream),
           "cudaMemcpy(GDN decode)");
+    check(cudaMemcpyAsync(host_partitioned.data(), output_partitioned,
+                          core_values * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(GDN partitioned)");
+    check(cudaMemcpyAsync(host_precomputed.data(), output_precomputed,
+                          core_values * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(GDN precomputed)");
     check(cudaStreamSynchronize(stream), "cudaStreamSynchronize(GDN test)");
     require_close(host_batch, host_decode, 0.01f, "GDN prefill parity");
+    require_close(host_partitioned, host_batch, 0.01f,
+                  "GDN partitioned prefill parity");
+    if (host_precomputed != host_partitioned)
+        throw std::runtime_error(
+            "GDN precomputed and partitioned prefill are not bitwise equal");
 
+    (void)cudaFree(gdn_parameters);
     (void)cudaFree(output_decode);
+    (void)cudaFree(output_precomputed);
+    (void)cudaFree(output_partitioned);
     (void)cudaFree(output_batch);
     (void)cudaFree(core_decode);
+    (void)cudaFree(core_precomputed);
+    (void)cudaFree(core_partitioned);
     (void)cudaFree(core_batch);
     (void)cudaFree(activated_decode);
     (void)cudaFree(activated_batch);
     (void)cudaFree(state_rec_decode);
+    (void)cudaFree(state_rec_precomputed);
+    (void)cudaFree(state_rec_partitioned);
     (void)cudaFree(state_rec_batch);
     (void)cudaFree(state_conv_decode);
     (void)cudaFree(state_conv_batch);
@@ -1082,6 +1187,8 @@ void test_qsa_prefill(cudaStream_t stream) {
     auto* gate_batch = allocate<std::uint16_t>(query_values);
     auto* index_query_batch = allocate<std::uint16_t>(index_query_values);
     auto* output_batch = allocate<std::uint16_t>(query_values);
+    auto* output_grouped = allocate<std::uint16_t>(query_values);
+    auto* output_grouped_fused = allocate<std::uint16_t>(query_values);
     auto* query_decode = allocate<std::uint16_t>(query_values);
     auto* gate_decode = allocate<std::uint16_t>(query_values);
     auto* index_query_decode = allocate<std::uint16_t>(index_query_values);
@@ -1094,6 +1201,12 @@ void test_qsa_prefill(cudaStream_t stream) {
     auto* batch_selected = allocate<std::int32_t>(
         static_cast<std::size_t>(tokens) * q38::kQ38QsaMaximumSelected);
     auto* batch_attention = allocate<float>(
+        static_cast<std::size_t>(tokens) * q38::kQ38QsaHeads *
+        q38::kQ38QsaMaximumSelected);
+    auto* grouped_attention = allocate<float>(
+        static_cast<std::size_t>(tokens) * q38::kQ38QsaHeads *
+        q38::kQ38QsaMaximumSelected);
+    auto* grouped_fused_attention = allocate<float>(
         static_cast<std::size_t>(tokens) * q38::kQ38QsaHeads *
         q38::kQ38QsaMaximumSelected);
     auto* decode_block_scores = allocate<float>(
@@ -1117,6 +1230,14 @@ void test_qsa_prefill(cudaStream_t stream) {
         query_batch, index_query_batch, batch_cache, 0, tokens,
         batch_block_scores, batch_score_stride, batch_selected,
         batch_attention, output_batch, reinterpret_cast<void*>(stream), 0);
+    q38::cuda_qsa_apply_grouped_prefill_bf16(
+        query_batch, batch_cache, 0, tokens, batch_selected,
+        grouped_attention, output_grouped, reinterpret_cast<void*>(stream),
+        0);
+    q38::cuda_qsa_apply_grouped_fused_prefill_bf16(
+        query_batch, batch_cache, 0, tokens, batch_selected,
+        grouped_fused_attention, output_grouped_fused,
+        reinterpret_cast<void*>(stream), 0);
 
     for (std::uint32_t token = 0; token < tokens; ++token) {
         const auto query_offset = static_cast<std::size_t>(token) *
@@ -1150,6 +1271,8 @@ void test_qsa_prefill(cudaStream_t stream) {
             reinterpret_cast<void*>(stream), 0);
     }
     std::vector<std::uint16_t> host_batch(query_values);
+    std::vector<std::uint16_t> host_grouped(query_values);
+    std::vector<std::uint16_t> host_grouped_fused(query_values);
     std::vector<std::uint16_t> host_decode(query_values);
     check(cudaMemcpyAsync(host_batch.data(), output_batch,
                           query_values * sizeof(std::uint16_t),
@@ -1159,13 +1282,28 @@ void test_qsa_prefill(cudaStream_t stream) {
                           query_values * sizeof(std::uint16_t),
                           cudaMemcpyDeviceToHost, stream),
           "cudaMemcpy(QSA decode)");
+    check(cudaMemcpyAsync(host_grouped.data(), output_grouped,
+                          query_values * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(QSA grouped prefill)");
+    check(cudaMemcpyAsync(host_grouped_fused.data(), output_grouped_fused,
+                          query_values * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(QSA fused grouped prefill)");
     check(cudaStreamSynchronize(stream), "cudaStreamSynchronize(QSA test)");
     require_close(host_batch, host_decode, 0.01f, "QSA prefill parity");
+    require_close(host_grouped, host_batch, 0.01f,
+                  "QSA grouped prefill parity");
+    if (host_grouped_fused != host_grouped)
+        throw std::runtime_error(
+            "QSA split and fused grouped prefill are not bitwise equal");
 
     (void)cudaFree(decode_attention);
     (void)cudaFree(decode_selected);
     (void)cudaFree(decode_block_scores);
     (void)cudaFree(batch_attention);
+    (void)cudaFree(grouped_attention);
+    (void)cudaFree(grouped_fused_attention);
     (void)cudaFree(batch_selected);
     (void)cudaFree(batch_block_scores);
     (void)cudaFree(output_decode);
@@ -1173,6 +1311,8 @@ void test_qsa_prefill(cudaStream_t stream) {
     (void)cudaFree(gate_decode);
     (void)cudaFree(query_decode);
     (void)cudaFree(output_batch);
+    (void)cudaFree(output_grouped);
+    (void)cudaFree(output_grouped_fused);
     (void)cudaFree(index_query_batch);
     (void)cudaFree(gate_batch);
     (void)cudaFree(query_batch);
@@ -1246,15 +1386,21 @@ void test_qsa_radix_selection(cudaStream_t stream) {
         allocate<std::int32_t>(q38::kQ38QsaMaximumSelected);
     auto* batch_attention = allocate<float>(
         q38::kQ38QsaHeads * q38::kQ38QsaMaximumSelected);
+    auto* grouped_attention = allocate<float>(
+        q38::kQ38QsaHeads * q38::kQ38QsaMaximumSelected);
     auto* decode_attention = allocate<float>(
         q38::kQ38QsaHeads * q38::kQ38QsaMaximumSelected);
     auto* batch_output = allocate<std::uint16_t>(query_values.size());
+    auto* grouped_output = allocate<std::uint16_t>(query_values.size());
     auto* decode_output = allocate<std::uint16_t>(query_values.size());
 
     q38::cuda_qsa_attention_prefill_bf16(
         query, index_query, cache, position, 1, batch_scores, score_stride,
         batch_selected, batch_attention, batch_output,
         reinterpret_cast<void*>(stream), 0);
+    q38::cuda_qsa_apply_grouped_prefill_bf16(
+        query, cache, position, 1, batch_selected, grouped_attention,
+        grouped_output, reinterpret_cast<void*>(stream), 0);
     const auto selected_count = q38::cuda_qsa_select_decode(
         index_query, cache, position, decode_scores, decode_selected,
         reinterpret_cast<void*>(stream), 0);
@@ -1268,6 +1414,7 @@ void test_qsa_radix_selection(cudaStream_t stream) {
     std::vector<std::int32_t> host_batch_selected(selected_count);
     std::vector<std::int32_t> host_decode_selected(selected_count);
     std::vector<std::uint16_t> host_batch_output(query_values.size());
+    std::vector<std::uint16_t> host_grouped_output(query_values.size());
     std::vector<std::uint16_t> host_decode_output(query_values.size());
     check(cudaMemcpyAsync(host_batch_selected.data(), batch_selected,
                           selected_count * sizeof(std::int32_t),
@@ -1285,17 +1432,25 @@ void test_qsa_radix_selection(cudaStream_t stream) {
                           host_decode_output.size() * sizeof(std::uint16_t),
                           cudaMemcpyDeviceToHost, stream),
           "cudaMemcpy(QSA radix decode output)");
+    check(cudaMemcpyAsync(host_grouped_output.data(), grouped_output,
+                          host_grouped_output.size() * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(QSA radix grouped output)");
     check(cudaStreamSynchronize(stream),
           "cudaStreamSynchronize(QSA radix test)");
     if (host_batch_selected != host_decode_selected)
         throw std::runtime_error("QSA radix selected blocks differ");
     require_close(host_batch_output, host_decode_output, 0.01f,
                   "QSA radix attention parity");
+    require_close(host_grouped_output, host_batch_output, 0.01f,
+                  "QSA radix grouped attention parity");
 
     (void)cudaFree(decode_output);
+    (void)cudaFree(grouped_output);
     (void)cudaFree(batch_output);
     (void)cudaFree(decode_attention);
     (void)cudaFree(batch_attention);
+    (void)cudaFree(grouped_attention);
     (void)cudaFree(decode_selected);
     (void)cudaFree(batch_selected);
     (void)cudaFree(decode_scores);
@@ -1348,6 +1503,106 @@ void test_qsa_radix_tie_selection(cudaStream_t stream) {
     }
     (void)cudaFree(selected);
     (void)cudaFree(scores);
+    (void)cudaFree(query);
+}
+
+void test_qsa_prefill_radix_batch_ties(cudaStream_t stream) {
+    constexpr std::uint32_t tokens = 4;
+    constexpr std::uint32_t complete_blocks =
+        q38::kQ38QsaBlockBudget + 32;
+    constexpr std::uint32_t capacity =
+        complete_blocks * q38::kQ38QsaBlockTokens;
+    constexpr std::uint32_t first_position = capacity - tokens;
+    constexpr std::uint32_t score_stride = complete_blocks;
+    q38::CudaQsaStateBank state(0, 1, capacity);
+    state.begin(1);
+    const auto cache = state.working(0);
+    const auto main_values = static_cast<std::size_t>(capacity) *
+                             q38::kQ38QsaKvHeads *
+                             q38::kQ38QsaHeadWidth;
+    check(cudaMemsetAsync(cache.main_keys, 0,
+                          main_values * sizeof(std::uint16_t), stream),
+          "cudaMemset(QSA prefill radix tie keys)");
+    check(cudaMemsetAsync(cache.main_values, 0,
+                          main_values * sizeof(std::uint16_t), stream),
+          "cudaMemset(QSA prefill radix tie values)");
+    check(cudaMemsetAsync(cache.pooled_index_keys, 0,
+                          static_cast<std::size_t>(complete_blocks) *
+                              q38::kQ38QsaIndexerWidth *
+                              sizeof(std::uint16_t),
+                          stream),
+          "cudaMemset(QSA prefill radix tie pooled keys)");
+
+    auto* query = allocate<std::uint16_t>(
+        static_cast<std::size_t>(tokens) * q38::kQ38QsaHeads *
+        q38::kQ38QsaHeadWidth);
+    auto* index_query = allocate<std::uint16_t>(
+        static_cast<std::size_t>(tokens) * q38::kQ38QsaIndexerHeads *
+        q38::kQ38QsaIndexerWidth);
+    check(cudaMemsetAsync(
+              query, 0,
+              static_cast<std::size_t>(tokens) * q38::kQ38QsaHeads *
+                  q38::kQ38QsaHeadWidth * sizeof(std::uint16_t),
+              stream),
+          "cudaMemset(QSA prefill radix tie query)");
+    check(cudaMemsetAsync(
+              index_query, 0,
+              static_cast<std::size_t>(tokens) * q38::kQ38QsaIndexerHeads *
+                  q38::kQ38QsaIndexerWidth * sizeof(std::uint16_t),
+              stream),
+          "cudaMemset(QSA prefill radix tie index query)");
+    auto* scores = allocate<float>(
+        static_cast<std::size_t>(tokens) * score_stride);
+    auto* selected = allocate<std::int32_t>(
+        static_cast<std::size_t>(tokens) * q38::kQ38QsaMaximumSelected);
+    auto* attention = allocate<float>(
+        static_cast<std::size_t>(tokens) * q38::kQ38QsaHeads *
+        q38::kQ38QsaMaximumSelected);
+    auto* output = allocate<std::uint16_t>(
+        static_cast<std::size_t>(tokens) * q38::kQ38QsaHeads *
+        q38::kQ38QsaHeadWidth);
+    q38::cuda_qsa_attention_prefill_bf16(
+        query, index_query, cache, first_position, tokens, scores,
+        score_stride, selected, attention, output,
+        reinterpret_cast<void*>(stream), 0);
+
+    std::vector<std::int32_t> host_selected(
+        static_cast<std::size_t>(tokens) * q38::kQ38QsaMaximumSelected);
+    check(cudaMemcpyAsync(host_selected.data(), selected,
+                          host_selected.size() * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost, stream),
+          "cudaMemcpy(QSA prefill radix tie selection)");
+    check(cudaStreamSynchronize(stream),
+          "cudaStreamSynchronize(QSA prefill radix tie test)");
+    for (std::uint32_t token = 0; token < tokens; ++token) {
+        const auto position = first_position + token;
+        const auto token_complete_blocks =
+            (position + 1) / q38::kQ38QsaBlockTokens;
+        const auto tail = (position + 1) % q38::kQ38QsaBlockTokens;
+        const auto base = static_cast<std::size_t>(token) *
+                          q38::kQ38QsaMaximumSelected;
+        for (std::uint32_t index = 0;
+             index < q38::kQ38QsaTokenBudget; ++index) {
+            if (host_selected[base + index] !=
+                static_cast<std::int32_t>(index))
+                throw std::runtime_error(
+                    "QSA prefill radix tie block order differs");
+        }
+        for (std::uint32_t index = 0; index < tail; ++index) {
+            const auto expected =
+                token_complete_blocks * q38::kQ38QsaBlockTokens + index;
+            if (host_selected[base + q38::kQ38QsaTokenBudget + index] !=
+                static_cast<std::int32_t>(expected))
+                throw std::runtime_error(
+                    "QSA prefill radix tie tail differs");
+        }
+    }
+
+    (void)cudaFree(output);
+    (void)cudaFree(attention);
+    (void)cudaFree(selected);
+    (void)cudaFree(scores);
+    (void)cudaFree(index_query);
     (void)cudaFree(query);
 }
 
@@ -1421,6 +1676,7 @@ int main() {
         test_qsa_prefill(stream);
         test_qsa_radix_selection(stream);
         test_qsa_radix_tie_selection(stream);
+        test_qsa_prefill_radix_batch_ties(stream);
 
         (void)cudaFree(device_norm_weight);
         (void)cudaFree(device_output);

@@ -845,19 +845,28 @@ def main() -> int:
     )
     parser.add_argument("--stop-token-id", type=int, action="append", default=[])
     parser.add_argument("--enable-mtp", action="store_true")
+    parser.add_argument(
+        "--mtp-max-draft",
+        type=int,
+        default=4,
+        help="maximum accepted MTP draft width (1..64); requests remain explicit",
+    )
     arguments = parser.parse_args()
     if arguments.host not in ("127.0.0.1", "::1", "localhost") and not arguments.api_key:
         parser.error("non-loopback binding requires --api-key")
     if (
         arguments.default_max_tokens < 0
         or arguments.max_output_tokens < 0
+        or not 1 <= arguments.mtp_max_draft <= 64
         or (
             arguments.default_max_tokens
             and arguments.max_output_tokens
             and arguments.default_max_tokens > arguments.max_output_tokens
         )
     ):
-        parser.error("output-token limits must be nonnegative and default <= maximum")
+        parser.error(
+            "output-token limits must be valid and MTP maximum must be in 1..64"
+        )
     codec = HuggingFaceCodec(arguments.tokenizer) if arguments.tokenizer else None
     stop_tokens = set(arguments.stop_token_id)
     if codec is not None:
@@ -870,7 +879,7 @@ def main() -> int:
         stop_token_ids=sorted(stop_tokens),
         default_timeout_ms=arguments.timeout_ms,
         mtp_enabled=arguments.enable_mtp,
-        mtp_max_draft=1,
+        mtp_max_draft=arguments.mtp_max_draft,
     )
     server = Q38HttpServer(
         (arguments.host, arguments.port),
@@ -889,6 +898,7 @@ def main() -> int:
                 "component": "q38-sidecar",
                 "listen": f"http://{arguments.host}:{arguments.port}",
                 "tokenizer": str(arguments.tokenizer) if arguments.tokenizer else None,
+                "mtp_max_draft": arguments.mtp_max_draft if arguments.enable_mtp else 0,
             },
             separators=(",", ":"),
         ),

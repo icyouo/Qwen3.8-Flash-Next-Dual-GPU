@@ -159,6 +159,30 @@ class ControlPlaneTest(unittest.TestCase):
             list(enabled.generate(enabled_session, 3, mode="mtp", mtp_width=2))
         self.assertEqual(width.exception.code, "invalid_generation_mode")
 
+        width_four = Q38ControlPlane(
+            FakeTransport(),
+            context_limit=32,
+            vocabulary=1000,
+            default_timeout_ms=1000,
+            mtp_enabled=True,
+            mtp_max_draft=4,
+        )
+        width_four_session = str(width_four.create_session("mtp-four")["id"])
+        width_four.append_tokens(width_four_session, [1])
+        events = list(
+            width_four.generate(
+                width_four_session, 6, mode="mtp", mtp_width=4
+            )
+        )
+        self.assertEqual(sum(len(event.token_ids) for event in events), 6)
+        with self.assertRaises(ControlPlaneError) as too_wide:
+            list(
+                width_four.generate(
+                    width_four_session, 2, mode="mtp", mtp_width=5
+                )
+            )
+        self.assertEqual(too_wide.exception.code, "invalid_generation_mode")
+
     def test_full_history_rebuilds_non_extension_and_keeps_fast_path(self) -> None:
         transport, control, session = self.make()
         control.append_tokens(session, [1, 2, 3])

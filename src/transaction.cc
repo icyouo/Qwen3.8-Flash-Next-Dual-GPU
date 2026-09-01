@@ -123,6 +123,21 @@ bool SessionTxnEngine::acknowledge(Stage stage, std::uint64_t epoch,
     return true;
 }
 
+bool SessionTxnEngine::shorten_speculative(std::uint32_t evaluated_count,
+                                           std::string* error) {
+    if (!active_) return fail(error, "no active transaction to shorten");
+    if (txn_.status != TxnStatus::kPrepared)
+        return fail(error, "transaction is not shorten-able");
+    if (txn_.kind != TxnKind::kSpeculative)
+        return fail(error, "only speculative transactions may be shortened");
+    if (stage0_ack_ || stage1_ack_)
+        return fail(error, "acknowledged transaction cannot be shortened");
+    if (evaluated_count == 0 || evaluated_count >= txn_.evaluated_count)
+        return fail(error, "shortened speculative extent is invalid");
+    txn_.evaluated_count = evaluated_count;
+    return true;
+}
+
 bool SessionTxnEngine::decide(std::uint32_t state_commit_count,
                               std::string* error) {
     if (!active_) return fail(error, "no active transaction to decide");

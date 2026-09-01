@@ -34,6 +34,12 @@ std::uint16_t float_to_bf16(float value) {
 
 }  // namespace
 
+void StageBackend::prefetch_transaction(
+    const SessionTxnV1&, const std::vector<std::int32_t>&,
+    std::shared_ptr<CancellationToken> cancellation) {
+    if (cancellation) cancellation->throw_if_requested();
+}
+
 std::vector<std::int32_t> StageBackend::draft(std::int32_t,
                                               std::uint64_t,
                                               std::uint32_t,
@@ -43,14 +49,21 @@ std::vector<std::int32_t> StageBackend::draft(std::int32_t,
 
 std::vector<std::int32_t> StageBackend::draft_retained(
     std::int32_t pending_token, std::uint64_t position,
-    std::uint64_t transaction_epoch,
+    std::uint32_t max_draft, std::uint64_t transaction_epoch,
     std::shared_ptr<CancellationToken> cancellation) {
-    if (transaction_epoch == 0)
-        throw std::invalid_argument("retained draft epoch is zero");
-    return draft(pending_token, position, 1, std::move(cancellation));
+    if (max_draft == 0 || transaction_epoch == 0)
+        throw std::invalid_argument("retained draft extent is invalid");
+    return draft(pending_token, position, max_draft,
+                 std::move(cancellation));
 }
 
 void StageBackend::abandon_retained_draft(std::uint64_t) {}
+
+void StageBackend::checkpoint_speculative_prefix(std::uint64_t,
+                                                 std::uint32_t) {}
+
+void StageBackend::reconcile_retained_draft(std::uint64_t,
+                                            std::uint32_t) {}
 
 void StageBackend::reset_session() {
     throw std::logic_error("backend does not support session reset");
@@ -217,11 +230,28 @@ std::vector<std::int32_t> MockStageBackend::draft(
     return tokens;
 }
 
+void MockStageBackend::checkpoint_speculative_prefix(
+    std::uint64_t transaction_epoch, std::uint32_t prefix_tokens) {
+    if (stage_ != Stage::kStage0 ||
+        transaction_epoch != provisional_epoch_ ||
+        provisional_kind_ != TxnKind::kSpeculative || prefix_tokens == 0 ||
+        prefix_tokens != provisional_processed_)
+        throw std::runtime_error("mock speculative checkpoint is invalid");
+    speculative_checkpoint_ = prefix_tokens;
+}
+
 void MockStageBackend::commit(std::uint64_t epoch,
                               std::uint32_t state_commit_count) {
+    const bool complete = provisional_processed_ == provisional_expected_;
+    const bool online_exact = provisional_kind_ == TxnKind::kSpeculative &&
+                              provisional_processed_ == state_commit_count;
+    const bool online_lookahead =
+        provisional_kind_ == TxnKind::kSpeculative &&
+        provisional_processed_ == state_commit_count + 1 &&
+        speculative_checkpoint_ == state_commit_count;
     if (epoch != provisional_epoch_ || state_commit_count == 0 ||
-        provisional_processed_ != provisional_expected_ ||
-        state_commit_count > provisional_processed_)
+        state_commit_count > provisional_processed_ ||
+        (!complete && !online_exact && !online_lookahead))
         throw std::runtime_error("backend commit does not match provisional state");
     committed_frontier_ = provisional_base_ + state_commit_count;
     committed_epoch_ = epoch;
@@ -231,6 +261,7 @@ void MockStageBackend::commit(std::uint64_t epoch,
     provisional_kind_ = TxnKind::kInvalid;
     provisional_digest_ = 0;
     provisional_tokens_.clear();
+    speculative_checkpoint_ = 0;
     ++metrics_.commits;
 }
 
@@ -251,6 +282,7 @@ void MockStageBackend::rollback(std::uint64_t epoch) {
     provisional_kind_ = TxnKind::kInvalid;
     provisional_digest_ = 0;
     provisional_tokens_.clear();
+    speculative_checkpoint_ = 0;
     ++metrics_.rollbacks;
 }
 
@@ -265,6 +297,7 @@ void MockStageBackend::reset_session() {
     provisional_kind_ = TxnKind::kInvalid;
     provisional_digest_ = 0;
     provisional_tokens_.clear();
+    speculative_checkpoint_ = 0;
 }
 
 }  // namespace q38

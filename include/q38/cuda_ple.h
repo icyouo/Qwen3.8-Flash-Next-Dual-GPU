@@ -13,7 +13,7 @@ constexpr std::uint32_t kQ38PleConvState = 9;
 
 class CudaPleStateBank {
 public:
-    explicit CudaPleStateBank(int device);
+    explicit CudaPleStateBank(int device, bool enable_checkpoint = false);
     ~CudaPleStateBank();
 
     CudaPleStateBank(const CudaPleStateBank&) = delete;
@@ -23,6 +23,8 @@ public:
 
     void begin(std::uint64_t epoch, void* stream);
     void restore(void* stream);
+    void checkpoint(void* stream);
+    void restore_checkpoint(void* stream);
     std::uint16_t* working() const;
     void commit(std::uint64_t epoch);
     void rollback(std::uint64_t epoch);

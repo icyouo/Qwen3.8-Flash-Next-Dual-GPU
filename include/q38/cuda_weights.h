@@ -18,10 +18,21 @@ struct CudaDeviceWeightOptions {
     bool load_mtp = true;
 };
 
+// Device-only physical layout.  The artifact remains canonical row-major so
+// its hashes and portability do not depend on one CUDA kernel generation.
+enum class CudaWeightLayoutV1 : std::uint32_t {
+    kRowMajor = 0,
+    // W4 matrix bytes are ordered by [matrix, row_tile_16, k_tile_16,
+    // row_in_tile, packed_k_pair].  This keeps every 16x16 Tensor-Core B tile
+    // in one contiguous 128-byte span without changing its storage size.
+    kMoeW4Tile16x16 = 1,
+};
+
 struct CudaTensorViewV1 {
     const DeviceTensorV1* descriptor = nullptr;
     const void* data = nullptr;
     const void* scales = nullptr;
+    CudaWeightLayoutV1 layout = CudaWeightLayoutV1::kRowMajor;
 
     bool empty() const { return descriptor == nullptr; }
 };

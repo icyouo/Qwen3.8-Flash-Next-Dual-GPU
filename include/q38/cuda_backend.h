@@ -19,6 +19,8 @@ struct CudaStageBackendOptions {
     std::uint32_t context_capacity = 262144;
     std::uint64_t prefill_matrix_cache_bytes = 8ull << 30u;
     bool enable_mtp = false;
+    bool enable_speculative_checkpoint = false;
+    bool enable_piecewise_decode_graph = false;
 };
 
 class CudaStageBackend final : public StageBackend {
@@ -32,6 +34,10 @@ public:
     CudaStageBackend& operator=(const CudaStageBackend&) = delete;
 
     Stage stage() const override;
+    void prefetch_transaction(
+        const SessionTxnV1& txn,
+        const std::vector<std::int32_t>& token_ids,
+        std::shared_ptr<CancellationToken> cancellation = {}) override;
     StageOutput execute(StageInput input) override;
     std::vector<std::int32_t> draft(std::int32_t pending_token,
                                     std::uint64_t position,
@@ -40,8 +46,14 @@ public:
                                         cancellation = {}) override;
     std::vector<std::int32_t> draft_retained(
         std::int32_t pending_token, std::uint64_t position,
-        std::uint64_t transaction_epoch,
+        std::uint32_t max_draft, std::uint64_t transaction_epoch,
         std::shared_ptr<CancellationToken> cancellation = {}) override;
+    void checkpoint_speculative_prefix(
+        std::uint64_t transaction_epoch,
+        std::uint32_t prefix_tokens) override;
+    void reconcile_retained_draft(
+        std::uint64_t transaction_epoch,
+        std::uint32_t target_row) override;
     void abandon_retained_draft(
         std::uint64_t transaction_epoch) override;
     void commit(std::uint64_t epoch,
@@ -65,7 +77,8 @@ std::unique_ptr<DualStageExecutor> make_cuda_executor(
     std::uint64_t ple_cache_bytes = 8ull << 30u,
     PleIoModeV1 ple_io_mode = PleIoModeV1::kAuto,
     std::uint32_t ple_queue_depth = 64,
-    bool enable_mtp = false);
+    bool enable_mtp = false,
+    bool enable_piecewise_decode_graph = false);
 
 bool cuda_q38_backend_compiled();
 

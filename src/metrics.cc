@@ -164,6 +164,14 @@ void append_stage(std::ostringstream& output, const char* name,
            << value.cuda_allocator_retries
            << ",\"cuda_allocation_failures\":"
            << value.cuda_allocation_failures
+           << ",\"cuda_graph_captures\":"
+           << value.cuda_graph_captures
+           << ",\"cuda_graph_replays\":"
+           << value.cuda_graph_replays
+           << ",\"cuda_graph_fallbacks\":"
+           << value.cuda_graph_fallbacks
+           << ",\"cuda_graph_nodes\":"
+           << value.cuda_graph_nodes
            << ",\"cuda_graph_held_bytes\":"
            << value.cuda_graph_held_bytes << '}';
 }
@@ -268,6 +276,12 @@ std::string metrics_json(const MetricsSchemaV1& metrics) {
            << stats.state_committed_tokens
            << ",\"published_tokens\":" << stats.published_tokens
            << ",\"drafted_tokens\":" << stats.drafted_tokens
+           << ",\"accepted_draft_tokens\":"
+           << stats.accepted_draft_tokens
+           << ",\"rejected_draft_tokens\":"
+           << stats.rejected_draft_tokens
+           << ",\"maximum_draft_width\":"
+           << stats.maximum_draft_width
            << ",\"rollbacks\":" << stats.rollbacks
            << ",\"failures\":" << stats.failures
            << ",\"cancellations\":" << stats.cancellations

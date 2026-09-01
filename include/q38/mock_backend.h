@@ -19,6 +19,9 @@ public:
                                     std::uint32_t max_draft,
                                     std::shared_ptr<CancellationToken>
                                         cancellation = {}) override;
+    void checkpoint_speculative_prefix(
+        std::uint64_t transaction_epoch,
+        std::uint32_t prefix_tokens) override;
     void commit(std::uint64_t epoch,
                 std::uint32_t state_commit_count) override;
     void rollback(std::uint64_t epoch) override;
@@ -40,6 +43,7 @@ private:
     TxnKind provisional_kind_ = TxnKind::kInvalid;
     std::uint64_t provisional_digest_ = 0;
     std::vector<std::int32_t> provisional_tokens_;
+    std::uint32_t speculative_checkpoint_ = 0;
     StageBackendMetricsV1 metrics_{};
 };
 

@@ -30,6 +30,9 @@ enum class ExecutorRpcOpcodeV1 : std::uint32_t {
     kCancel = 8,
     // Atomically drops mutable session state without unloading weights.
     kReset = 9,
+    // Read-only, opt-in snapshot of the last committed target logits.
+    // argument0=0 returns metadata; argument0=1 includes exact BF16 LE hex.
+    kLogits = 10,
 };
 
 enum class ExecutorRpcStatusV1 : std::uint32_t {
@@ -102,7 +105,8 @@ class ExecutorRpcServiceV1 {
 public:
     ExecutorRpcServiceV1(DualStageExecutor* executor,
                          std::uint64_t session_hash,
-                         std::string snapshot_journal_path = {});
+                         std::string snapshot_journal_path = {},
+                         bool enable_logit_diagnostics = false);
     ~ExecutorRpcServiceV1();
 
     ExecutorRpcServiceV1(const ExecutorRpcServiceV1&) = delete;

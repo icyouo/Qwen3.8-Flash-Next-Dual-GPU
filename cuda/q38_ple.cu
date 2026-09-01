@@ -167,19 +167,25 @@ __global__ void ple_conv_prefill_kernel(
 struct CudaPleStateBank::Impl {
     int device;
     std::uint16_t* banks[2]{nullptr, nullptr};
+    std::uint16_t* checkpoint = nullptr;
     std::uint32_t committed = 0;
     bool active = false;
+    bool checkpoint_valid = false;
     std::uint64_t epoch = 0;
     static constexpr std::uint64_t words =
         static_cast<std::uint64_t>(kQ38HyperWidth) * kQ38PleConvState;
 
-    explicit Impl(int value_device) : device(value_device) {
+    Impl(int value_device, bool enable_checkpoint) : device(value_device) {
         select_device(device);
         try {
             check(cudaMalloc(reinterpret_cast<void**>(&banks[0]), words * 2),
                   "cudaMalloc(PLE bank 0)");
             check(cudaMalloc(reinterpret_cast<void**>(&banks[1]), words * 2),
                   "cudaMalloc(PLE bank 1)");
+            if (enable_checkpoint)
+                check(cudaMalloc(reinterpret_cast<void**>(&checkpoint),
+                                 words * 2),
+                      "cudaMalloc(PLE checkpoint)");
             check(cudaMemset(banks[0], 0, words * 2),
                   "cudaMemset(PLE bank 0)");
             check(cudaMemset(banks[1], 0, words * 2),
@@ -194,12 +200,14 @@ struct CudaPleStateBank::Impl {
         (void)cudaSetDevice(device);
         if (banks[0]) (void)cudaFree(banks[0]);
         if (banks[1]) (void)cudaFree(banks[1]);
+        if (checkpoint) (void)cudaFree(checkpoint);
         banks[0] = banks[1] = nullptr;
+        checkpoint = nullptr;
     }
 };
 
-CudaPleStateBank::CudaPleStateBank(int device)
-    : impl_(std::make_unique<Impl>(device)) {}
+CudaPleStateBank::CudaPleStateBank(int device, bool enable_checkpoint)
+    : impl_(std::make_unique<Impl>(device, enable_checkpoint)) {}
 CudaPleStateBank::~CudaPleStateBank() = default;
 CudaPleStateBank::CudaPleStateBank(CudaPleStateBank&&) noexcept = default;
 CudaPleStateBank& CudaPleStateBank::operator=(CudaPleStateBank&&) noexcept =
@@ -216,6 +224,7 @@ void CudaPleStateBank::begin(std::uint64_t epoch, void* stream) {
           "cudaMemcpyAsync(PLE transaction clone)");
     impl_->active = true;
     impl_->epoch = epoch;
+    impl_->checkpoint_valid = false;
 }
 void CudaPleStateBank::restore(void* stream) {
     if (!stream || !impl_->active)
@@ -227,6 +236,27 @@ void CudaPleStateBank::restore(void* stream) {
                           reinterpret_cast<cudaStream_t>(stream)),
           "cudaMemcpyAsync(PLE transaction restore)");
 }
+void CudaPleStateBank::checkpoint(void* stream) {
+    if (!stream || !impl_->active || !impl_->checkpoint)
+        throw std::logic_error("invalid PLE speculative checkpoint");
+    select_device(impl_->device);
+    check(cudaMemcpyAsync(impl_->checkpoint,
+                          impl_->banks[1u - impl_->committed], Impl::words * 2,
+                          cudaMemcpyDeviceToDevice,
+                          reinterpret_cast<cudaStream_t>(stream)),
+          "cudaMemcpyAsync(PLE speculative checkpoint)");
+    impl_->checkpoint_valid = true;
+}
+void CudaPleStateBank::restore_checkpoint(void* stream) {
+    if (!stream || !impl_->active || !impl_->checkpoint_valid)
+        throw std::logic_error("invalid PLE checkpoint restore");
+    select_device(impl_->device);
+    check(cudaMemcpyAsync(impl_->banks[1u - impl_->committed],
+                          impl_->checkpoint, Impl::words * 2,
+                          cudaMemcpyDeviceToDevice,
+                          reinterpret_cast<cudaStream_t>(stream)),
+          "cudaMemcpyAsync(PLE checkpoint restore)");
+}
 std::uint16_t* CudaPleStateBank::working() const {
     if (!impl_->active) throw std::logic_error("PLE state is not active");
     return impl_->banks[1u - impl_->committed];
@@ -237,12 +267,14 @@ void CudaPleStateBank::commit(std::uint64_t epoch) {
     impl_->committed = 1u - impl_->committed;
     impl_->active = false;
     impl_->epoch = 0;
+    impl_->checkpoint_valid = false;
 }
 void CudaPleStateBank::rollback(std::uint64_t epoch) {
     if (!impl_->active || impl_->epoch != epoch)
         throw std::logic_error("PLE rollback epoch mismatch");
     impl_->active = false;
     impl_->epoch = 0;
+    impl_->checkpoint_valid = false;
 }
 void CudaPleStateBank::reset(void* stream) {
     if (!stream || impl_->active) throw std::logic_error("invalid PLE reset");
@@ -253,11 +285,17 @@ void CudaPleStateBank::reset(void* stream) {
     check(cudaMemsetAsync(impl_->banks[1], 0, Impl::words * 2,
                           reinterpret_cast<cudaStream_t>(stream)),
           "cudaMemsetAsync(PLE bank 1)");
+    if (impl_->checkpoint)
+        check(cudaMemsetAsync(impl_->checkpoint, 0, Impl::words * 2,
+                              reinterpret_cast<cudaStream_t>(stream)),
+              "cudaMemsetAsync(PLE checkpoint)");
     impl_->committed = 0;
+    impl_->checkpoint_valid = false;
 }
 
 std::uint64_t CudaPleStateBank::allocated_bytes() const {
-    return 2ull * Impl::words * sizeof(std::uint16_t);
+    return (impl_->checkpoint ? 3ull : 2ull) * Impl::words *
+           sizeof(std::uint16_t);
 }
 
 void cuda_ple_fp8_rows_to_bf16(const std::uint8_t* fp8_rows,

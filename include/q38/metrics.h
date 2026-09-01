@@ -11,7 +11,7 @@ namespace q38 {
 
 constexpr std::uint32_t kMetricsMagic = fourcc('Q', '3', '8', 'M');
 constexpr std::uint64_t kMetricsSchemaHashV1 =
-    UINT64_C(0x7133386d65740136);  // Final V1 field-order fingerprint.
+    UINT64_C(0x7133386d6574013b);  // V1 width-N MTP + 58 stage counters.
 
 struct ExecutorStatsV1 {
     std::uint64_t transactions = 0;
@@ -22,6 +22,9 @@ struct ExecutorStatsV1 {
     std::uint64_t state_committed_tokens = 0;
     std::uint64_t published_tokens = 0;
     std::uint64_t drafted_tokens = 0;
+    std::uint64_t accepted_draft_tokens = 0;
+    std::uint64_t rejected_draft_tokens = 0;
+    std::uint64_t maximum_draft_width = 0;
     std::uint64_t rollbacks = 0;
     std::uint64_t failures = 0;
     std::uint64_t cancellations = 0;
@@ -92,6 +95,10 @@ struct StageBackendMetricsV1 {
     std::uint64_t cuda_device_total_bytes = 0;
     std::uint64_t cuda_allocator_retries = 0;
     std::uint64_t cuda_allocation_failures = 0;
+    std::uint64_t cuda_graph_captures = 0;
+    std::uint64_t cuda_graph_replays = 0;
+    std::uint64_t cuda_graph_fallbacks = 0;
+    std::uint64_t cuda_graph_nodes = 0;
     std::uint64_t cuda_graph_held_bytes = 0;
 };
 
@@ -149,9 +156,9 @@ struct alignas(8) MetricsSchemaV1 {
     LatencySummaryV1 sampling_latency{};
 };
 
-static_assert(sizeof(ExecutorStatsV1) == 18 * sizeof(std::uint64_t),
+static_assert(sizeof(ExecutorStatsV1) == 21 * sizeof(std::uint64_t),
               "executor metrics ABI changed");
-static_assert(sizeof(StageBackendMetricsV1) == 54 * sizeof(std::uint64_t),
+static_assert(sizeof(StageBackendMetricsV1) == 58 * sizeof(std::uint64_t),
               "stage metrics ABI changed");
 static_assert(sizeof(HostMetricsV1) == 20 * sizeof(std::uint64_t),
               "host metrics ABI changed");

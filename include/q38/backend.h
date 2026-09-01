@@ -14,6 +14,8 @@
 
 namespace q38 {
 
+constexpr std::uint32_t kMaximumMtpDraftWidth = 64;
+
 class ExecutionCancelled : public std::runtime_error {
 public:
     ExecutionCancelled() : std::runtime_error("execution cancelled") {}
@@ -145,21 +147,38 @@ class StageBackend {
 public:
     virtual ~StageBackend() = default;
     virtual Stage stage() const = 0;
+    // Gives stage0 immutable known-token transactions early enough to warm
+    // non-semantic storage caches across device-workspace chunk boundaries.
+    // Semantic state must still advance only through execute/commit.
+    virtual void prefetch_transaction(
+        const SessionTxnV1& txn,
+        const std::vector<std::int32_t>& token_ids,
+        std::shared_ptr<CancellationToken> cancellation = {});
     virtual StageOutput execute(StageInput input) = 0;
     virtual std::vector<std::int32_t> draft(std::int32_t pending_token,
                                             std::uint64_t position,
                                             std::uint32_t max_draft,
                                             std::shared_ptr<CancellationToken>
                                                 cancellation = {});
-    // Width-one MTP may retain the provisional draft-model state under the
-    // target transaction epoch.  That row is semantically the current
-    // pending target token and can be committed after either acceptance or
-    // rejection, avoiding a replay in the commit path.  Backends without
-    // retained draft state fall back to ordinary one-token drafting.
+    // MTP may retain a bounded provisional draft-model branch under the target
+    // transaction epoch. The first row is based on canonical target HC and may
+    // be committed directly; accepted deeper rows must be reconciled against
+    // real target HC before commit. Backends without specialized retained
+    // state fall back to ordinary bounded drafting.
     virtual std::vector<std::int32_t> draft_retained(
         std::int32_t pending_token, std::uint64_t position,
-        std::uint64_t transaction_epoch,
+        std::uint32_t max_draft, std::uint64_t transaction_epoch,
         std::shared_ptr<CancellationToken> cancellation = {});
+    // Retained verification keeps stage0 one row ahead of stage1. Preserve the
+    // current recurrent prefix before that lookahead so an online rejection
+    // can discard exactly one physical row without replaying the prefix.
+    virtual void checkpoint_speculative_prefix(
+        std::uint64_t transaction_epoch, std::uint32_t prefix_tokens);
+    // Once target row k accepts draft k+1, replace that retained MTP row with
+    // the row derived from target HC k. Implementations may enqueue the repair
+    // and complete it on the same stream before later stage1 work.
+    virtual void reconcile_retained_draft(
+        std::uint64_t transaction_epoch, std::uint32_t target_row);
     virtual void abandon_retained_draft(std::uint64_t transaction_epoch);
     virtual void commit(std::uint64_t epoch,
                         std::uint32_t state_commit_count) = 0;

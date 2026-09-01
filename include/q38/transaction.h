@@ -36,6 +36,11 @@ public:
     bool seed_decode_pending(std::string* error);
     bool prepare(TxnKind kind, std::uint32_t evaluated_count,
                  std::string* error);
+    // Retained-draft verification may stop at the first mismatch. Shorten the
+    // still-prepared speculative extent before either stage acknowledges it;
+    // other transaction kinds and extent growth remain invalid.
+    bool shorten_speculative(std::uint32_t evaluated_count,
+                             std::string* error);
     bool acknowledge(Stage stage, std::uint64_t epoch,
                      std::uint32_t evaluated_count, std::string* error);
     bool decide(std::uint32_t state_commit_count, std::string* error);

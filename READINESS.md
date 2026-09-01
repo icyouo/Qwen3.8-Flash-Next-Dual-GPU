@@ -13,6 +13,7 @@ successful CUDA compile as model-correctness or performance evidence.
 | Request-atomic append/decode/MTP state | `transaction.cc`, `executor.cc`; provisional execution, dual acknowledge, commit/publish ordering and full-request rollback |
 | No-P2P transport | `cuda_transport.cu`; separate small/large pinned rings, BF16 D2H/H2D and position-tagged payload checksum |
 | QSA/GDN/PLE/HC/MoE/LM/MTP model data path | `cuda/q38_*.cu`, `cuda_backend.cu`; plain lane is default and MTP is explicit opt-in |
+| Piecewise CUDA Graph decode | `cuda_backend.cu`; fixed-shape GPU regions only, exact-QSA and transaction/I/O boundaries remain eager, dual-bank variants are pointer-safe, and capture failure falls back to eager |
 | Bounded SSD-PLE | `ple.cc`, `q38_ple.cu`; registered-buffer io_uring, O_DIRECT, bounded LRU, FP8 row scales and I/O metrics |
 | Durable state and identity | `identity.cc`, `snapshot.cc`; identity-bound append-only journal with explicit cold-rebuild semantics |
 | Stable local control plane | `rpc.cc`, `q38_control_plane.py`, `q38_sidecar.py`; concurrent Unix RPC, idempotence, cancel/deadline, token-native HTTP/SSE |
@@ -29,7 +30,7 @@ Executed on Ubuntu `p3-ultra`, not on the macOS editing workspace:
 - Both 64 GiB CMP 170HX boards were active as SM80 devices under driver
   610.43.02 and CUDA 13.1.  Validation used the verified 128,193,992,032-byte
   cut-25 artifact in a separate source/identity/journal directory.
-- C++ runtime tests passed; Python tests passed 42/42 with NumPy; CUDA
+- C++ runtime tests passed; Python tests passed 59/59; CUDA
   compile-check, full runtime build, and real GPU fixtures passed.  Fixtures now
   cover W4/W8 production-layout decode GEMV, W4/W8 routed MoE, QSA parity, and
   stable 512-expert top-k including tied logits.
@@ -64,6 +65,14 @@ Executed on Ubuntu `p3-ultra`, not on the macOS editing workspace:
   arithmetic still requires a new production identity and golden model-quality
   validation; testing used an explicitly manual development launch because the
   old READY correctly rejected the changed runtime hash.
+- The repaired online-prefix width-4 MTP lane passed a frozen 32,768-token
+  coding trace with exact plain-target token-prefix parity. Five transactions
+  published `5, 4, 4, 2, 5` tokens, accepted 15/20 drafts, reached 48.65 tok/s,
+  and reduced aggregate backend commit from 124.17 ms in the previous trace to
+  1.19 ms. Metrics showed GPU0 only one physical row ahead of the logical GPU1
+  prefix, with zero failures and rollbacks. Raw evidence is in the sibling
+  `.artifacts/q38-mtp-prefix-r2` directory. This is a directional 32K control
+  path gate, not a full model-quality or 256K release claim.
 
 These synthetic-token runs prove real CUDA state mechanics and performance, but
 they do **not** by themselves prove model quality or the strict 262K release
@@ -84,8 +93,22 @@ Do not skip directly to the 262K production claim.
    correctness; synthetic tokens are only a state/transport stress input.
 4. Run near-256K suffix continuation from an existing session and prove the old
    prefix is not replayed.
-5. Only after the plain lane passes may `--enable-mtp` be tested. The pinned
-   official checkpoint currently permits one draft token (width-2 target
-   verification); wider requests intentionally fail closed.
+5. Only after the plain lane passes may `--enable-mtp` be tested. The runtime
+   now implements bounded retained drafting for widths 1..64, with launch
+   capability capped by `--mtp-max-draft` (initially 4). Width one has the full
+   directional 32K/128K/256K throughput set; the repaired width-four control
+   path has initial 32K token-prefix and mixed accept/reject evidence. Widths
+   2/3 and the remaining width-4 token/logit parity, cancellation/rollback,
+   context-tail, 128K/256K, long-generation, and throughput gates must pass
+   before a production default is selected.
 6. Performance/release claims still require the design document's cold/warm PLE,
    latency percentiles, memory floors, growing-turn and soak gates.
+7. The opt-in piecewise CUDA Graph lane must match eager token IDs and logits at
+   short/32K/128K/256K contexts, survive cancel and injected rollback, report
+   two or fewer bank variants per stage with zero steady-state captures, and
+   demonstrate lower stage latency without increasing tracked CUDA allocations.
+   Use `--enable-logit-diagnostics` plus `tools/q38_logit_parity.py` in isolated
+   eager/graph runs: the gate requires matching session/epoch/frontier metadata,
+   selected tokens, and bitwise-identical raw BF16 payloads. Disable diagnostics
+   for the subsequent latency measurement because it intentionally adds a full
+   logits D2H copy.

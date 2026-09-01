@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -129,6 +130,8 @@ class LaunchManifestTest(unittest.TestCase):
             self.assertIn("--sampling", command)
             self.assertIn("--snapshot-journal", command)
             self.assertNotIn("--enable-mtp", command)
+            self.assertNotIn("--enable-piecewise-decode-graph", command)
+            self.assertNotIn("--enable-logit-diagnostics", command)
             fast_command = runtime_command(
                 validated,
                 Path("/bin/true"),
@@ -148,6 +151,29 @@ class LaunchManifestTest(unittest.TestCase):
                 True,
             )
             self.assertIn("--enable-mtp", mtp_command)
+            self.assertNotIn("--enable-piecewise-decode-graph", mtp_command)
+            graph_command = runtime_command(
+                validated,
+                Path("/bin/true"),
+                Path("/tmp/q38.sock"),
+                Path("/tmp/q38.journal"),
+                4096,
+                8,
+                enable_piecewise_decode_graph=True,
+            )
+            self.assertNotIn("--enable-mtp", graph_command)
+            self.assertIn("--enable-piecewise-decode-graph", graph_command)
+            diagnostics_command = runtime_command(
+                validated,
+                Path("/bin/true"),
+                Path("/tmp/q38.sock"),
+                None,
+                4096,
+                8,
+                enable_logit_diagnostics=True,
+            )
+            self.assertIn("--enable-logit-diagnostics", diagnostics_command)
+            self.assertNotIn("--enable-piecewise-decode-graph", diagnostics_command)
 
     def test_detects_segment_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -156,6 +182,38 @@ class LaunchManifestTest(unittest.TestCase):
             (root / "stage0" / "segments" / "a.bin").write_bytes(b"broken")
             with self.assertRaises(ValueError):
                 validate_ready(path)
+
+    def test_mtp_width_cap_reaches_the_sidecar_launch_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ready = self.fixture(root)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(TOOLS / "q38_launch.py"),
+                    "--ready",
+                    str(ready),
+                    "--runtime",
+                    "/bin/true",
+                    "--socket",
+                    str(root / "executor.sock"),
+                    "--durability",
+                    "off",
+                    "--enable-mtp",
+                    "--mtp-max-draft",
+                    "4",
+                    "--dry-run",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            plan = json.loads(completed.stdout)
+            self.assertEqual(plan["mtp_max_draft"], 4)
+            sidecar = plan["sidecar_command"]
+            self.assertIn("--enable-mtp", sidecar)
+            width = sidecar.index("--mtp-max-draft")
+            self.assertEqual(sidecar[width + 1], "4")
 
     def test_rejects_partial_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

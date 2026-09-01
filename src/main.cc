@@ -51,6 +51,7 @@ int main(int argc, char** argv) {
     std::string identity_path;
     std::string snapshot_journal_path;
     std::uint64_t ple_cache_mib = 0;
+    bool enable_logit_diagnostics = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--chunk" && i + 1 < argc) {
@@ -103,11 +104,15 @@ int main(int argc, char** argv) {
         } else if (arg == "--stop-token-id" && i + 1 < argc) {
             options.stop_token_ids.push_back(
                 static_cast<std::int32_t>(std::stol(argv[++i])));
+        } else if (arg == "--enable-logit-diagnostics") {
+            enable_logit_diagnostics = true;
+            options.retain_last_logits_for_diagnostics = true;
         } else {
             std::cerr << "usage: q38-runtime [--manifest FILE] [--stage0-index FILE "
                          "--stage1-index FILE] [--ple-layout FILE] [--chunk N] "
                          "[--identity FILE] [--sampling greedy|top-k-top-p] "
                          "[--snapshot-journal FILE] [--stop-token-id N] "
+                         "[--enable-logit-diagnostics] "
                          "[sampling options]\n";
             return 2;
         }
@@ -156,12 +161,16 @@ int main(int argc, char** argv) {
             executor = q38::make_mock_executor(options);
         }
         std::cout << "{\"type\":\"ready\",\"backend\":\"mock\","
-                     "\"contract_version\":1,\"rpc_version\":1}\n"
+                     "\"contract_version\":1,\"rpc_version\":1,"
+                  << "\"logit_diagnostics_enabled\":"
+                  << (enable_logit_diagnostics ? "true" : "false")
+                  << "}\n"
                   << std::flush;
         if (!socket_path.empty()) {
             q38::ExecutorRpcServiceV1 service(executor.get(),
                                               options.session_hash,
-                                              snapshot_journal_path);
+                                              snapshot_journal_path,
+                                              enable_logit_diagnostics);
             q38::serve_executor_rpc_unix(&service, socket_path);
             return 0;
         }
@@ -185,6 +194,12 @@ int main(int argc, char** argv) {
                           << ",\"published_tokens\":"
                           << stats.published_tokens
                           << ",\"drafted_tokens\":" << stats.drafted_tokens
+                          << ",\"accepted_draft_tokens\":"
+                          << stats.accepted_draft_tokens
+                          << ",\"rejected_draft_tokens\":"
+                          << stats.rejected_draft_tokens
+                          << ",\"maximum_draft_width\":"
+                          << stats.maximum_draft_width
                           << ",\"rollbacks\":" << stats.rollbacks
                           << ",\"failures\":" << stats.failures
                           << ",\"cancellations\":" << stats.cancellations

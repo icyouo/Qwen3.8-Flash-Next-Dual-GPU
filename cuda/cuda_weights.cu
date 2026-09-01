@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -39,13 +40,42 @@ struct TensorPointers {
     const DeviceTensorV1* descriptor = nullptr;
     const void* data = nullptr;
     const void* scales = nullptr;
+    CudaWeightLayoutV1 layout = CudaWeightLayoutV1::kRowMajor;
 };
 
 struct TensorPlacement {
     std::size_t tensor = 0;
     std::uint64_t data_offset = 0;
     std::uint64_t scale_offset = 0;
+    CudaWeightLayoutV1 layout = CudaWeightLayoutV1::kRowMajor;
 };
+
+bool ends_with(const std::string& value, const char* suffix) {
+    const auto length = std::strlen(suffix);
+    return value.size() >= length &&
+           value.compare(value.size() - length, length, suffix) == 0;
+}
+
+bool tiled_moe_layout_enabled() {
+    const char* value = std::getenv("Q38_CUDA_MOE_LAYOUT");
+    return !value || (std::strcmp(value, "row") != 0 &&
+                      std::strcmp(value, "row_major") != 0 &&
+                      std::strcmp(value, "0") != 0 &&
+                      std::strcmp(value, "false") != 0);
+}
+
+bool should_tile_moe_w4(const DeviceTensorV1& tensor) {
+    if (!tiled_moe_layout_enabled() ||
+        tensor.format != DeviceWeightFormatV1::kW4A16SymG128 ||
+        tensor.shape.size() != 3 || tensor.shape[1] % 16 != 0 ||
+        tensor.shape[2] % 16 != 0)
+        return false;
+    // The gate/up projection benefits from contiguous Tensor-Core B tiles.
+    // The down projection's shorter K dimension regresses on this GPU because
+    // the extra tiled-address arithmetic outweighs its transaction savings,
+    // so retain its canonical row-major device layout.
+    return ends_with(tensor.name, "ffn_gate_up_exps.weight");
+}
 
 }  // namespace
 
@@ -128,6 +158,8 @@ struct CudaDeviceWeightStore::Impl {
             arena_bytes = align_up(arena_bytes, options.arena_alignment);
             TensorPlacement placement;
             placement.tensor = tensor_index;
+            if (should_tile_moe_w4(tensor))
+                placement.layout = CudaWeightLayoutV1::kMoeW4Tile16x16;
             placement.data_offset = arena_bytes;
             if (tensor.data_bytes > std::numeric_limits<std::uint64_t>::max() -
                                     arena_bytes)
@@ -194,12 +226,74 @@ struct CudaDeviceWeightStore::Impl {
                 ++statistics.upload_chunks;
             }
         };
+        const auto upload_tiled_w4 = [&](const std::byte* host,
+                                         std::byte* device,
+                                         const DeviceTensorV1& tensor) {
+            constexpr std::size_t kTileRows = 16;
+            constexpr std::size_t kTileColumns = 16;
+            constexpr std::size_t kTileBytes =
+                kTileRows * kTileColumns / 2;
+            if (options.staging_bytes < kTileBytes)
+                throw std::invalid_argument(
+                    "CUDA staging buffer is too small for a MoE W4 tile");
+            const auto rows = static_cast<std::size_t>(tensor.shape[1]);
+            const auto columns = static_cast<std::size_t>(tensor.shape[2]);
+            const auto matrices = static_cast<std::size_t>(tensor.shape[0]);
+            const auto row_tiles = rows / kTileRows;
+            const auto column_tiles = columns / kTileColumns;
+            const auto tiles_per_matrix = row_tiles * column_tiles;
+            const auto total_tiles = matrices * tiles_per_matrix;
+            const auto source_matrix_bytes = rows * columns / 2;
+            std::size_t tile_index = 0;
+            std::uint64_t uploaded = 0;
+            while (tile_index < total_tiles) {
+                auto& buffer = staging[cursor++ % staging.size()];
+                check(cudaEventSynchronize(buffer.reusable),
+                      "cudaEventSynchronize(weight staging)");
+                std::size_t filled = 0;
+                while (tile_index < total_tiles &&
+                       filled + kTileBytes <= options.staging_bytes) {
+                    const auto matrix = tile_index / tiles_per_matrix;
+                    const auto within = tile_index % tiles_per_matrix;
+                    const auto row_tile = within / column_tiles;
+                    const auto column_tile = within % column_tiles;
+                    const auto* matrix_source =
+                        host + matrix * source_matrix_bytes;
+                    for (std::size_t row = 0; row < kTileRows; ++row) {
+                        const auto source_offset =
+                            (row_tile * kTileRows + row) * (columns / 2) +
+                            column_tile * (kTileColumns / 2);
+                        std::memcpy(buffer.host + filled +
+                                        row * (kTileColumns / 2),
+                                    matrix_source + source_offset,
+                                    kTileColumns / 2);
+                    }
+                    filled += kTileBytes;
+                    ++tile_index;
+                }
+                check(cudaMemcpyAsync(device + uploaded, buffer.host, filled,
+                                      cudaMemcpyHostToDevice, stream),
+                      "cudaMemcpyAsync(tiled MoE weight upload)");
+                check(cudaEventRecord(buffer.reusable, stream),
+                      "cudaEventRecord(tiled MoE weight staging)");
+                uploaded += filled;
+                statistics.uploaded_bytes += filled;
+                ++statistics.upload_chunks;
+            }
+            if (uploaded != tensor.data_bytes)
+                throw std::logic_error("tiled MoE W4 upload size differs");
+        };
         tensors.reserve(placements.size());
         for (const auto& placement : placements) {
             const auto& tensor = index.tensors[placement.tensor];
             const auto source_view = source.require(tensor.name);
-            upload_extent(source_view.data, arena + placement.data_offset,
-                          tensor.data_bytes);
+            if (placement.layout ==
+                CudaWeightLayoutV1::kMoeW4Tile16x16)
+                upload_tiled_w4(source_view.data,
+                                arena + placement.data_offset, tensor);
+            else
+                upload_extent(source_view.data, arena + placement.data_offset,
+                              tensor.data_bytes);
             if (tensor.scale_bytes != 0)
                 upload_extent(source_view.scales,
                               arena + placement.scale_offset,
@@ -210,6 +304,7 @@ struct CudaDeviceWeightStore::Impl {
                 tensor.scale_bytes == 0
                     ? nullptr
                     : static_cast<const void*>(arena + placement.scale_offset),
+                placement.layout,
             };
             if (!tensors.emplace(tensor.name, pointers).second)
                 throw std::runtime_error("duplicate CUDA tensor name");
@@ -254,7 +349,7 @@ CudaTensorViewV1 CudaDeviceWeightStore::find(const std::string& name) const {
     const auto found = impl_->tensors.find(name);
     if (found == impl_->tensors.end()) return {};
     return CudaTensorViewV1{found->second.descriptor, found->second.data,
-                            found->second.scales};
+                            found->second.scales, found->second.layout};
 }
 
 CudaTensorViewV1 CudaDeviceWeightStore::require(const std::string& name) const {
@@ -271,6 +366,9 @@ CudaMatrixViewV1 cuda_matrix_view(const CudaTensorViewV1& tensor,
                                   std::uint64_t outer_index) {
     if (tensor.empty() || !tensor.data || tensor.descriptor->shape.size() < 2)
         throw std::invalid_argument("CUDA tensor is not a matrix");
+    if (tensor.layout != CudaWeightLayoutV1::kRowMajor)
+        throw std::invalid_argument(
+            "tiled CUDA expert tensor cannot be bound as a generic matrix");
     const auto& descriptor = *tensor.descriptor;
     const auto rows64 = descriptor.shape[descriptor.shape.size() - 2];
     const auto columns64 = descriptor.shape.back();

@@ -33,6 +33,8 @@ int main(int argc, char** argv) {
     q38::PleIoModeV1 ple_io_mode = q38::PleIoModeV1::kIoUringDirect;
     std::uint32_t ple_queue_depth = 64;
     bool enable_mtp = false;
+    bool enable_piecewise_decode_graph = false;
+    bool enable_logit_diagnostics = false;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--stage0-index" && index + 1 < argc)
@@ -98,7 +100,12 @@ int main(int argc, char** argv) {
                 static_cast<std::int32_t>(std::stol(argv[++index])));
         else if (argument == "--enable-mtp")
             enable_mtp = true;
-        else {
+        else if (argument == "--enable-piecewise-decode-graph")
+            enable_piecewise_decode_graph = true;
+        else if (argument == "--enable-logit-diagnostics") {
+            enable_logit_diagnostics = true;
+            options.retain_last_logits_for_diagnostics = true;
+        } else {
             std::cerr << "usage: q38-cuda-runtime --stage0-index FILE "
                          "--stage1-index FILE --ple-layout FILE "
                          "[--chunk N] [--ple-cache-gib N] "
@@ -109,6 +116,8 @@ int main(int argc, char** argv) {
                          "[--sampling greedy|top-k-top-p] "
                          "[--snapshot-journal FILE] [--stop-token-id N] "
                          "[--enable-mtp] "
+                         "[--enable-piecewise-decode-graph] "
+                         "[--enable-logit-diagnostics] "
                          "[sampling options]\n";
             return 2;
         }
@@ -122,16 +131,23 @@ int main(int argc, char** argv) {
         options.identity = q38::load_session_identity(identity_path);
         auto executor = q38::make_cuda_executor(
             stage0, stage1, ple, options, 0, 1, ple_cache_gib << 30u,
-            ple_io_mode, ple_queue_depth, enable_mtp);
+            ple_io_mode, ple_queue_depth, enable_mtp,
+            enable_piecewise_decode_graph);
         std::cout << "{\"type\":\"ready\",\"backend\":\"cuda\","
                      "\"contract_version\":1,\"rpc_version\":1,"
                   << "\"mtp_enabled\":"
-                  << (enable_mtp ? "true" : "false") << "}\n"
+                  << (enable_mtp ? "true" : "false")
+                  << ",\"piecewise_decode_graph_enabled\":"
+                  << (enable_piecewise_decode_graph ? "true" : "false")
+                  << ",\"logit_diagnostics_enabled\":"
+                  << (enable_logit_diagnostics ? "true" : "false")
+                  << "}\n"
                   << std::flush;
         if (!socket_path.empty()) {
             q38::ExecutorRpcServiceV1 service(executor.get(),
                                               options.session_hash,
-                                              snapshot_journal_path);
+                                              snapshot_journal_path,
+                                              enable_logit_diagnostics);
             q38::serve_executor_rpc_unix(&service, socket_path);
             return 0;
         }

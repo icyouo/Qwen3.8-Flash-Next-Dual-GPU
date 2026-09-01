@@ -153,10 +153,11 @@ public:
     }
     std::vector<std::int32_t> draft_retained(
         std::int32_t pending_token, std::uint64_t position,
-        std::uint64_t transaction_epoch,
+        std::uint32_t max_draft, std::uint64_t transaction_epoch,
         std::shared_ptr<q38::CancellationToken> cancellation = {}) override {
         auto result = inner_->draft_retained(
-            pending_token, position, transaction_epoch, cancellation);
+            pending_token, position, max_draft, transaction_epoch,
+            cancellation);
         if (!cancelled_once_ && cancellation) {
             cancelled_once_ = true;
             (void)cancellation->request_cancel();
@@ -243,13 +244,13 @@ public:
     }
     std::vector<std::int32_t> draft_retained(
         std::int32_t pending_token, std::uint64_t position,
-        std::uint64_t transaction_epoch,
+        std::uint32_t max_draft, std::uint64_t transaction_epoch,
         std::shared_ptr<q38::CancellationToken> cancellation = {}) override {
         if (state_->armed.load(std::memory_order_acquire)) {
             state_->draft_entered.store(true, std::memory_order_release);
             wait_for_overlap_peer(state_->stage0_entered);
         }
-        return inner_->draft_retained(pending_token, position,
+        return inner_->draft_retained(pending_token, position, max_draft,
                                       transaction_epoch,
                                       std::move(cancellation));
     }
@@ -441,6 +442,31 @@ void test_rejects_bad_ack() {
     CHECK(engine.commit(&event, &error));
 }
 
+void test_shortens_only_unacknowledged_speculation() {
+    q38::SessionTxnEngine engine(0x41);
+    std::string error;
+    CHECK(engine.append_known(1, &error));
+    CHECK(engine.prepare(q38::TxnKind::kSpeculative, 5, &error));
+    const auto epoch = engine.active_transaction().epoch;
+    CHECK(!engine.shorten_speculative(0, &error));
+    CHECK(!engine.shorten_speculative(5, &error));
+    CHECK(engine.shorten_speculative(3, &error));
+    CHECK(engine.active_transaction().evaluated_count == 3);
+    CHECK(engine.acknowledge(q38::Stage::kStage0, epoch, 3, &error));
+    CHECK(!engine.shorten_speculative(2, &error));
+    CHECK(engine.acknowledge(q38::Stage::kStage1, epoch, 3, &error));
+    CHECK(engine.decide(3, &error));
+    q38::CommitEventV1 event;
+    CHECK(engine.commit(&event, &error));
+    CHECK(event.newly_published == 3);
+    CHECK(engine.frontiers().target == 3);
+    CHECK(engine.frontiers().canonical == 4);
+
+    CHECK(engine.prepare(q38::TxnKind::kAppendKnown, 1, &error));
+    CHECK(!engine.shorten_speculative(1, &error));
+    CHECK(engine.rollback(&error));
+}
+
 void test_randomized_frontiers() {
     q38::SessionTxnEngine engine(0xabcdef);
     std::mt19937 rng(0x170);
@@ -531,8 +557,14 @@ void test_width_one_speculative_pipeline() {
         const auto before = executor->metrics();
         const auto result = executor->speculative_step(1);
         const auto after = executor->metrics();
+        const auto verified = result.published_tokens.size();
         CHECK(after.stage0.execute_calls == before.stage0.execute_calls + 2);
-        CHECK(after.stage1.execute_calls == before.stage1.execute_calls + 2);
+        CHECK(after.stage1.execute_calls ==
+              before.stage1.execute_calls + verified);
+        CHECK(after.executor.evaluated_tokens ==
+              before.executor.evaluated_tokens + verified);
+        CHECK(after.executor.state_committed_tokens ==
+              before.executor.state_committed_tokens + verified);
         CHECK(result.published_tokens.size() == 1 ||
               result.published_tokens.size() == 2);
         saw_reject = saw_reject || result.published_tokens.size() == 1;
@@ -546,6 +578,57 @@ void test_width_one_speculative_pipeline() {
     }
     CHECK(saw_accept);
     CHECK(saw_reject);
+}
+
+void test_width_n_speculative_pipeline() {
+    q38::ExecutorOptions options;
+    options.append_chunk_tokens = 4;
+    auto executor = q38::make_mock_executor(options);
+    executor->append({31, 32, 33, 34, 35, 36, 37});
+    (void)executor->seed_decode();
+
+    constexpr std::uint32_t width = 4;
+    std::array<bool, width + 2> saw_published_extent{};
+    const auto all_depths_seen = [&]() {
+        return std::all_of(saw_published_extent.begin() + 1,
+                           saw_published_extent.end(),
+                           [](bool seen) { return seen; });
+    };
+    for (int step = 0; step < 4096 && !all_depths_seen(); ++step) {
+        const auto before = executor->metrics();
+        const auto result = executor->speculative_step(width);
+        const auto after = executor->metrics();
+        const auto verified = result.published_tokens.size();
+        const auto stage0_rows =
+            verified + (verified <= width ? 1u : 0u);
+        CHECK(after.stage0.execute_calls ==
+              before.stage0.execute_calls + stage0_rows);
+        CHECK(after.stage1.execute_calls ==
+              before.stage1.execute_calls + verified);
+        CHECK(after.executor.evaluated_tokens ==
+              before.executor.evaluated_tokens + verified);
+        CHECK(after.executor.state_committed_tokens ==
+              before.executor.state_committed_tokens + verified);
+        CHECK(after.executor.drafted_tokens ==
+              before.executor.drafted_tokens + width);
+        CHECK((after.executor.accepted_draft_tokens -
+                   before.executor.accepted_draft_tokens) +
+                  (after.executor.rejected_draft_tokens -
+                   before.executor.rejected_draft_tokens) ==
+              width);
+        CHECK(after.executor.maximum_draft_width == width);
+        CHECK(result.published_tokens.size() >= 1);
+        CHECK(result.published_tokens.size() <= width + 1);
+        saw_published_extent[result.published_tokens.size()] = true;
+        CHECK(executor->frontiers().canonical -
+                  executor->frontiers().target ==
+              1);
+        CHECK(executor->frontiers().stage0 == executor->frontiers().target);
+        CHECK(executor->frontiers().stage1 == executor->frontiers().target);
+        CHECK(executor->frontiers().draft == executor->frontiers().target);
+    }
+    // Exercise rejection at every draft depth plus the all-accepted N+1 path.
+    CHECK(all_depths_seen());
 }
 
 void test_retained_draft_cancellation_rolls_back_transaction() {
@@ -565,7 +648,7 @@ void test_retained_draft_cancellation_rolls_back_transaction() {
     auto cancellation = std::make_shared<q38::CancellationToken>();
     bool cancelled = false;
     try {
-        (void)executor.speculative_step(1, cancellation);
+        (void)executor.speculative_step(4, cancellation);
     } catch (const q38::ExecutionCancelled&) {
         cancelled = true;
     }
@@ -573,7 +656,7 @@ void test_retained_draft_cancellation_rolls_back_transaction() {
     CHECK(rolled_back->load(std::memory_order_relaxed) == 1);
     CHECK(executor.frontiers().canonical == before.canonical);
     CHECK(executor.frontiers().target == before.target);
-    const auto retry = executor.speculative_step(1);
+    const auto retry = executor.speculative_step(4);
     CHECK(!retry.published_tokens.empty());
 }
 
@@ -619,12 +702,20 @@ void test_speculative_stop_token_is_transactionally_truncated() {
     executor->append(prompt);
     (void)executor->seed_decode();
     const auto before = executor->frontiers();
+    const auto metrics_before = executor->metrics();
     const auto stopped = executor->speculative_step(5);
+    const auto metrics_after = executor->metrics();
     CHECK(stopped.published_tokens.size() == 1);
     CHECK(stopped.published_tokens.front() == stop);
     CHECK(executor->frontiers().canonical == before.canonical + 1);
     CHECK(executor->frontiers().target == before.target + 1);
     CHECK(executor->frontiers().canonical - executor->frontiers().target == 1);
+    CHECK(metrics_after.stage0.execute_calls ==
+          metrics_before.stage0.execute_calls + 2);
+    CHECK(metrics_after.stage1.execute_calls ==
+          metrics_before.stage1.execute_calls + 1);
+    CHECK(metrics_after.executor.evaluated_tokens ==
+          metrics_before.executor.evaluated_tokens + 1);
 }
 
 void test_executor_context_limit() {
@@ -675,10 +766,23 @@ void test_executor_context_limit() {
         auto executor = q38::make_mock_executor(options);
         executor->append({1});
         (void)executor->seed_decode();
-        (void)executor->speculative_step(100);
+        (void)executor->speculative_step(64);
         CHECK(executor->frontiers().canonical <= options.context_limit);
         CHECK(executor->canonical_tokens().size() ==
               executor->frontiers().canonical);
+    }
+
+    {
+        auto executor = q38::make_mock_executor(options);
+        executor->append({1});
+        (void)executor->seed_decode();
+        bool rejected = false;
+        try {
+            (void)executor->speculative_step(65);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        CHECK(rejected);
     }
 }
 
@@ -815,6 +919,88 @@ void test_executor_rpc_service() {
     CHECK(response.header.status ==
           q38::ExecutorRpcStatusV1::kFailedPrecondition);
     CHECK(response.header.frontiers.canonical == 2);
+}
+
+void test_executor_rpc_logit_diagnostics() {
+    q38::ExecutorOptions options;
+    options.session_hash = 0x38;
+    options.context_limit = 8;
+    options.vocab_size = 16;
+    options.retain_last_logits_for_diagnostics = true;
+    auto executor = q38::make_mock_executor(options);
+    q38::ExecutorRpcServiceV1 service(executor.get(), options.session_hash,
+                                      {}, true);
+
+    auto logits = rpc_request(q38::ExecutorRpcOpcodeV1::kLogits, 90,
+                              options.session_hash);
+    auto response = service.handle(logits);
+    CHECK(response.header.status ==
+          q38::ExecutorRpcStatusV1::kFailedPrecondition);
+    CHECK(response.message.find("no committed") != std::string::npos);
+
+    auto append = rpc_request(q38::ExecutorRpcOpcodeV1::kAppend, 1,
+                              options.session_hash);
+    append.tokens = {2, 3};
+    append.header.token_count = append.tokens.size();
+    append.header.payload_bytes =
+        append.tokens.size() * sizeof(std::int32_t);
+    response = service.handle(append);
+    CHECK(response.header.status == q38::ExecutorRpcStatusV1::kOk);
+    const auto snapshot = executor->diagnostic_logit_snapshot();
+    CHECK(snapshot.has_value());
+    CHECK(snapshot->transaction_kind == q38::TxnKind::kAppendKnown);
+    CHECK(snapshot->logits_bf16.size() == options.vocab_size);
+
+    response = service.handle(logits);
+    CHECK(response.header.status == q38::ExecutorRpcStatusV1::kOk);
+    CHECK(response.message.find("\"schema\":\"q38.logits.bf16.v1\"") !=
+          std::string::npos);
+    CHECK(response.message.find("\"element_count\":16") !=
+          std::string::npos);
+    CHECK(response.message.find("raw_bf16_le_hex") == std::string::npos);
+
+    logits.header.argument0 = 1;
+    response = service.handle(logits);
+    CHECK(response.header.status == q38::ExecutorRpcStatusV1::kOk);
+    const auto raw = response.message.find("\"raw_bf16_le_hex\":\"");
+    CHECK(raw != std::string::npos);
+    if (raw != std::string::npos) {
+        const auto first = raw + std::string("\"raw_bf16_le_hex\":\"").size();
+        const auto last = response.message.find('"', first);
+        CHECK(last != std::string::npos);
+        if (last != std::string::npos)
+            CHECK(last - first == options.vocab_size * 4u);
+    }
+
+    auto invalid = logits;
+    invalid.header.argument0 = 2;
+    response = service.handle(invalid);
+    CHECK(response.header.status == q38::ExecutorRpcStatusV1::kBadRequest);
+
+    auto seed = rpc_request(q38::ExecutorRpcOpcodeV1::kSeed, 2,
+                            options.session_hash);
+    response = service.handle(seed);
+    CHECK(response.header.status == q38::ExecutorRpcStatusV1::kOk);
+    auto decode = rpc_request(q38::ExecutorRpcOpcodeV1::kDecode, 3,
+                              options.session_hash);
+    decode.header.argument0 = 1;
+    response = service.handle(decode);
+    CHECK(response.header.status == q38::ExecutorRpcStatusV1::kOk);
+    CHECK(executor->diagnostic_logit_snapshot()->transaction_kind ==
+          q38::TxnKind::kDecode);
+
+    auto reset = rpc_request(q38::ExecutorRpcOpcodeV1::kReset, 4,
+                             options.session_hash);
+    response = service.handle(reset);
+    CHECK(response.header.status == q38::ExecutorRpcStatusV1::kOk);
+    CHECK(!executor->diagnostic_logit_snapshot().has_value());
+
+    q38::ExecutorRpcServiceV1 disabled(executor.get(), options.session_hash);
+    logits.header.argument0 = 0;
+    response = disabled.handle(logits);
+    CHECK(response.header.status ==
+          q38::ExecutorRpcStatusV1::kFailedPrecondition);
+    CHECK(response.message.find("disabled") != std::string::npos);
 }
 
 void test_executor_rpc_cancel_and_deadline() {
@@ -1088,6 +1274,18 @@ void test_metrics_schema() {
     CHECK(json.find("\"cuda_tracked_allocated_bytes\":") !=
           std::string::npos);
     CHECK(json.find("\"runtime_pinned_bytes\":") !=
+          std::string::npos);
+    CHECK(json.find("\"accepted_draft_tokens\":") !=
+          std::string::npos);
+    CHECK(json.find("\"maximum_draft_width\":") !=
+          std::string::npos);
+    CHECK(json.find("\"cuda_graph_captures\":") !=
+          std::string::npos);
+    CHECK(json.find("\"cuda_graph_replays\":") !=
+          std::string::npos);
+    CHECK(json.find("\"cuda_graph_fallbacks\":") !=
+          std::string::npos);
+    CHECK(json.find("\"cuda_graph_nodes\":") !=
           std::string::npos);
 #ifdef __linux__
     CHECK(metrics.host.process_rss_bytes > 0);
@@ -1474,19 +1672,20 @@ void test_ple_layout_hash_and_store() {
     direct_options.io_mode = q38::PleIoModeV1::kIoUringDirect;
     direct_options.queue_depth = 8;
     q38::PleStore direct_store(std::move(direct_layout), direct_options);
-    const auto direct_rows = direct_store.read_rows({0, 3, 7, 15});
-    CHECK(direct_rows.size() == 4u * 4096u);
+    const auto direct_rows = direct_store.read_rows(
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+    CHECK(direct_rows.size() == 16u * 4096u);
     CHECK(direct_rows[0] == 0);
-    CHECK(direct_rows[4096] == 3);
-    CHECK(direct_rows[8192] == 7);
-    CHECK(direct_rows[12288] == 15);
+    CHECK(direct_rows[3u * 4096u] == 3);
+    CHECK(direct_rows[7u * 4096u] == 7);
+    CHECK(direct_rows[15u * 4096u] == 15);
     const auto direct_stats = direct_store.cache_stats();
     CHECK(direct_stats.io_uring_enabled == 1);
     CHECK(direct_stats.direct_io_enabled == 1);
-    CHECK(direct_stats.io_uring_submissions == 4);
-    CHECK(direct_stats.io_uring_completions == 4);
-    CHECK(direct_stats.maximum_queue_depth == 4);
-    CHECK(direct_stats.direct_read_bytes == 4u * 4096u);
+    CHECK(direct_stats.io_uring_submissions == 16);
+    CHECK(direct_stats.io_uring_completions == 16);
+    CHECK(direct_stats.maximum_queue_depth == 8);
+    CHECK(direct_stats.direct_read_bytes == 16u * 4096u);
     CHECK(direct_stats.read_latency_p50_ns > 0);
     std::remove(direct_layout_path.c_str());
     std::remove(direct_data_path.c_str());
@@ -1500,14 +1699,17 @@ int main() {
     test_boundary_checksum_rejects_corruption();
     test_transactions();
     test_rejects_bad_ack();
+    test_shortens_only_unacknowledged_speculation();
     test_randomized_frontiers();
     test_mock_executor();
     test_width_one_speculative_pipeline();
+    test_width_n_speculative_pipeline();
     test_retained_draft_cancellation_rolls_back_transaction();
     test_retained_draft_overlaps_first_stage0_row();
     test_speculative_stop_token_is_transactionally_truncated();
     test_executor_context_limit();
     test_executor_rpc_service();
+    test_executor_rpc_logit_diagnostics();
     test_executor_rpc_cancel_and_deadline();
     test_transactional_sampling();
     test_session_identity_contract();

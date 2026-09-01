@@ -282,7 +282,7 @@ std::vector<std::uint64_t> PleHashState::rows(
 
 struct PleStore::Cache {
     struct Entry {
-        std::vector<std::uint8_t> bytes;
+        std::uint8_t* bytes = nullptr;
         std::list<std::uint64_t>::iterator lru;
     };
 
@@ -296,8 +296,44 @@ struct PleStore::Cache {
     mutable std::mutex mutex;
     mutable std::unordered_map<std::uint64_t, Entry> entries;
     mutable std::list<std::uint64_t> lru;
+    mutable std::vector<std::unique_ptr<std::uint8_t[]>> page_chunks;
+    mutable std::vector<std::uint8_t*> free_pages;
+    mutable std::size_t allocated_pages = 0;
     mutable PleCacheStatsV1 stats;
     mutable std::deque<std::uint64_t> read_latencies;
+
+    std::uint8_t* acquire_page() const {
+        if (free_pages.empty() && allocated_pages < max_pages) {
+            constexpr std::size_t kChunkBytes = 64u << 20u;
+            const auto target_pages =
+                std::max<std::size_t>(1, kChunkBytes / page_bytes);
+            const auto chunk_pages = std::min(
+                target_pages, max_pages - allocated_pages);
+            std::unique_ptr<std::uint8_t[]> chunk(
+                new std::uint8_t[chunk_pages * page_bytes]);
+            free_pages.reserve(free_pages.size() + chunk_pages);
+            for (std::size_t index = 0; index < chunk_pages; ++index)
+                free_pages.push_back(chunk.get() + index * page_bytes);
+            allocated_pages += chunk_pages;
+            page_chunks.push_back(std::move(chunk));
+        }
+        if (!free_pages.empty()) {
+            auto* result = free_pages.back();
+            free_pages.pop_back();
+            return result;
+        }
+        if (lru.empty())
+            throw std::logic_error("PLE page cache has no reusable page");
+        const auto victim = lru.back();
+        const auto found = entries.find(victim);
+        if (found == entries.end() || !found->second.bytes)
+            throw std::logic_error("PLE page cache LRU is inconsistent");
+        auto* result = found->second.bytes;
+        lru.pop_back();
+        entries.erase(found);
+        ++stats.evictions;
+        return result;
+    }
 };
 
 struct PleStore::ScalePart {
@@ -340,73 +376,117 @@ struct PleStore::IoUringProvider {
     std::uint32_t queue_depth() const { return queue_depth_; }
 
     std::uint64_t read(const std::vector<ReadRequest>& requests) {
-        if (requests.empty() || requests.size() > queue_depth_)
+        if (requests.empty())
             throw std::invalid_argument("PLE io_uring batch size is invalid");
-        const auto count = static_cast<std::uint32_t>(requests.size());
-        const auto head = load(sq_head_);
-        auto tail = load(sq_tail_);
-        if (tail - head + count > *sq_entries_)
-            throw std::runtime_error("PLE io_uring submission queue is full");
-        for (std::uint32_t index = 0; index < count; ++index) {
-            const auto slot = tail & *sq_ring_mask_;
-            auto& entry = sqes_[slot];
-            std::memset(&entry, 0, sizeof(entry));
-            entry.opcode = IORING_OP_READ_FIXED;
-            entry.fd = requests[index].fd;
-            entry.off = requests[index].offset;
-            entry.addr = reinterpret_cast<std::uint64_t>(buffers_[index]);
-            entry.len = page_bytes_;
-            entry.buf_index = static_cast<std::uint16_t>(index);
-            entry.user_data = index;
-            sq_array_[slot] = slot;
-            ++tail;
-        }
-        store(sq_tail_, tail);
-        std::uint32_t submitted = 0;
-        while (submitted < count) {
-            const auto result = static_cast<int>(::syscall(
-                __NR_io_uring_enter, ring_fd_, count - submitted, count,
-                IORING_ENTER_GETEVENTS, nullptr, 0));
-            if (result < 0 && errno == EINTR) continue;
-            if (result < 0)
-                throw std::runtime_error("io_uring_enter failed: " +
-                                         std::string(std::strerror(errno)));
-            submitted += static_cast<std::uint32_t>(result);
-        }
 
-        while (load(cq_tail_) - load(cq_head_) < count) {
-            const auto available = load(cq_tail_) - load(cq_head_);
-            const auto result = static_cast<int>(::syscall(
-                __NR_io_uring_enter, ring_fd_, 0, count - available,
-                IORING_ENTER_GETEVENTS, nullptr, 0));
-            if (result < 0 && errno == EINTR) continue;
-            if (result < 0)
-                throw std::runtime_error("io_uring completion wait failed: " +
-                                         std::string(std::strerror(errno)));
-        }
-        auto completion_head = load(cq_head_);
+        // Keep a sliding window of fixed-buffer reads in flight.  The old
+        // implementation imposed a barrier after every queue-depth-sized
+        // group, so one slow completion held back the whole next group.  PLE
+        // prefill commonly has thousands of independent random pages; reuse a
+        // completed buffer immediately and keep the device queue populated.
+        constexpr auto kNoRequest = std::numeric_limits<std::size_t>::max();
+        std::vector<std::size_t> active(queue_depth_, kNoRequest);
+        std::vector<std::uint32_t> free_buffers;
+        free_buffers.reserve(queue_depth_);
+        for (std::uint32_t index = queue_depth_; index > 0; --index)
+            free_buffers.push_back(index - 1);
+
+        std::size_t next_request = 0;
+        std::size_t completed = 0;
+        std::uint32_t in_flight = 0;
         std::uint64_t physical_bytes = 0;
-        for (std::uint32_t done = 0; done < count; ++done) {
-            const auto& completion =
-                cqes_[completion_head & *cq_ring_mask_];
-            const auto request_index =
-                static_cast<std::size_t>(completion.user_data);
-            if (request_index >= requests.size() || completion.res < 0)
-                throw std::runtime_error(
-                    completion.res < 0
-                        ? "PLE io_uring read failed: " +
-                              std::string(std::strerror(-completion.res))
-                        : "PLE io_uring completion identity is invalid");
-            const auto bytes = static_cast<std::size_t>(completion.res);
-            if (bytes < requests[request_index].expected_bytes ||
-                bytes > page_bytes_)
-                throw std::runtime_error("PLE io_uring direct read was short");
-            std::copy_n(static_cast<std::uint8_t*>(buffers_[request_index]),
-                        bytes, requests[request_index].output);
-            physical_bytes += bytes;
-            ++completion_head;
+        while (completed < requests.size()) {
+            const auto submission_head = load(sq_head_);
+            auto submission_tail = load(sq_tail_);
+            std::uint32_t queued = 0;
+            while (next_request < requests.size() &&
+                   !free_buffers.empty() &&
+                   submission_tail - submission_head < *sq_entries_) {
+                const auto buffer_index = free_buffers.back();
+                free_buffers.pop_back();
+                const auto request_index = next_request++;
+                const auto slot = submission_tail & *sq_ring_mask_;
+                auto& entry = sqes_[slot];
+                std::memset(&entry, 0, sizeof(entry));
+                entry.opcode = IORING_OP_READ_FIXED;
+                entry.fd = requests[request_index].fd;
+                entry.off = requests[request_index].offset;
+                entry.addr = reinterpret_cast<std::uint64_t>(
+                    buffers_[buffer_index]);
+                entry.len = page_bytes_;
+                entry.buf_index = static_cast<std::uint16_t>(buffer_index);
+                entry.user_data = buffer_index;
+                sq_array_[slot] = slot;
+                active[buffer_index] = request_index;
+                ++submission_tail;
+                ++queued;
+            }
+            store(sq_tail_, submission_tail);
+
+            std::uint32_t submitted = 0;
+            while (submitted < queued) {
+                const auto result = static_cast<int>(::syscall(
+                    __NR_io_uring_enter, ring_fd_, queued - submitted, 0, 0,
+                    nullptr, 0));
+                if (result < 0 && errno == EINTR) continue;
+                if (result < 0)
+                    throw std::runtime_error(
+                        "io_uring_enter failed: " +
+                        std::string(std::strerror(errno)));
+                if (result == 0)
+                    throw std::runtime_error(
+                        "io_uring submitted no PLE reads");
+                submitted += static_cast<std::uint32_t>(result);
+            }
+            in_flight += queued;
+            if (in_flight == 0)
+                throw std::runtime_error("PLE io_uring made no progress");
+
+            while (load(cq_tail_) == load(cq_head_)) {
+                const auto result = static_cast<int>(::syscall(
+                    __NR_io_uring_enter, ring_fd_, 0, 1,
+                    IORING_ENTER_GETEVENTS, nullptr, 0));
+                if (result < 0 && errno == EINTR) continue;
+                if (result < 0)
+                    throw std::runtime_error(
+                        "io_uring completion wait failed: " +
+                        std::string(std::strerror(errno)));
+            }
+
+            auto completion_head = load(cq_head_);
+            const auto completion_tail = load(cq_tail_);
+            while (completion_head != completion_tail) {
+                const auto& completion =
+                    cqes_[completion_head & *cq_ring_mask_];
+                const auto buffer_index =
+                    static_cast<std::size_t>(completion.user_data);
+                const auto request_index =
+                    buffer_index < active.size() ? active[buffer_index]
+                                                 : kNoRequest;
+                if (request_index == kNoRequest ||
+                    request_index >= requests.size() || completion.res < 0)
+                    throw std::runtime_error(
+                        completion.res < 0
+                            ? "PLE io_uring read failed: " +
+                                  std::string(std::strerror(-completion.res))
+                            : "PLE io_uring completion identity is invalid");
+                const auto bytes = static_cast<std::size_t>(completion.res);
+                if (bytes < requests[request_index].expected_bytes ||
+                    bytes > page_bytes_)
+                    throw std::runtime_error(
+                        "PLE io_uring direct read was short");
+                std::copy_n(
+                    static_cast<std::uint8_t*>(buffers_[buffer_index]), bytes,
+                    requests[request_index].output);
+                physical_bytes += bytes;
+                active[buffer_index] = kNoRequest;
+                free_buffers.push_back(static_cast<std::uint32_t>(buffer_index));
+                ++completed;
+                --in_flight;
+                ++completion_head;
+            }
+            store(cq_head_, completion_head);
         }
-        store(cq_head_, completion_head);
         return physical_bytes;
     }
 
@@ -730,7 +810,6 @@ void PleStore::read_extents(const std::vector<PleReadExtentV1>& extents,
         std::uint32_t file_index = 0;
         std::uint64_t page_offset = 0;
         std::size_t physical_bytes = 0;
-        std::vector<std::uint8_t> bytes;
     };
     struct PendingCopy {
         std::size_t load = 0;
@@ -764,7 +843,7 @@ void PleStore::read_extents(const std::vector<PleReadExtentV1>& extents,
                 cache_->lru.erase(found->second.lru);
                 cache_->lru.push_front(key);
                 found->second.lru = cache_->lru.begin();
-                std::copy_n(found->second.bytes.data() + in_page, take,
+                std::copy_n(found->second.bytes + in_page, take,
                             output + extent.output_offset + copied);
             } else {
                 auto queued = load_by_key.find(key);
@@ -777,7 +856,6 @@ void PleStore::read_extents(const std::vector<PleReadExtentV1>& extents,
                     load.page_offset = page_offset;
                     load.physical_bytes = static_cast<std::size_t>(
                         std::min<std::uint64_t>(available, cache_->page_bytes));
-                    load.bytes.resize(cache_->page_bytes, 0);
                     const auto index = loads.size();
                     loads.push_back(std::move(load));
                     queued = load_by_key.emplace(key, index).first;
@@ -793,46 +871,58 @@ void PleStore::read_extents(const std::vector<PleReadExtentV1>& extents,
     cache_->stats.unique_page_requests += request_pages.size();
 
     if (!loads.empty()) {
+        if (loads.size() > std::numeric_limits<std::size_t>::max() /
+                               cache_->page_bytes)
+            throw std::overflow_error("PLE page-read batch size overflows");
+        // One scratch slab replaces thousands of independent 4 KiB heap
+        // allocations.  Cache residency is backed by coarse 64 MiB chunks;
+        // individual pages are copied into those chunks only after all reads
+        // succeed, preserving the previous fail-closed cache behavior.
+        std::vector<std::uint8_t> read_buffer(
+            loads.size() * cache_->page_bytes, 0);
+        const auto page_data = [&](std::size_t index) {
+            return read_buffer.data() + index * cache_->page_bytes;
+        };
         const auto started = std::chrono::steady_clock::now();
         try {
-            const auto maximum_batch = io_uring_
-                ? static_cast<std::size_t>(io_uring_->queue_depth())
-                : std::size_t{1};
-            for (std::size_t first = 0; first < loads.size();
-                 first += maximum_batch) {
-                const auto count = std::min(maximum_batch, loads.size() - first);
+            if (io_uring_) {
                 ++cache_->stats.read_batches;
                 cache_->stats.maximum_queue_depth = std::max<std::uint64_t>(
-                    cache_->stats.maximum_queue_depth, count);
-                if (io_uring_) {
-                    std::vector<IoUringProvider::ReadRequest> requests;
-                    requests.reserve(count);
-                    for (std::size_t local = 0; local < count; ++local) {
-                        auto& load = loads[first + local];
-                        const auto opened = std::find_if(
-                            files_.begin(), files_.end(),
-                            [&load](const OpenFile& file) {
-                                return file.index == load.file_index;
-                            });
-                        if (opened == files_.end() || opened->direct_fd < 0)
-                            throw std::runtime_error(
-                                "PLE direct file descriptor is unavailable");
-                        requests.push_back(IoUringProvider::ReadRequest{
-                            opened->direct_fd, load.page_offset,
-                            load.bytes.data(), load.physical_bytes});
-                    }
-                    const auto physical = io_uring_->read(requests);
-                    cache_->stats.physical_read_bytes += physical;
-                    cache_->stats.direct_read_bytes += physical;
-                    cache_->stats.io_uring_submissions += count;
-                    cache_->stats.io_uring_completions += count;
-                } else {
-                    auto& load = loads[first];
+                    cache_->stats.maximum_queue_depth,
+                    std::min<std::size_t>(loads.size(),
+                                          io_uring_->queue_depth()));
+                std::vector<IoUringProvider::ReadRequest> requests;
+                requests.reserve(loads.size());
+                for (std::size_t index = 0; index < loads.size(); ++index) {
+                    auto& load = loads[index];
+                    const auto opened = std::find_if(
+                        files_.begin(), files_.end(),
+                        [&load](const OpenFile& file) {
+                            return file.index == load.file_index;
+                        });
+                    if (opened == files_.end() || opened->direct_fd < 0)
+                        throw std::runtime_error(
+                            "PLE direct file descriptor is unavailable");
+                    requests.push_back(IoUringProvider::ReadRequest{
+                        opened->direct_fd, load.page_offset,
+                        page_data(index), load.physical_bytes});
+                }
+                const auto physical = io_uring_->read(requests);
+                cache_->stats.physical_read_bytes += physical;
+                cache_->stats.direct_read_bytes += physical;
+                cache_->stats.io_uring_submissions += requests.size();
+                cache_->stats.io_uring_completions += requests.size();
+            } else {
+                for (std::size_t index = 0; index < loads.size(); ++index) {
+                    auto& load = loads[index];
+                    ++cache_->stats.read_batches;
+                    cache_->stats.maximum_queue_depth = std::max<std::uint64_t>(
+                        cache_->stats.maximum_queue_depth, 1);
                     std::size_t done = 0;
                     while (done < load.physical_bytes) {
                         const auto count_read = pread(
                             file_descriptor(load.file_index),
-                            load.bytes.data() + done,
+                            page_data(index) + done,
                             load.physical_bytes - done,
                             static_cast<off_t>(load.page_offset + done));
                         if (count_read < 0 && errno == EINTR) continue;
@@ -858,21 +948,17 @@ void PleStore::read_extents(const std::vector<PleReadExtentV1>& extents,
         }
 
         for (const auto& copy : pending) {
-            const auto& load = loads.at(copy.load);
-            std::copy_n(load.bytes.data() + copy.in_page, copy.bytes,
+            std::copy_n(page_data(copy.load) + copy.in_page, copy.bytes,
                         output + copy.output_offset);
         }
-        for (auto& load : loads) {
-            if (cache_->entries.size() == cache_->max_pages) {
-                const auto victim = cache_->lru.back();
-                cache_->lru.pop_back();
-                cache_->entries.erase(victim);
-                ++cache_->stats.evictions;
-            }
+        for (std::size_t index = 0; index < loads.size(); ++index) {
+            const auto& load = loads[index];
+            auto* cache_page = cache_->acquire_page();
+            std::copy_n(page_data(index), cache_->page_bytes, cache_page);
             cache_->lru.push_front(load.key);
             cache_->entries.emplace(
                 load.key,
-                Cache::Entry{std::move(load.bytes), cache_->lru.begin()});
+                Cache::Entry{cache_page, cache_->lru.begin()});
         }
     }
 }

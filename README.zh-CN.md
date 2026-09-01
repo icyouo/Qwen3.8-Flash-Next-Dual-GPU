@@ -12,8 +12,11 @@ vLLM、SGLang、llama.cpp 或 DS4 的 fork，运行时也不依赖它们。`tran
 的官方 tokenizer/chat template codec，不参与模型执行和状态所有权。
 
 > **当前状态：research preview。** 双卡真实 CUDA 执行、自定义 artifact、事务化服务、
-> batch-1 decode 和 grouped-MMQ prefill 已通过验证；可选的 width-one MTP 流水也已经通过
-> 32K/128K/256K 方向性性能与状态一致性测试。完整 tokenizer/logit golden parity、严格
+> batch-1 decode 和 grouped-MMQ prefill 已通过验证；可选的 width-one MTP 流水已经通过
+> 32K/128K/256K 方向性性能与状态一致性测试。有界 width-N retained-draft 支持 1..64，
+> 初始运维上限为 4；它的在线前缀 width-4 路径已经通过首轮 32K 真实 GPU token parity
+> 及混合 accept/reject 性能测试。Width 2/3 与更完整的 width-4 矩阵仍待验证。完整
+> tokenizer/logit golden parity、严格
 > 262,080 + 64、覆盖 accept/reject 的 MTP 质量门禁及长时间故障测试仍未完成。当前数据
 > 证明运行时机制和性能，不代表最终模型质量，也不代表 256K 已达到生产发布标准。
 
@@ -35,11 +38,21 @@ MTP。
 | Grouped MMQ；内部 tile 32 | 4,096 | 22.36 s | 183.15 tok/s |
 | Grouped MMQ；512-token slab；双 stage 串行 | 4,096 | 8.62 s | 475.15 tok/s |
 | **Grouped MMQ；512-token slab；双 stage 流水** | **512** | **5.02 s** | **815.78 tok/s** |
+| **当前版：流水 + GDN 预计算 + W4/QSA 缓存** | **512** | **3.09 s** | **1,327.58 tok/s** |
 | 旧 DS4 参考 | 不适用 | 4,102 tokens 用时 5.27 s | 777.9 tok/s |
 
-最后一行是同一机器上的历史数据，并非相同 artifact 的严格 A/B。最终 q38 路径相对最初
-native prefill 提升 **10.9×**，达到了此前 DS4 的性能级别。输入为重复的合成 token，
+最后一行是同一机器上的历史数据，并非相同 artifact 的严格 A/B。当前 q38 路径相对最初
+native prefill 提升 **17.7×**，超过了此前 DS4 的性能级别。输入为重复的合成 token，
 因此它是真实 CUDA 与状态机性能测试，不是文本质量结论。
+
+最新版普通模式（关闭 MTP）的实测如下。32K 一行有意开启了细粒度 CUDA stage profiling，
+其余两行关闭 profiling。
+
+| 实际 prefill tokens | Profiling | Append 时间 | Prefill |
+|---:|---|---:|---:|
+| 4,096 | 关闭 | 3.085 s | **1,327.58 tok/s** |
+| 32,768 | 细粒度 | 22.605 s | **1,449.60 tok/s** |
+| 262,080 | 关闭 | 197.479 s | **1,327.13 tok/s** |
 
 ### Decode
 
@@ -58,7 +71,7 @@ tokens，实测 **27.89 tok/s**、ITL p50 35.01 ms。
 是因为每个成功的变更 RPC 都要等待 `fdatasync`；所以任何性能数据都必须同时标明
 durability mode。
 
-#### 长上下文 exact-QSA R2
+#### 长上下文 exact-QSA
 
 精确并行 selector 与 tiled attention 消除了此前的长上下文 decode 崩塌，同时没有修改
 512-block 选择预算或 tie 语义。
@@ -67,7 +80,7 @@ durability mode。
 |---:|---:|---:|---:|---:|
 | 32,768 | 20.11 tok/s | **27.84 tok/s** | **1.38×** | 47.88 → 32.79 ms |
 | 131,072 | 10.71 tok/s | **26.03 tok/s** | **2.43×** | 91.58 → 36.33 ms |
-| 262,080 | 6.21 tok/s | **22.67 tok/s** | **3.65×** | 159.19 → 42.61 ms |
+| 262,080（当前 ballot gather） | 6.21 tok/s | **27.79 tok/s** | **4.47×** | 159.19 → 33.91 ms |
 
 条件：双 64 GiB CMP 170HX、单并发、`durability=off`、关闭 MTP、使用官方 tokenizer
 处理源码语料、排除模型启动；每组先单独生成一个 seed token 计算 TTFT，再严格测量后续
@@ -75,11 +88,43 @@ durability mode。
 256K fixture 会在 69,579 个唯一语料 token 后重复，因此不代表最差 PLE locality，也不
 构成模型质量 parity 结论。
 
-#### 可选 width-one MTP
+#### 实验性 Piecewise CUDA Graph decode
 
-首版优化 MTP lane 会保留 draft 的 QSA row，把两个 target row 拆成两个单 token
-microbatch，并让下一行的 stage 0 与当前行的 stage 1 流水执行。它只在
-`--enable-mtp --mtp-width 1` 下启用；普通 `decode_one()` 和 width 大于 1 的行为不变。
+`--enable-piecewise-decode-graph` 只加速普通的单 token decode。每个 stage 会把固定形状的
+embedding/GDN/MoE/PLE-GPU/head 工作捕获为 7 段静态 graph，6 个依赖当前位置的
+exact-QSA 层仍在各段之间 eager 执行。PLE 读取与 H2D staging、跨卡传输、sampling、
+cancel，以及 transaction commit/rollback 都不会进入 graph。
+
+CUDA graph node 会保留原始 state pointer，而 GDN/PLE transaction 会在两个 working bank
+之间交替。因此运行时针对每个 bank pair 最多惰性建立一套 graph，不会把一套 graph
+错误地重放到另一组 bank。捕获失败时，该 stage 会关闭 graph lane 并回退到原有 eager
+decode。此功能默认关闭；在真实 GPU 上通过 token/logit parity、rollback、显存与 latency
+A/B 门禁前，不宣称任何加速。可通过 `cuda_graph_captures`、`cuda_graph_replays`、
+`cuda_graph_fallbacks` 与 `cuda_graph_nodes` 指标确认实际行为。
+
+严格比较 eager/graph 时，用 `--enable-logit-diagnostics` 启动待测 executor。这个纯诊断
+开关只保留最近一次已提交 append/decode 事务的原始 BF16 model-head 输出；默认关闭，
+因此普通 greedy 服务不会增加整段 logits 的 D2H 拷贝。分别在 eager 与 graph 的相同已提交
+步骤抓取，再逐 BF16 bit 比较：
+
+```bash
+python3 tools/q38_logit_parity.py capture \
+  --socket /tmp/q38-eager.sock --session-hash 368 --output eager-step
+python3 tools/q38_logit_parity.py capture \
+  --socket /tmp/q38-graph.sock --session-hash 368 --output graph-step
+python3 tools/q38_logit_parity.py compare eager-step.json graph-step.json \
+  --output parity.json
+```
+
+抓取会生成一份精简 JSON 清单和原样 little-endian `.bf16` 文件，并同时校验运行时 FNV-1a
+与工具侧 SHA-256。只有 session/epoch/frontier/事务类型一致、选中 token 一致且每个 BF16
+元素完全相等才会通过。延迟基准测试不要打开这个诊断开关。
+
+#### 已实测的 width-one MTP 基线
+
+首版实测 MTP lane 会保留一个 draft QSA row，把两个 target row 拆成两个单 token
+microbatch，并让下一行的 stage 0 与当前行的 stage 1 流水执行。此后运行时已将该路径
+通用化为有界 width N；下表仍然只是 width-one 实测数据，不代表更宽模式的推算结果。
 
 | Context | Plain decode 基线 | MTP width 1 | MTP 有效 ITL | 相对 plain 提升 |
 |---:|---:|---:|---:|---:|
@@ -95,6 +140,23 @@ retained-row fast path 和吞吐有效，不能代表一般 acceptance rate 或�
 不会进入该分支，因此有意跳过了重复且耗时很长的完整 256K plain 重跑。
 
 原始证据、准确命令、已知限制和未完成门禁统一记录在 [READINESS.md](READINESS.md)。
+
+#### 在线前缀 width-four 首轮结果
+
+更宽的 MTP 路径现在会逐行在线校验，并在第一个 mismatch 立即停止。GPU0 最多只领先一行，
+用一个可选 GDN/PLE checkpoint 保护前缀；GPU1 则在 GPU0 计算下一行时，用真实 target HC
+在线修正每个已接受的深层 MTP row。Commit 直接发布已校验前缀，不再校验 rejected suffix，
+也不再重放已接受的 target/MTP rows。
+
+在冻结的 32,768-token coding fixture 上，五次 width-4 transaction（不含 seed）分别发布
+`5, 4, 4, 2, 5` 个 token，覆盖两次全接收和三个提前停止深度。总计接受 15/20 个 draft，
+达到 **48.65 tok/s**；backend commit 总耗时 **1.19 ms**，而旧 retained-draft trace 为
+**124.17 ms**。发布的 21 个 token 与普通 target decode 的相同长度前缀逐 token 完全一致，
+并且全程零 failure、零 rollback；同轮 plain reference 为 28.67 tok/s。
+
+旧 trace 的 acceptance 数量不同，所以这是一组方向性的端到端结果，不是固定工作量 kernel
+A/B。它验证了 32K 修复路径，但不能替代剩余的 128K/256K、logit golden、cancellation、
+长生成以及 width-2/3 对比门禁。
 
 ## 架构
 
@@ -166,12 +228,15 @@ Q38_CUDA_PROFILE_DECODE=1
 
 ### Retained-draft MTP lane
 
-Width-one MTP 在 target 验证后不会再次执行 draft token。Transaction 建立 epoch 后，GPU1
-开始 retained draft，同时 GPU0 开始 target row 0。Backend 会把 provisional draft QSA row
-保留在同一个 epoch 下；target 接受 draft 时，commit 直接消费这行。两个 target row 随后
-以单 token chunk 进入既有 stage scheduler，从而让 GPU0 的 row `n+1` 与 GPU1 的 row `n`
-重叠。Reject、cancel、rollback 和 partial replay 都会先丢弃或重建 provisional state，之后
-才允许发布 canonical state。MTP 默认关闭，plain scheduler 完全不进入 retained-state 路径。
+Width N 下，GPU1 会递归运行 checkpoint 中经过 multi-step 训练的同一个 MTP layer，同时
+GPU0 开始 target row 0；N+1 个 target row 随后以单 token chunk 进入既有 scheduler，使
+GPU0 的 row `n+1` 与 GPU1 的 row `n` 重叠。校验会在第一个 mismatch 停止；GPU0 在每次
+lookahead 前保存当前 GDN/PLE prefix，提前停止时只恢复这一个 checkpoint，而 QSA 直接提交
+较短的 append-only extent。第一个 retained MTP QSA row 使用 canonical target HC，可以
+直接提交；后续 draft row 使用的是 MTP 预测 HC，因此每个已接受的深层 row 都会在 GPU0
+计算 lookahead 时，用对应真实 target HC 在线修正，commit 不再串行修复前缀。Reject、
+stop token、cancel、rollback 与 context 尾部裁剪仍保持请求原子性。MTP 默认关闭，plain
+scheduler 完全不进入 retained-state 路径。
 
 ## 模型 artifact 与内存分布
 
@@ -307,7 +372,13 @@ Benchmark 或客户端能够重放完整 canonical token history 时，可以只
 
 `durability=off` 只会移除 snapshot journal 及其 crash-rebuild 保证，不会弱化进程存活期间
 的 transaction、rollback 或 committed-token 语义。`--dry-run` 可只验证 artifact 而不
-启动；MTP 默认关闭，只有 plain lane 的正确性与显存门禁通过后才应使用 `--enable-mtp`。
+启动；MTP 默认关闭，只有 plain lane 的正确性与显存门禁通过后才应使用
+`--enable-mtp --mtp-max-draft 4`。Token-native 请求通过
+`{"mode":"mtp","mtp_width":4}` 选择宽度，OpenAI-compatible 请求使用
+`{"q38_mode":"mtp","q38_mtp_width":4}`；启动参数只是能力上限，每个请求仍显式选择。
+Piecewise CUDA Graph decode 同样默认关闭，只能通过
+`--enable-piecewise-decode-graph` 显式启用；完成 [READINESS.md](READINESS.md) 中的 graph
+专项门禁前，不应把它用于性能结论。
 
 ## API
 
@@ -372,8 +443,8 @@ stop token 或 tool completion 仍可提前结束。显式请求超过剩余上�
    与 PLE metrics；
 4. 证明 near-256K suffix continuation 不会重放旧 prefix；
 5. 在每档 context 验证 rollback、cancel、duplicate request、crash recovery 与 fault injection；
-6. 扩展 opt-in width-one MTP 的 accept/reject、cancel、parity 与长生成门禁，再优化更宽
-   draft width；
+6. 完成 width 2/3 对比，以及 width-4 剩余的 accept-depth、cancel、token/logit parity、
+   长生成、128K/256K 与吞吐门禁，再选择生产默认宽度；
 7. 完成长时间稳定性与 failure-injection soak。
 
 完整实现/证据边界见 [READINESS.md](READINESS.md)，详细架构与发布门禁见

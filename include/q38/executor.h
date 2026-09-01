@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,10 @@ struct ExecutorOptions {
     // or device-state errors. CPU fixtures keep this false so rollback and
     // retry behavior can still be exercised independently.
     bool backend_failure_is_fatal = false;
+    // Diagnostic-only: retain the raw BF16 logits from the most recently
+    // committed non-speculative target transaction. Disabled by default so
+    // ordinary greedy execution does not add a device-to-host logits copy.
+    bool retain_last_logits_for_diagnostics = false;
     SamplingConfigV1 sampling{};
     // Stop tokens are part of the parser/sampling identity.  Speculative
     // commits are truncated before the first accepted stop token so no token
@@ -38,6 +43,16 @@ struct ExecutorOptions {
 struct DecodeResult {
     CommitEventV1 commit{};
     std::vector<std::int32_t> published_tokens;
+};
+
+struct LogitSnapshotV1 {
+    std::uint64_t transaction_epoch = 0;
+    std::uint64_t target_frontier = 0;
+    TxnKind transaction_kind = TxnKind::kInvalid;
+    std::int32_t selected_token = -1;
+    // Raw model-head output before repetition/frequency/presence penalties or
+    // sampling transforms. Values preserve their exact BF16 bit patterns.
+    std::vector<std::uint16_t> logits_bf16;
 };
 
 class DualStageExecutor {
@@ -68,6 +83,7 @@ public:
     SamplerStateV1 sampler_state() const;
     const SessionIdentityV1& identity() const;
     StateSnapshotV1 snapshot() const;
+    std::optional<LogitSnapshotV1> diagnostic_logit_snapshot() const;
     void fail_closed();
     bool poisoned() const;
 

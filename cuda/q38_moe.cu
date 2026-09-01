@@ -72,7 +72,8 @@ __device__ float quant_weight(int format, const void* data,
                               std::uint64_t matrix_elements,
                               std::uint64_t matrix_scale_elements,
                               std::uint32_t columns, std::int32_t expert,
-                              std::uint32_t row, std::uint32_t column) {
+                              std::uint32_t row, std::uint32_t column,
+                              int layout) {
     const auto local = static_cast<std::uint64_t>(row) * columns + column;
     const auto scale = load_bf16(
         scales, static_cast<std::uint64_t>(expert) * matrix_scale_elements +
@@ -85,9 +86,23 @@ __device__ float quant_weight(int format, const void* data,
                    static_cast<const std::int8_t*>(data)[index]) *
                scale;
     }
-    const auto nibble_index = static_cast<std::uint64_t>(expert) *
-                                  (matrix_elements / 2) +
-                              (local >> 1);
+    std::uint64_t nibble_index = 0;
+    if (layout ==
+        static_cast<int>(CudaWeightLayoutV1::kMoeW4Tile16x16)) {
+        constexpr std::uint32_t kTile = 16;
+        constexpr std::uint32_t kTileBytes = kTile * kTile / 2;
+        const auto tile =
+            static_cast<std::uint64_t>(row / kTile) * (columns / kTile) +
+            column / kTile;
+        nibble_index =
+            static_cast<std::uint64_t>(expert) * (matrix_elements / 2) +
+            tile * kTileBytes + (row % kTile) * (kTile / 2) +
+            (column % kTile) / 2;
+    } else {
+        nibble_index = static_cast<std::uint64_t>(expert) *
+                           (matrix_elements / 2) +
+                       (local >> 1);
+    }
     const auto packed = static_cast<const std::uint8_t*>(data)[nibble_index];
     int quantized = (local & 1) ? packed >> 4 : packed & 0x0f;
     if (quantized >= 8) quantized -= 16;
@@ -98,7 +113,7 @@ __device__ __forceinline__ int sign_extend_int4(unsigned value) {
     return static_cast<int>(value) - ((value & 0x8u) ? 16 : 0);
 }
 
-template <int WeightBits>
+template <int WeightBits, bool Tiled = false>
 __device__ __forceinline__ float quantized_row_dot_warp(
     const void* data, const std::uint16_t* scales,
     std::uint64_t matrix_elements, std::uint64_t matrix_scale_elements,
@@ -134,10 +149,27 @@ __device__ __forceinline__ float quantized_row_dot_warp(
                   a2 * static_cast<float>(packed.z) +
                   a3 * static_cast<float>(packed.w);
         } else {
-            const auto* weights = static_cast<const std::uint8_t*>(data) +
-                                  static_cast<std::uint64_t>(expert) *
-                                      (matrix_elements / 2) +
-                                  (local >> 1);
+            std::uint64_t packed_offset = 0;
+            if constexpr (Tiled) {
+                constexpr std::uint32_t kTile = 16;
+                constexpr std::uint32_t kTileBytes = kTile * kTile / 2;
+                const auto tile =
+                    static_cast<std::uint64_t>(row / kTile) *
+                        (columns / kTile) +
+                    column / kTile;
+                packed_offset =
+                    static_cast<std::uint64_t>(expert) *
+                        (matrix_elements / 2) +
+                    tile * kTileBytes + (row % kTile) * (kTile / 2) +
+                    (column % kTile) / 2;
+            } else {
+                packed_offset =
+                    static_cast<std::uint64_t>(expert) *
+                        (matrix_elements / 2) +
+                    (local >> 1);
+            }
+            const auto* weights =
+                static_cast<const std::uint8_t*>(data) + packed_offset;
             const auto packed =
                 *reinterpret_cast<const std::uint16_t*>(weights);
             dot = a0 * static_cast<float>(sign_extend_int4(packed & 0x0fu)) +
@@ -153,7 +185,7 @@ __device__ __forceinline__ float quantized_row_dot_warp(
     return warp_sum(sum);
 }
 
-template <int WeightBits>
+template <int WeightBits, bool Tiled = false>
 __global__ void expert_gate_up_decode_kernel(
     const void* data, const std::uint16_t* scales,
     const std::uint16_t* hidden, const std::int32_t* expert_ids,
@@ -178,14 +210,14 @@ __global__ void expert_gate_up_decode_kernel(
         if (lane == 0) store_bf16(output, route * rows + row, 0.0f);
         return;
     }
-    const auto sum = quantized_row_dot_warp<WeightBits>(
+    const auto sum = quantized_row_dot_warp<WeightBits, Tiled>(
         data, scales, static_cast<std::uint64_t>(rows) * columns,
         static_cast<std::uint64_t>(rows) * (columns / kQuantGroupSize),
         columns, expert, row, cached_hidden);
     if (lane == 0) store_bf16(output, route * rows + row, sum);
 }
 
-template <int WeightBits>
+template <int WeightBits, bool Tiled = false>
 __global__ void expert_down_decode_kernel(
     const void* data, const std::uint16_t* scales,
     const std::uint16_t* activated, const std::int32_t* expert_ids,
@@ -210,7 +242,7 @@ __global__ void expert_down_decode_kernel(
         const auto expert = expert_ids[route];
         if (row < rows && expert >= 0 &&
             expert < static_cast<std::int32_t>(kQ38MoeExperts)) {
-            const auto sum = quantized_row_dot_warp<WeightBits>(
+            const auto sum = quantized_row_dot_warp<WeightBits, Tiled>(
                 data, scales, static_cast<std::uint64_t>(rows) * columns,
                 static_cast<std::uint64_t>(rows) *
                     (columns / kQuantGroupSize),
@@ -224,7 +256,7 @@ __global__ void expert_down_decode_kernel(
 }
 
 __global__ void expert_gate_up_kernel(
-    int format, const void* data, const std::uint16_t* scales,
+    int format, int layout, const void* data, const std::uint16_t* scales,
     const std::uint16_t* hidden, const std::int32_t* expert_ids,
     std::uint32_t top_k, std::uint16_t* output) {
     constexpr std::uint32_t rows = 2 * kQ38MoeIntermediate;
@@ -245,7 +277,7 @@ __global__ void expert_gate_up_kernel(
                quant_weight(format, data, scales,
                             static_cast<std::uint64_t>(rows) * columns,
                             static_cast<std::uint64_t>(rows) * (columns / 128),
-                            columns, expert, row, column);
+                            columns, expert, row, column, layout);
     sum = block_sum(sum);
     if (threadIdx.x == 0) store_bf16(output, route * rows + row, sum);
 }
@@ -267,7 +299,7 @@ __global__ void expert_silu_kernel(const std::uint16_t* gate_up,
 }
 
 __global__ void expert_down_kernel(
-    int format, const void* data, const std::uint16_t* scales,
+    int format, int layout, const void* data, const std::uint16_t* scales,
     const std::uint16_t* activated, const std::int32_t* expert_ids,
     const float* expert_weights, std::uint32_t top_k, float* accumulation) {
     constexpr std::uint32_t rows = kQ38HiddenWidth;
@@ -286,7 +318,7 @@ __global__ void expert_down_kernel(
                quant_weight(format, data, scales,
                             static_cast<std::uint64_t>(rows) * columns,
                             static_cast<std::uint64_t>(rows) * (columns / 128),
-                            columns, expert, row, column);
+                            columns, expert, row, column, layout);
     sum = block_sum(sum);
     if (threadIdx.x == 0)
         atomicAdd(accumulation +
@@ -369,8 +401,16 @@ void cuda_moe_routed_bf16(
                     gate_up_experts.data,
                     static_cast<const std::uint16_t*>(gate_up_experts.scales),
                     hidden, expert_ids, top_k, gate_up_scratch);
+        } else if (gate_up_experts.layout ==
+                   CudaWeightLayoutV1::kMoeW4Tile16x16) {
+            expert_gate_up_decode_kernel<4, true>
+                <<<gate_grid, kDecodeThreads, hidden_shared_bytes,
+                   stream_value>>>(
+                    gate_up_experts.data,
+                    static_cast<const std::uint16_t*>(gate_up_experts.scales),
+                    hidden, expert_ids, top_k, gate_up_scratch);
         } else {
-            expert_gate_up_decode_kernel<4>
+            expert_gate_up_decode_kernel<4, false>
                 <<<gate_grid, kDecodeThreads, hidden_shared_bytes,
                    stream_value>>>(
                     gate_up_experts.data,
@@ -395,8 +435,17 @@ void cuda_moe_routed_bf16(
                     static_cast<const std::uint16_t*>(down_experts.scales),
                     activated_scratch, expert_ids, expert_weights, top_k,
                     routed_output);
+        } else if (down_experts.layout ==
+                   CudaWeightLayoutV1::kMoeW4Tile16x16) {
+            expert_down_decode_kernel<4, true>
+                <<<down_blocks, kDecodeThreads, down_shared_bytes,
+                   stream_value>>>(
+                    down_experts.data,
+                    static_cast<const std::uint16_t*>(down_experts.scales),
+                    activated_scratch, expert_ids, expert_weights, top_k,
+                    routed_output);
         } else {
-            expert_down_decode_kernel<4>
+            expert_down_decode_kernel<4, false>
                 <<<down_blocks, kDecodeThreads, down_shared_bytes,
                    stream_value>>>(
                     down_experts.data,
@@ -416,6 +465,7 @@ void cuda_moe_routed_bf16(
     expert_gate_up_kernel<<<dim3(2 * kQ38MoeIntermediate, routes), 256, 0,
                               stream_value>>>(
         static_cast<int>(gate_up_experts.descriptor->format),
+        static_cast<int>(gate_up_experts.layout),
         gate_up_experts.data,
         static_cast<const std::uint16_t*>(gate_up_experts.scales), hidden,
         expert_ids, top_k, gate_up_scratch);
@@ -423,7 +473,8 @@ void cuda_moe_routed_bf16(
         gate_up_scratch, activated_scratch, routes);
     expert_down_kernel<<<dim3(kQ38HiddenWidth, routes), 256, 0,
                            stream_value>>>(
-        static_cast<int>(down_experts.descriptor->format), down_experts.data,
+        static_cast<int>(down_experts.descriptor->format),
+        static_cast<int>(down_experts.layout), down_experts.data,
         static_cast<const std::uint16_t*>(down_experts.scales),
         activated_scratch, expert_ids, expert_weights, top_k,
         accumulation_scratch);

@@ -28,6 +28,13 @@ PleStage0Backend::PleStage0Backend(std::unique_ptr<StageBackend> inner,
         throw std::invalid_argument("PLE backend requires stage0 and a store");
 }
 
+void PleStage0Backend::prefetch_transaction(
+    const SessionTxnV1& txn,
+    const std::vector<std::int32_t>& token_ids,
+    std::shared_ptr<CancellationToken> cancellation) {
+    inner_->prefetch_transaction(txn, token_ids, std::move(cancellation));
+}
+
 StageOutput PleStage0Backend::execute(StageInput input) {
     const auto epoch = input.txn.epoch;
     const auto expected = input.txn.evaluated_count;

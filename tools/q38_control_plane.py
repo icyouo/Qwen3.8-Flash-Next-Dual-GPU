@@ -225,7 +225,7 @@ class Q38ControlPlane:
             context_limit <= 0
             or vocabulary <= 0
             or default_timeout_ms <= 0
-            or mtp_max_draft <= 0
+            or not 1 <= mtp_max_draft <= 64
         ):
             raise ValueError("invalid control-plane limits")
         self.transport = transport
@@ -488,7 +488,7 @@ class Q38ControlPlane:
             raise ControlPlaneError(
                 400,
                 "invalid_generation_mode",
-                f"MTP draft width exceeds this checkpoint's {self.mtp_max_draft}-token limit",
+                f"MTP draft width exceeds the configured {self.mtp_max_draft}-token limit",
             )
         self._require_budget(record, max_new_tokens)
         if not record.canonical_tokens:

@@ -19,6 +19,10 @@ public:
                      PleHashConfigV1 hash_config);
 
     Stage stage() const override { return Stage::kStage0; }
+    void prefetch_transaction(
+        const SessionTxnV1& txn,
+        const std::vector<std::int32_t>& token_ids,
+        std::shared_ptr<CancellationToken> cancellation = {}) override;
     StageOutput execute(StageInput input) override;
     std::vector<std::int32_t> draft(std::int32_t pending_token,
                                     std::uint64_t position,

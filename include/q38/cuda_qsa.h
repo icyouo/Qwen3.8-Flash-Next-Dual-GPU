@@ -139,6 +139,97 @@ void cuda_qsa_attention_prefill_bf16(
     void* stream,
     int device);
 
+// Fine-grained variants used by the opt-in prefill profiler.  Keeping the
+// selector and sparse-attention launches separate also gives architecture
+// experiments an explicit boundary without changing the default API.
+void cuda_qsa_select_prefill(
+    const std::uint16_t* index_query,
+    CudaQsaLayerStateView cache,
+    std::uint32_t first_position,
+    std::uint32_t tokens,
+    float* scratch_block_scores,
+    std::uint32_t block_score_stride,
+    std::int32_t* selected_indices,
+    void* stream,
+    int device);
+
+void cuda_qsa_apply_prefill_bf16(
+    const std::uint16_t* query,
+    CudaQsaLayerStateView cache,
+    std::uint32_t first_position,
+    std::uint32_t tokens,
+    const std::int32_t* selected_indices,
+    float* scratch_attention_scores,
+    std::uint16_t* output,
+    void* stream,
+    int device);
+
+void cuda_qsa_score_prefill_bf16(
+    const std::uint16_t* query,
+    CudaQsaLayerStateView cache,
+    std::uint32_t first_position,
+    std::uint32_t tokens,
+    const std::int32_t* selected_indices,
+    float* scratch_attention_scores,
+    void* stream,
+    int device);
+
+void cuda_qsa_output_prefill_bf16(
+    CudaQsaLayerStateView cache,
+    std::uint32_t first_position,
+    std::uint32_t tokens,
+    const std::int32_t* selected_indices,
+    float* scratch_attention_scores,
+    std::uint16_t* output,
+    void* stream,
+    int device);
+
+// Grouped-query prefill path.  The twelve query heads attached to one KV head
+// share explicit K/V tiles instead of relying on inter-CTA cache reuse.
+void cuda_qsa_apply_grouped_prefill_bf16(
+    const std::uint16_t* query,
+    CudaQsaLayerStateView cache,
+    std::uint32_t first_position,
+    std::uint32_t tokens,
+    const std::int32_t* selected_indices,
+    float* scratch_attention_scores,
+    std::uint16_t* output,
+    void* stream,
+    int device);
+
+// Experimental grouped fusion used only for A/B diagnostics.  The production
+// default remains the faster split grouped path.
+void cuda_qsa_apply_grouped_fused_prefill_bf16(
+    const std::uint16_t* query,
+    CudaQsaLayerStateView cache,
+    std::uint32_t first_position,
+    std::uint32_t tokens,
+    const std::int32_t* selected_indices,
+    float* scratch_attention_scores,
+    std::uint16_t* output,
+    void* stream,
+    int device);
+
+void cuda_qsa_score_grouped_prefill_bf16(
+    const std::uint16_t* query,
+    CudaQsaLayerStateView cache,
+    std::uint32_t first_position,
+    std::uint32_t tokens,
+    const std::int32_t* selected_indices,
+    float* scratch_attention_scores,
+    void* stream,
+    int device);
+
+void cuda_qsa_output_grouped_prefill_bf16(
+    CudaQsaLayerStateView cache,
+    std::uint32_t first_position,
+    std::uint32_t tokens,
+    const std::int32_t* selected_indices,
+    float* scratch_attention_scores,
+    std::uint16_t* output,
+    void* stream,
+    int device);
+
 bool cuda_q38_qsa_compiled();
 
 }  // namespace q38

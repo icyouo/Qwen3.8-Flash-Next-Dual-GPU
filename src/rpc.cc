@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <iomanip>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -32,7 +34,6 @@ namespace {
 // atomicity. The built-in control plane batches requests, not semantic decode
 // steps.
 constexpr std::uint32_t kMaximumStepsPerRequest = 1;
-constexpr std::uint32_t kMaximumDraftWidth = 64;
 constexpr std::uint32_t kMaximumTimeoutMs = 24u * 60u * 60u * 1000u;
 constexpr std::size_t kMaximumCachedWriterResponses = 4096;
 
@@ -52,6 +53,7 @@ bool valid_opcode(ExecutorRpcOpcodeV1 opcode) {
     case ExecutorRpcOpcodeV1::kStats:
     case ExecutorRpcOpcodeV1::kCancel:
     case ExecutorRpcOpcodeV1::kReset:
+    case ExecutorRpcOpcodeV1::kLogits:
         return true;
     case ExecutorRpcOpcodeV1::kInvalid:
         return false;
@@ -103,6 +105,67 @@ RequestFingerprint request_fingerprint(const ExecutorRpcRequestV1& request) {
     if (!request.tokens.empty())
         fingerprint_bytes(&result, request.tokens.data(),
                           request.tokens.size() * sizeof(std::int32_t));
+    return result;
+}
+
+const char* transaction_kind_name(TxnKind kind) {
+    switch (kind) {
+    case TxnKind::kAppendKnown:
+        return "append_known";
+    case TxnKind::kDecode:
+        return "decode";
+    case TxnKind::kSpeculative:
+        return "speculative";
+    case TxnKind::kInvalid:
+        return "invalid";
+    }
+    return "invalid";
+}
+
+std::string logit_snapshot_json(const LogitSnapshotV1& snapshot,
+                                bool include_raw) {
+    std::uint64_t checksum = UINT64_C(14695981039346656037);
+    const auto checksum_byte = [&](std::uint8_t value) {
+        checksum ^= value;
+        checksum *= UINT64_C(1099511628211);
+    };
+    for (const auto value : snapshot.logits_bf16) {
+        checksum_byte(static_cast<std::uint8_t>(value & 0xffu));
+        checksum_byte(static_cast<std::uint8_t>(value >> 8u));
+    }
+    std::ostringstream checksum_text;
+    checksum_text << std::hex << std::setfill('0') << std::setw(16)
+                  << checksum;
+    std::string result =
+        "{\"schema\":\"q38.logits.bf16.v1\",\"dtype\":\"bf16\","
+        "\"byte_order\":\"little\",\"transaction_epoch\":" +
+        std::to_string(snapshot.transaction_epoch) +
+        ",\"target_frontier\":" +
+        std::to_string(snapshot.target_frontier) +
+        ",\"transaction_kind\":\"" +
+        transaction_kind_name(snapshot.transaction_kind) +
+        "\",\"selected_token\":" +
+        std::to_string(snapshot.selected_token) +
+        ",\"element_count\":" +
+        std::to_string(snapshot.logits_bf16.size()) +
+        ",\"fnv1a64\":\"" + checksum_text.str() + "\"";
+    if (include_raw) {
+        static constexpr char kHex[] = "0123456789abcdef";
+        result.reserve(result.size() + snapshot.logits_bf16.size() * 4 + 24);
+        result += ",\"raw_bf16_le_hex\":\"";
+        for (const auto value : snapshot.logits_bf16) {
+            const std::uint8_t low =
+                static_cast<std::uint8_t>(value & 0xffu);
+            const std::uint8_t high =
+                static_cast<std::uint8_t>(value >> 8u);
+            result.push_back(kHex[low >> 4u]);
+            result.push_back(kHex[low & 0x0fu]);
+            result.push_back(kHex[high >> 4u]);
+            result.push_back(kHex[high & 0x0fu]);
+        }
+        result.push_back('"');
+    }
+    result.push_back('}');
     return result;
 }
 
@@ -283,8 +346,13 @@ bool validate_executor_rpc_request(const ExecutorRpcRequestV1& request,
         if (!request.tokens.empty() || header.argument0 == 0 ||
             header.argument0 > kMaximumStepsPerRequest ||
             header.argument1 == 0 ||
-            header.argument1 > kMaximumDraftWidth)
+            header.argument1 > kMaximumMtpDraftWidth)
             return fail(error, "speculative RPC arguments are invalid");
+        break;
+    case ExecutorRpcOpcodeV1::kLogits:
+        if (!request.tokens.empty() || header.argument0 > 1 ||
+            header.argument1 != 0)
+            return fail(error, "logits RPC arguments are invalid");
         break;
     case ExecutorRpcOpcodeV1::kPing:
     case ExecutorRpcOpcodeV1::kState:
@@ -309,8 +377,9 @@ struct ExecutorRpcServiceV1::Impl {
     };
 
     Impl(DualStageExecutor* value_executor, std::uint64_t value_session_hash,
-         std::string snapshot_path)
-        : executor(value_executor), session_hash(value_session_hash) {
+         std::string snapshot_path, bool value_enable_logit_diagnostics)
+        : executor(value_executor), session_hash(value_session_hash),
+          enable_logit_diagnostics(value_enable_logit_diagnostics) {
         if (!executor)
             throw std::invalid_argument("executor RPC has no executor");
         published_frontiers = executor->frontiers();
@@ -327,6 +396,7 @@ struct ExecutorRpcServiceV1::Impl {
 
     DualStageExecutor* executor;
     std::uint64_t session_hash;
+    bool enable_logit_diagnostics = false;
     // writer_mutex serializes semantic mutations. state_mutex protects the
     // cancellation registry and idempotence cache and is never held while a
     // model pass is executing.
@@ -345,9 +415,11 @@ struct ExecutorRpcServiceV1::Impl {
 
 ExecutorRpcServiceV1::ExecutorRpcServiceV1(DualStageExecutor* executor,
                                            std::uint64_t session_hash,
-                                           std::string snapshot_journal_path)
+                                           std::string snapshot_journal_path,
+                                           bool enable_logit_diagnostics)
     : impl_(std::make_unique<Impl>(executor, session_hash,
-                                   std::move(snapshot_journal_path))) {}
+                                   std::move(snapshot_journal_path),
+                                   enable_logit_diagnostics)) {}
 
 ExecutorRpcServiceV1::~ExecutorRpcServiceV1() = default;
 
@@ -548,6 +620,24 @@ ExecutorRpcResponseV1 ExecutorRpcServiceV1::handle(
             response.message = "executor is fail-closed";
         } else if (request.header.opcode == ExecutorRpcOpcodeV1::kStats) {
             response.message = metrics_json(state.executor->metrics());
+        } else if (request.header.opcode == ExecutorRpcOpcodeV1::kLogits) {
+            if (!state.enable_logit_diagnostics) {
+                response.header.status =
+                    ExecutorRpcStatusV1::kFailedPrecondition;
+                response.message = "logit diagnostics are disabled";
+            } else {
+                const auto snapshot =
+                    state.executor->diagnostic_logit_snapshot();
+                if (!snapshot) {
+                    response.header.status =
+                        ExecutorRpcStatusV1::kFailedPrecondition;
+                    response.message =
+                        "no committed target logit snapshot is available";
+                } else {
+                    response.message = logit_snapshot_json(
+                        *snapshot, request.header.argument0 == 1);
+                }
+            }
         }
         finalize_response(&response, state.executor->frontiers());
         return response;

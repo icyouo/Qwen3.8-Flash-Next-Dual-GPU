@@ -257,6 +257,311 @@ __global__ void gdn_recurrent_prefill_kernel(
     }
 }
 
+constexpr std::uint32_t kGdnPrefillPartitions = 4;
+constexpr std::uint32_t kGdnPartitionColumns =
+    kQ38GdnHeadWidth / kGdnPrefillPartitions;
+
+// The serial prefill kernel assigns one 128-thread CTA to a value head, which
+// exposes only 24 CTAs on the whole device.  This variant tiles the recurrent
+// state by output columns: four independent 1024-thread CTAs per head keep the
+// state accesses coalesced while exposing 96 long-lived CTAs.  Each warp owns
+// one key row across 32 adjacent output columns.
+__global__ void gdn_recurrent_prefill_partitioned_kernel(
+    const std::uint16_t* qkv, const std::uint16_t* projected_b,
+    const std::uint16_t* projected_a, const std::uint16_t* a_log,
+    const std::uint16_t* dt_bias, float* state, std::uint16_t* output,
+    std::uint32_t tokens) {
+    const auto value_head = blockIdx.x;
+    const auto partition = blockIdx.y;
+    const auto lane = threadIdx.x & 31;
+    const auto key_lane = threadIdx.x >> 5;
+    const auto output_element = partition * kGdnPartitionColumns + lane;
+    const auto key_head =
+        value_head / (kQ38GdnValueHeads / kQ38GdnKeyHeads);
+    const auto query_local = key_head * kQ38GdnHeadWidth;
+    const auto key_local = kQ38GdnKeyHeads * kQ38GdnHeadWidth + query_local;
+    const auto value_local = 2 * kQ38GdnKeyHeads * kQ38GdnHeadWidth +
+                             value_head * kQ38GdnHeadWidth;
+    const auto state_base = static_cast<std::uint64_t>(value_head) *
+                            kQ38GdnHeadWidth * kQ38GdnHeadWidth;
+
+    __shared__ float partial[kQ38GdnHeadWidth * kGdnPartitionColumns];
+    __shared__ float query_norm_partials[4];
+    __shared__ float key_norm_partials[4];
+    __shared__ float deltas[kGdnPartitionColumns];
+    __shared__ float query_scale;
+    __shared__ float key_scale;
+    __shared__ float decay;
+    __shared__ float beta;
+
+    for (std::uint32_t token = 0; token < tokens; ++token) {
+        const auto token_base =
+            static_cast<std::uint64_t>(token) * kQ38GdnQkvWidth;
+        float query_square = 0.0f;
+        float key_square = 0.0f;
+        if (threadIdx.x < kQ38GdnHeadWidth) {
+            const float query_raw =
+                bf16_load(qkv, token_base + query_local + threadIdx.x);
+            const float key_raw =
+                bf16_load(qkv, token_base + key_local + threadIdx.x);
+            query_square = query_raw * query_raw;
+            key_square = key_raw * key_raw;
+        }
+        query_square = warp_sum(query_square);
+        key_square = warp_sum(key_square);
+        if (threadIdx.x < kQ38GdnHeadWidth && lane == 0) {
+            query_norm_partials[key_lane] = query_square;
+            key_norm_partials[key_lane] = key_square;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float query_norm = 0.0f;
+            float key_norm = 0.0f;
+#pragma unroll
+            for (std::uint32_t warp = 0; warp < 4; ++warp) {
+                query_norm += query_norm_partials[warp];
+                key_norm += key_norm_partials[warp];
+            }
+            query_scale = rsqrtf(query_norm + 1.0e-6f) *
+                          rsqrtf(static_cast<float>(kQ38GdnHeadWidth));
+            key_scale = rsqrtf(key_norm + 1.0e-6f);
+            const float a = bf16_load(
+                projected_a,
+                static_cast<std::uint64_t>(token) * kQ38GdnValueHeads +
+                    value_head);
+            const float b = bf16_load(
+                projected_b,
+                static_cast<std::uint64_t>(token) * kQ38GdnValueHeads +
+                    value_head);
+            const float shifted_a = a + bf16_load(dt_bias, value_head);
+            const float softplus = shifted_a > 20.0f
+                                       ? shifted_a
+                                       : log1pf(expf(shifted_a));
+            decay =
+                expf(-expf(bf16_load(a_log, value_head)) * softplus);
+            beta = 1.0f / (1.0f + expf(-b));
+        }
+        __syncthreads();
+
+        float memory_partial = 0.0f;
+        for (std::uint32_t key_element = key_lane;
+             key_element < kQ38GdnHeadWidth; key_element += 32) {
+            const auto state_index =
+                state_base + static_cast<std::uint64_t>(key_element) *
+                                 kQ38GdnHeadWidth +
+                output_element;
+            const float decayed = state[state_index] * decay;
+            state[state_index] = decayed;
+            const float key =
+                bf16_load(qkv, token_base + key_local + key_element) *
+                key_scale;
+            memory_partial += decayed * key;
+        }
+        partial[key_lane * kGdnPartitionColumns + lane] = memory_partial;
+        __syncthreads();
+        if (key_lane == 0) {
+            float memory = 0.0f;
+#pragma unroll
+            for (std::uint32_t row = 0; row < 32; ++row)
+                memory += partial[row * kGdnPartitionColumns + lane];
+            const float value =
+                bf16_load(qkv, token_base + value_local + output_element);
+            deltas[lane] = (value - memory) * beta;
+        }
+        __syncthreads();
+
+        float core_partial = 0.0f;
+        const float delta = deltas[lane];
+        for (std::uint32_t key_element = key_lane;
+             key_element < kQ38GdnHeadWidth; key_element += 32) {
+            const auto state_index =
+                state_base + static_cast<std::uint64_t>(key_element) *
+                                 kQ38GdnHeadWidth +
+                output_element;
+            const float key =
+                bf16_load(qkv, token_base + key_local + key_element) *
+                key_scale;
+            const float updated = state[state_index] + key * delta;
+            state[state_index] = updated;
+            const float query =
+                bf16_load(qkv, token_base + query_local + key_element) *
+                query_scale;
+            core_partial += updated * query;
+        }
+        partial[key_lane * kGdnPartitionColumns + lane] = core_partial;
+        __syncthreads();
+        if (key_lane == 0) {
+            float core = 0.0f;
+#pragma unroll
+            for (std::uint32_t row = 0; row < 32; ++row)
+                core += partial[row * kGdnPartitionColumns + lane];
+            bf16_store(output,
+                       static_cast<std::uint64_t>(token) *
+                               kQ38GdnValueWidth +
+                           value_head * kQ38GdnHeadWidth + output_element,
+                       core);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void gdn_prepare_prefill_parameters_kernel(
+    const std::uint16_t* qkv, const std::uint16_t* projected_b,
+    const std::uint16_t* projected_a, const std::uint16_t* a_log,
+    const std::uint16_t* dt_bias, float* query_scales, float* key_scales,
+    float* decays, float* betas) {
+    const auto key_head = blockIdx.x;
+    const auto token = blockIdx.y;
+    const auto element = threadIdx.x;
+    const auto token_base =
+        static_cast<std::uint64_t>(token) * kQ38GdnQkvWidth;
+    const auto query_local = key_head * kQ38GdnHeadWidth;
+    const auto key_local = kQ38GdnKeyHeads * kQ38GdnHeadWidth + query_local;
+    const float query_raw =
+        bf16_load(qkv, token_base + query_local + element);
+    const float key_raw = bf16_load(qkv, token_base + key_local + element);
+    const auto lane = threadIdx.x & 31;
+    const auto warp = threadIdx.x >> 5;
+    __shared__ float query_partials[4];
+    __shared__ float key_partials[4];
+    const float query_partial = warp_sum(query_raw * query_raw);
+    const float key_partial = warp_sum(key_raw * key_raw);
+    if (lane == 0) {
+        query_partials[warp] = query_partial;
+        key_partials[warp] = key_partial;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+
+    float query_norm = 0.0f;
+    float key_norm = 0.0f;
+#pragma unroll
+    for (std::uint32_t index = 0; index < 4; ++index) {
+        query_norm += query_partials[index];
+        key_norm += key_partials[index];
+    }
+    const auto key_scale_index =
+        static_cast<std::uint64_t>(token) * kQ38GdnKeyHeads + key_head;
+    query_scales[key_scale_index] =
+        rsqrtf(query_norm + 1.0e-6f) *
+        rsqrtf(static_cast<float>(kQ38GdnHeadWidth));
+    key_scales[key_scale_index] = rsqrtf(key_norm + 1.0e-6f);
+
+#pragma unroll
+    for (std::uint32_t local = 0;
+         local < kQ38GdnValueHeads / kQ38GdnKeyHeads; ++local) {
+        const auto value_head =
+            key_head * (kQ38GdnValueHeads / kQ38GdnKeyHeads) + local;
+        const auto value_index =
+            static_cast<std::uint64_t>(token) * kQ38GdnValueHeads +
+            value_head;
+        const float a = bf16_load(projected_a, value_index);
+        const float b = bf16_load(projected_b, value_index);
+        const float shifted_a = a + bf16_load(dt_bias, value_head);
+        const float softplus = shifted_a > 20.0f
+                                   ? shifted_a
+                                   : log1pf(expf(shifted_a));
+        decays[value_index] =
+            expf(-expf(bf16_load(a_log, value_head)) * softplus);
+        betas[value_index] = 1.0f / (1.0f + expf(-b));
+    }
+}
+
+__global__ void gdn_recurrent_prefill_precomputed_kernel(
+    const std::uint16_t* qkv, const float* query_scales,
+    const float* key_scales, const float* decays, const float* betas,
+    float* state, std::uint16_t* output, std::uint32_t tokens) {
+    const auto value_head = blockIdx.x;
+    const auto partition = blockIdx.y;
+    const auto lane = threadIdx.x & 31;
+    const auto key_lane = threadIdx.x >> 5;
+    const auto output_element = partition * kGdnPartitionColumns + lane;
+    const auto key_head =
+        value_head / (kQ38GdnValueHeads / kQ38GdnKeyHeads);
+    const auto query_local = key_head * kQ38GdnHeadWidth;
+    const auto key_local = kQ38GdnKeyHeads * kQ38GdnHeadWidth + query_local;
+    const auto value_local = 2 * kQ38GdnKeyHeads * kQ38GdnHeadWidth +
+                             value_head * kQ38GdnHeadWidth;
+    const auto state_base = static_cast<std::uint64_t>(value_head) *
+                            kQ38GdnHeadWidth * kQ38GdnHeadWidth;
+    __shared__ float partial[kQ38GdnHeadWidth * kGdnPartitionColumns];
+    __shared__ float deltas[kGdnPartitionColumns];
+
+    for (std::uint32_t token = 0; token < tokens; ++token) {
+        const auto token_base =
+            static_cast<std::uint64_t>(token) * kQ38GdnQkvWidth;
+        const auto key_scale_index =
+            static_cast<std::uint64_t>(token) * kQ38GdnKeyHeads + key_head;
+        const auto value_index =
+            static_cast<std::uint64_t>(token) * kQ38GdnValueHeads +
+            value_head;
+        const float query_scale = query_scales[key_scale_index];
+        const float key_scale = key_scales[key_scale_index];
+        const float decay = decays[value_index];
+        const float beta = betas[value_index];
+
+        float memory_partial = 0.0f;
+        for (std::uint32_t key_element = key_lane;
+             key_element < kQ38GdnHeadWidth; key_element += 32) {
+            const auto state_index =
+                state_base + static_cast<std::uint64_t>(key_element) *
+                                 kQ38GdnHeadWidth +
+                output_element;
+            const float decayed = state[state_index] * decay;
+            state[state_index] = decayed;
+            const float key =
+                bf16_load(qkv, token_base + key_local + key_element) *
+                key_scale;
+            memory_partial += decayed * key;
+        }
+        partial[key_lane * kGdnPartitionColumns + lane] = memory_partial;
+        __syncthreads();
+        if (key_lane == 0) {
+            float memory = 0.0f;
+#pragma unroll
+            for (std::uint32_t row = 0; row < 32; ++row)
+                memory += partial[row * kGdnPartitionColumns + lane];
+            const float value =
+                bf16_load(qkv, token_base + value_local + output_element);
+            deltas[lane] = (value - memory) * beta;
+        }
+        __syncthreads();
+
+        float core_partial = 0.0f;
+        const float delta = deltas[lane];
+        for (std::uint32_t key_element = key_lane;
+             key_element < kQ38GdnHeadWidth; key_element += 32) {
+            const auto state_index =
+                state_base + static_cast<std::uint64_t>(key_element) *
+                                 kQ38GdnHeadWidth +
+                output_element;
+            const float key =
+                bf16_load(qkv, token_base + key_local + key_element) *
+                key_scale;
+            const float updated = state[state_index] + key * delta;
+            state[state_index] = updated;
+            const float query =
+                bf16_load(qkv, token_base + query_local + key_element) *
+                query_scale;
+            core_partial += updated * query;
+        }
+        partial[key_lane * kGdnPartitionColumns + lane] = core_partial;
+        __syncthreads();
+        if (key_lane == 0) {
+            float core = 0.0f;
+#pragma unroll
+            for (std::uint32_t row = 0; row < 32; ++row)
+                core += partial[row * kGdnPartitionColumns + lane];
+            bf16_store(output,
+                       static_cast<std::uint64_t>(token) *
+                               kQ38GdnValueWidth +
+                           value_head * kQ38GdnHeadWidth + output_element,
+                       core);
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void gdn_output_norm_kernel(
     const std::uint16_t* core, const std::uint16_t* gate,
     const std::uint16_t* weight, std::uint16_t* output, float epsilon) {
@@ -283,8 +588,10 @@ struct CudaGdnStateBank::Impl {
     int device;
     std::uint32_t layers;
     std::byte* banks[2]{nullptr, nullptr};
+    std::byte* checkpoint = nullptr;
     std::uint32_t committed = 0;
     bool active = false;
+    bool checkpoint_valid = false;
     std::uint64_t active_epoch = 0;
     std::uint64_t conv_layer_bytes =
         static_cast<std::uint64_t>(kQ38GdnQkvWidth) * kQ38GdnConvWidth * 2;
@@ -293,7 +600,8 @@ struct CudaGdnStateBank::Impl {
         kQ38GdnHeadWidth * sizeof(float);
     std::uint64_t bank_bytes = 0;
 
-    Impl(int value_device, std::uint32_t value_layers)
+    Impl(int value_device, std::uint32_t value_layers,
+         bool enable_checkpoint)
         : device(value_device), layers(value_layers) {
         if (layers == 0) throw std::invalid_argument("GDN state bank is empty");
         if (layers > std::numeric_limits<std::uint64_t>::max() /
@@ -308,6 +616,10 @@ struct CudaGdnStateBank::Impl {
                   "cudaMalloc(GDN bank 0)");
             check(cudaMalloc(reinterpret_cast<void**>(&banks[1]), bank_bytes),
                   "cudaMalloc(GDN bank 1)");
+            if (enable_checkpoint)
+                check(cudaMalloc(reinterpret_cast<void**>(&checkpoint),
+                                 bank_bytes),
+                      "cudaMalloc(GDN checkpoint)");
             check(cudaMemset(banks[0], 0, bank_bytes), "cudaMemset(GDN bank 0)");
             check(cudaMemset(banks[1], 0, bank_bytes), "cudaMemset(GDN bank 1)");
         } catch (...) {
@@ -321,7 +633,9 @@ struct CudaGdnStateBank::Impl {
         (void)cudaSetDevice(device);
         if (banks[0]) (void)cudaFree(banks[0]);
         if (banks[1]) (void)cudaFree(banks[1]);
+        if (checkpoint) (void)cudaFree(checkpoint);
         banks[0] = banks[1] = nullptr;
+        checkpoint = nullptr;
     }
 
     std::byte* layer_base(std::uint32_t bank, std::uint32_t layer) const {
@@ -331,8 +645,9 @@ struct CudaGdnStateBank::Impl {
     }
 };
 
-CudaGdnStateBank::CudaGdnStateBank(int device, std::uint32_t layers)
-    : impl_(std::make_unique<Impl>(device, layers)) {}
+CudaGdnStateBank::CudaGdnStateBank(int device, std::uint32_t layers,
+                                   bool enable_checkpoint)
+    : impl_(std::make_unique<Impl>(device, layers, enable_checkpoint)) {}
 CudaGdnStateBank::~CudaGdnStateBank() = default;
 CudaGdnStateBank::CudaGdnStateBank(CudaGdnStateBank&&) noexcept = default;
 CudaGdnStateBank& CudaGdnStateBank::operator=(CudaGdnStateBank&&) noexcept =
@@ -349,6 +664,7 @@ void CudaGdnStateBank::begin(std::uint64_t epoch, void* stream) {
           "cudaMemcpyAsync(GDN transaction clone)");
     impl_->active = true;
     impl_->active_epoch = epoch;
+    impl_->checkpoint_valid = false;
 }
 
 void CudaGdnStateBank::restore(void* stream) {
@@ -360,6 +676,29 @@ void CudaGdnStateBank::restore(void* stream) {
                           cudaMemcpyDeviceToDevice,
                           reinterpret_cast<cudaStream_t>(stream)),
           "cudaMemcpyAsync(GDN transaction restore)");
+}
+
+void CudaGdnStateBank::checkpoint(void* stream) {
+    if (!stream || !impl_->active || !impl_->checkpoint)
+        throw std::logic_error("invalid GDN speculative checkpoint");
+    select_device(impl_->device);
+    check(cudaMemcpyAsync(impl_->checkpoint,
+                          impl_->banks[1u - impl_->committed],
+                          impl_->bank_bytes, cudaMemcpyDeviceToDevice,
+                          reinterpret_cast<cudaStream_t>(stream)),
+          "cudaMemcpyAsync(GDN speculative checkpoint)");
+    impl_->checkpoint_valid = true;
+}
+
+void CudaGdnStateBank::restore_checkpoint(void* stream) {
+    if (!stream || !impl_->active || !impl_->checkpoint_valid)
+        throw std::logic_error("invalid GDN checkpoint restore");
+    select_device(impl_->device);
+    check(cudaMemcpyAsync(impl_->banks[1u - impl_->committed],
+                          impl_->checkpoint, impl_->bank_bytes,
+                          cudaMemcpyDeviceToDevice,
+                          reinterpret_cast<cudaStream_t>(stream)),
+          "cudaMemcpyAsync(GDN checkpoint restore)");
 }
 
 CudaGdnLayerStateView CudaGdnStateBank::working(
@@ -378,6 +717,7 @@ void CudaGdnStateBank::commit(std::uint64_t epoch) {
     impl_->committed = 1u - impl_->committed;
     impl_->active = false;
     impl_->active_epoch = 0;
+    impl_->checkpoint_valid = false;
 }
 
 void CudaGdnStateBank::rollback(std::uint64_t epoch) {
@@ -385,6 +725,7 @@ void CudaGdnStateBank::rollback(std::uint64_t epoch) {
         throw std::logic_error("GDN rollback epoch mismatch");
     impl_->active = false;
     impl_->active_epoch = 0;
+    impl_->checkpoint_valid = false;
 }
 
 void CudaGdnStateBank::reset(void* stream) {
@@ -397,12 +738,20 @@ void CudaGdnStateBank::reset(void* stream) {
     check(cudaMemsetAsync(impl_->banks[1], 0, impl_->bank_bytes,
                           reinterpret_cast<cudaStream_t>(stream)),
           "cudaMemsetAsync(GDN bank 1)");
+    if (impl_->checkpoint)
+        check(cudaMemsetAsync(impl_->checkpoint, 0, impl_->bank_bytes,
+                              reinterpret_cast<cudaStream_t>(stream)),
+              "cudaMemsetAsync(GDN checkpoint)");
     impl_->committed = 0;
+    impl_->checkpoint_valid = false;
 }
 
 std::uint32_t CudaGdnStateBank::layers() const { return impl_->layers; }
 std::uint64_t CudaGdnStateBank::bytes_per_bank() const {
     return impl_->bank_bytes;
+}
+std::uint64_t CudaGdnStateBank::allocated_bytes() const {
+    return impl_->bank_bytes * (impl_->checkpoint ? 3ull : 2ull);
 }
 
 void cuda_gdn_conv_decode_bf16(
@@ -485,6 +834,67 @@ void cuda_gdn_recurrent_prefill_bf16(
         activated_qkv, projected_b, projected_a, a_log, dt_bias,
         recurrent_state, core_output, tokens);
     check(cudaPeekAtLastError(), "GDN prefill recurrent");
+}
+
+void cuda_gdn_recurrent_prefill_partitioned_bf16(
+    const std::uint16_t* activated_qkv,
+    const std::uint16_t* projected_b,
+    const std::uint16_t* projected_a,
+    const std::uint16_t* a_log,
+    const std::uint16_t* dt_bias,
+    float* recurrent_state,
+    std::uint16_t* core_output,
+    std::uint32_t tokens,
+    void* stream,
+    int device) {
+    if (!activated_qkv || !projected_b || !projected_a || !a_log ||
+        !dt_bias || !recurrent_state || !core_output || !stream || tokens == 0)
+        throw std::invalid_argument(
+            "invalid partitioned GDN prefill recurrent buffers");
+    select_device(device);
+    gdn_recurrent_prefill_partitioned_kernel<<<
+        dim3(kQ38GdnValueHeads, kGdnPrefillPartitions), 1024, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+        activated_qkv, projected_b, projected_a, a_log, dt_bias,
+        recurrent_state, core_output, tokens);
+    check(cudaPeekAtLastError(), "partitioned GDN prefill recurrent");
+}
+
+void cuda_gdn_recurrent_prefill_precomputed_bf16(
+    const std::uint16_t* activated_qkv,
+    const std::uint16_t* projected_b,
+    const std::uint16_t* projected_a,
+    const std::uint16_t* a_log,
+    const std::uint16_t* dt_bias,
+    float* recurrent_state,
+    float* parameter_scratch,
+    std::uint16_t* core_output,
+    std::uint32_t tokens,
+    void* stream,
+    int device) {
+    if (!activated_qkv || !projected_b || !projected_a || !a_log ||
+        !dt_bias || !recurrent_state || !parameter_scratch || !core_output ||
+        !stream || tokens == 0)
+        throw std::invalid_argument(
+            "invalid precomputed GDN prefill recurrent buffers");
+    select_device(device);
+    auto* query_scales = parameter_scratch;
+    auto* key_scales = query_scales +
+                       static_cast<std::size_t>(tokens) * kQ38GdnKeyHeads;
+    auto* decays = key_scales +
+                   static_cast<std::size_t>(tokens) * kQ38GdnKeyHeads;
+    auto* betas = decays +
+                  static_cast<std::size_t>(tokens) * kQ38GdnValueHeads;
+    const auto stream_value = reinterpret_cast<cudaStream_t>(stream);
+    gdn_prepare_prefill_parameters_kernel<<<
+        dim3(kQ38GdnKeyHeads, tokens), kQ38GdnHeadWidth, 0, stream_value>>>(
+        activated_qkv, projected_b, projected_a, a_log, dt_bias,
+        query_scales, key_scales, decays, betas);
+    gdn_recurrent_prefill_precomputed_kernel<<<
+        dim3(kQ38GdnValueHeads, kGdnPrefillPartitions), 1024, 0,
+        stream_value>>>(activated_qkv, query_scales, key_scales, decays,
+                        betas, recurrent_state, core_output, tokens);
+    check(cudaPeekAtLastError(), "precomputed GDN prefill recurrent");
 }
 
 void cuda_gdn_output_norm_prefill_bf16(

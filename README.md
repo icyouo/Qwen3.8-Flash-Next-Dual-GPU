@@ -15,8 +15,12 @@ and chat template.
 
 > **Status: research preview.** Real dual-GPU CUDA execution, the custom
 > artifact, transactional serving, batch-1 decode, and the grouped-MMQ prefill
-> path have been validated. The opt-in width-one MTP pipeline has also passed
-> directional 32K/128K/256K performance and state-consistency probes. Full
+> path have been validated. The opt-in width-one MTP pipeline has passed
+> directional 32K/128K/256K performance and state-consistency probes. Bounded
+> width-N retained drafting supports 1..64 drafts with an initial operational
+> cap of four; its online-prefix width-4 path has passed an initial 32K
+> real-GPU token-parity and mixed accept/reject performance probe. Widths 2/3
+> and the broader width-4 matrix still require validation. Full
 > tokenizer/logit golden parity, strict 262,080 + 64 runs, broad MTP
 > accept/reject quality gates, and long-duration fault testing are still in
 > progress. The current numbers prove runtime mechanics and speed, not final
@@ -41,13 +45,24 @@ across both GPUs.
 | Grouped MMQ; internal tile 32 | 4,096 | 22.36 s | 183.15 tok/s |
 | Grouped MMQ; 512-token slabs; serialized stages | 4,096 | 8.62 s | 475.15 tok/s |
 | **Grouped MMQ; 512-token slabs; pipelined stages** | **512** | **5.02 s** | **815.78 tok/s** |
+| **Current: pipelined + GDN precompute + W4/QSA caches** | **512** | **3.09 s** | **1,327.58 tok/s** |
 | Historical DS4 reference | n/a | 5.27 s for 4,102 tokens | 777.9 tok/s |
 
 The final row is a historical measurement from the same machine, not a strict
-artifact-for-artifact comparison. The optimized q38 result is **10.9×** the
-original native prefill baseline and reaches the prior DS4 performance class.
+artifact-for-artifact comparison. The current q38 result is **17.7×** the
+original native prefill baseline and exceeds the prior DS4 performance class.
 The input was a repeated synthetic token sequence, so this is a real CUDA and
 state-machine benchmark, not a text-quality result.
+
+The latest ordinary-mode checkpoint (MTP disabled) also measured as follows.
+The 32K row deliberately keeps fine-grained CUDA stage profiling enabled; the
+other two rows do not.
+
+| Actual prefill tokens | Profiling | Append time | Prefill |
+|---:|---|---:|---:|
+| 4,096 | off | 3.085 s | **1,327.58 tok/s** |
+| 32,768 | detailed | 22.605 s | **1,449.60 tok/s** |
+| 262,080 | off | 197.479 s | **1,327.13 tok/s** |
 
 ### Decode
 
@@ -68,7 +83,7 @@ ms end-to-end p50. Strict mode is slower because every successful mutating RPC
 waits for `fdatasync`. Benchmark results must therefore always name their
 durability mode.
 
-#### Long-context exact-QSA R2
+#### Long-context exact-QSA
 
 The exact parallel selector and tiled attention path remove the earlier decode
 collapse without changing the 512-block selection budget or tie semantics.
@@ -77,7 +92,7 @@ collapse without changing the 512-block selection budget or tie semantics.
 |---:|---:|---:|---:|---:|
 | 32,768 | 20.11 tok/s | **27.84 tok/s** | **1.38×** | 47.88 → 32.79 ms |
 | 131,072 | 10.71 tok/s | **26.03 tok/s** | **2.43×** | 91.58 → 36.33 ms |
-| 262,080 | 6.21 tok/s | **22.67 tok/s** | **3.65×** | 159.19 → 42.61 ms |
+| 262,080 (current ballot gather) | 6.21 tok/s | **27.79 tok/s** | **4.47×** | 159.19 → 33.91 ms |
 
 Conditions: two 64 GiB CMP 170HX cards, single concurrency, `durability=off`,
 MTP disabled, official-tokenizer source-code corpus, model startup excluded,
@@ -86,12 +101,52 @@ Five samples establish a directional throughput baseline, not p95/p99. The
 128K and 256K fixtures repeat after 69,579 unique corpus tokens, so they do not
 claim worst-case PLE locality or model-quality parity.
 
-#### Opt-in width-one MTP
+#### Experimental piecewise CUDA Graph decode
 
-The first optimized MTP lane retains the draft QSA row, verifies two target
+`--enable-piecewise-decode-graph` enables a graph lane for ordinary one-token
+decode only. Each stage captures the fixed-shape embedding/GDN/MoE/PLE-GPU/head
+work as seven static fragments and runs the six position-dependent exact-QSA
+layers eagerly between them. PLE reads and H2D staging, inter-stage transport,
+sampling, cancellation, and transaction commit/rollback stay outside capture.
+
+CUDA graph nodes retain raw state pointers, while GDN and PLE transactions
+alternate between two working banks. The runtime therefore builds at most one
+lazy graph variant per bank pair and never patches a graph onto another bank.
+Capture failure disables this lane for that stage and falls back to the existing
+eager decode path. The feature is off by default and has no published speedup
+claim until real-GPU token/logit parity, rollback, memory, and latency A/B gates
+pass. The `cuda_graph_captures`, `cuda_graph_replays`,
+`cuda_graph_fallbacks`, and `cuda_graph_nodes` metrics expose its behavior.
+
+For strict eager/graph parity, launch the executor under test with
+`--enable-logit-diagnostics`. This diagnostic-only flag retains the raw BF16
+model-head output from the last committed append/decode transaction; it is
+default-off and therefore adds no logits D2H copy to ordinary greedy serving.
+Capture the identical committed step from separate eager and graph runs, then
+compare every BF16 bit:
+
+```bash
+python3 tools/q38_logit_parity.py capture \
+  --socket /tmp/q38-eager.sock --session-hash 368 --output eager-step
+python3 tools/q38_logit_parity.py capture \
+  --socket /tmp/q38-graph.sock --session-hash 368 --output graph-step
+python3 tools/q38_logit_parity.py compare eager-step.json graph-step.json \
+  --output parity.json
+```
+
+The capture writes a compact JSON manifest plus an exact little-endian `.bf16`
+payload protected by both the runtime FNV-1a checksum and a tool-side SHA-256.
+Comparison fails unless session/epoch/frontier/kind match, selected tokens match,
+and every raw BF16 element is identical. Do not enable this flag for latency
+benchmarks.
+
+#### Measured width-one MTP baseline
+
+The first measured MTP baseline retains one draft QSA row, verifies two target
 rows as one-token microbatches, and pipelines stage 0 of the next row against
-stage 1 of the current row. It is isolated behind `--enable-mtp --mtp-width 1`;
-ordinary `decode_one()` and width-greater-than-one behavior are unchanged.
+stage 1 of the current row. The runtime has since generalized this lane to a
+bounded width N, but the table below remains width-one evidence rather than a
+projected wider result.
 
 | Context | Plain decode baseline | MTP width 1 | MTP effective ITL | Gain over plain |
 |---:|---:|---:|---:|---:|
@@ -112,6 +167,27 @@ was intentionally skipped.
 
 Raw evidence, exact commands, known limitations, and the remaining release
 gates are tracked in [READINESS.md](READINESS.md).
+
+#### Initial online-prefix width-four result
+
+The wider lane now verifies target rows online and stops at the first mismatch.
+GPU0 keeps at most one lookahead row, protected by one optional GDN/PLE
+checkpoint, while GPU1 reconciles each accepted deeper MTP row against real
+target HC. Commit therefore publishes the already-verified prefix instead of
+verifying the rejected suffix and replaying accepted target/MTP rows.
+
+On the frozen 32,768-token coding fixture, five width-4 transactions published
+`5, 4, 4, 2, 5` tokens (excluding the seed), covering two all-accepted cases
+and three early-stop depths. The run accepted 15/20 drafts and reached
+**48.65 tok/s**; total backend commit time was **1.19 ms**, versus **124.17 ms**
+in the previous retained-draft trace. All 21 published tokens exactly matched
+the ordinary target decode prefix, and the run reported zero failures and zero
+rollbacks. The simultaneously measured plain reference was 28.67 tok/s.
+
+Acceptance differed from the older trace, so this is a directional end-to-end
+result rather than a fixed-work kernel A/B. It validates the repaired control
+path at 32K; it does not replace the remaining 128K/256K, logit-golden,
+cancellation, long-generation, or width-2/3 comparison gates.
 
 ## Architecture
 
@@ -191,15 +267,18 @@ Q38_CUDA_PROFILE_DECODE=1
 
 ### Retained-draft MTP lane
 
-Width-one MTP does not rerun the draft token after verification. After the
-transaction establishes its epoch, GPU1 starts the retained draft while GPU0
-starts target row 0. The backend keeps the provisional draft QSA row under that
-epoch and consumes it at commit if the target accepts the draft. The two target
-rows then travel through the existing stage scheduler as one-token chunks,
-allowing GPU0 row `n+1` to overlap GPU1 row `n`. Rejection, cancellation,
-rollback, and partial replay discard or rebuild provisional state before
-anything becomes canonical. MTP is opt-in, and the plain scheduler takes none
-of this retained-state path.
+For width N, GPU1 recurrently runs the checkpoint's multi-step-trained MTP
+layer while GPU0 starts target row 0. The N+1 target rows then travel through
+the existing scheduler as one-token chunks, allowing GPU0 row `n+1` to overlap
+GPU1 row `n`. Verification stops at the first mismatch. Before each lookahead,
+GPU0 checkpoints the current GDN/PLE prefix; an early stop restores that single
+checkpoint while QSA commits its shorter append-only extent. The first retained
+MTP QSA row is based on canonical target HC and can be committed directly.
+Later draft rows used MTP-predicted HC, so every accepted deeper row is
+reconciled online from the corresponding real target HC while GPU0 computes its
+lookahead. Commit performs no serial prefix repair. Rejection, stop tokens,
+cancellation, rollback, and context-tail capping remain request-atomic. MTP is
+opt-in, and the plain scheduler takes none of this retained-state path.
 
 ## Model artifact and memory placement
 
@@ -350,8 +429,15 @@ history, disable only crash recovery:
 `durability=off` removes the snapshot journal and its crash-rebuild guarantee;
 it does not weaken in-process transaction, rollback, or committed-token
 semantics. Use `--dry-run` to validate an artifact without launching. MTP is
-off by default and should be enabled with `--enable-mtp` only after the plain
-lane passes its correctness and memory gates.
+off by default and should be enabled with `--enable-mtp --mtp-max-draft 4`
+only after the plain lane passes its correctness and memory gates. Individual
+token-native requests use `{"mode":"mtp","mtp_width":4}`; OpenAI-compatible
+requests use `{"q38_mode":"mtp","q38_mtp_width":4}`. The configured maximum
+is a capability ceiling, while each request still chooses its width. Piecewise
+CUDA Graph decode is
+also experimental and opt-in through `--enable-piecewise-decode-graph`; do not
+combine it with benchmark claims until the graph-specific gates in
+[READINESS.md](READINESS.md) pass.
 
 ## API
 
@@ -426,8 +512,9 @@ The immediate release sequence is:
 4. prove near-256K suffix continuation without prefix replay;
 5. validate rollback, cancellation, duplicate requests, crash recovery, and
    fault injection at every context level;
-6. expand the opt-in width-one MTP accept/reject, cancellation, parity, and
-   long-generation gates, then optimize wider draft widths; and
+6. complete width 2/3 comparisons and the remaining width-4 accept-depth,
+   cancellation, token/logit parity, long-generation, 128K/256K, and throughput
+   gates before selecting the production width; and
 7. complete the long-duration stability and failure-injection soak.
 
 For the full implementation/evidence boundary, see [READINESS.md](READINESS.md).

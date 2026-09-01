@@ -268,6 +268,8 @@ def runtime_command(
     chunk: int,
     ple_cache_gib: int,
     enable_mtp: bool = False,
+    enable_piecewise_decode_graph: bool = False,
+    enable_logit_diagnostics: bool = False,
 ) -> list[str]:
     paths = validated["paths"]
     ready = validated["ready"]
@@ -301,6 +303,10 @@ def runtime_command(
         command.extend(["--snapshot-journal", str(snapshot.resolve())])
     if enable_mtp:
         command.append("--enable-mtp")
+    if enable_piecewise_decode_graph:
+        command.append("--enable-piecewise-decode-graph")
+    if enable_logit_diagnostics:
+        command.append("--enable-logit-diagnostics")
     command.extend(sampling_arguments(validated["sampling"]))  # type: ignore[arg-type]
     return command
 
@@ -360,10 +366,22 @@ def main() -> int:
     parser.add_argument("--skip-segment-hashes", action="store_true")
     parser.add_argument("--executor-only", action="store_true")
     parser.add_argument("--enable-mtp", action="store_true")
+    parser.add_argument(
+        "--mtp-max-draft",
+        type=int,
+        default=4,
+        help="maximum sidecar MTP draft width (1..64)",
+    )
+    parser.add_argument("--enable-piecewise-decode-graph", action="store_true")
+    parser.add_argument("--enable-logit-diagnostics", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args()
-    if arguments.chunk <= 0 or arguments.ple_cache_gib <= 0:
-        parser.error("chunk/cache values must be positive")
+    if (
+        arguments.chunk <= 0
+        or arguments.ple_cache_gib <= 0
+        or not 1 <= arguments.mtp_max_draft <= 64
+    ):
+        parser.error("chunk/cache must be positive and MTP maximum must be in 1..64")
     if arguments.host not in ("127.0.0.1", "::1", "localhost") and not arguments.api_key:
         parser.error("non-loopback binding requires --api-key")
     if arguments.skip_segment_hashes and not arguments.dry_run:
@@ -379,6 +397,8 @@ def main() -> int:
         arguments.chunk,
         arguments.ple_cache_gib,
         arguments.enable_mtp,
+        arguments.enable_piecewise_decode_graph,
+        arguments.enable_logit_diagnostics,
     )
     sidecar = [
         sys.executable,
@@ -407,7 +427,9 @@ def main() -> int:
     for token in stops:
         sidecar.extend(["--stop-token-id", str(token)])
     if arguments.enable_mtp:
-        sidecar.append("--enable-mtp")
+        sidecar.extend(
+            ["--enable-mtp", "--mtp-max-draft", str(arguments.mtp_max_draft)]
+        )
     evidence = {
         "schema": "Q38_LAUNCH_PLAN_V1",
         "session_hash": validated["session_hash"],
@@ -415,6 +437,9 @@ def main() -> int:
         "artifact_bytes": validated["segment_bytes"],
         "segment_hashes_verified": not arguments.skip_segment_hashes,
         "mtp_enabled": arguments.enable_mtp,
+        "mtp_max_draft": arguments.mtp_max_draft if arguments.enable_mtp else 0,
+        "piecewise_decode_graph_enabled": arguments.enable_piecewise_decode_graph,
+        "logit_diagnostics_enabled": arguments.enable_logit_diagnostics,
         "durability": arguments.durability,
         "runtime_command": command,
         "sidecar_command": None if arguments.executor_only else sidecar,

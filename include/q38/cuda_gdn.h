@@ -14,6 +14,12 @@ constexpr std::uint32_t kQ38GdnQkvWidth = 10240;
 constexpr std::uint32_t kQ38GdnValueWidth = 6144;
 constexpr std::uint32_t kQ38GdnConvWidth = 4;
 
+constexpr std::size_t q38_gdn_prefill_parameter_floats(
+    std::uint32_t tokens) {
+    return static_cast<std::size_t>(tokens) *
+           (2 * kQ38GdnKeyHeads + 2 * kQ38GdnValueHeads);
+}
+
 struct CudaGdnLayerStateView {
     std::uint16_t* conv = nullptr;
     float* recurrent = nullptr;
@@ -24,7 +30,8 @@ struct CudaGdnLayerStateView {
 // rollback simply discards working state.
 class CudaGdnStateBank {
 public:
-    CudaGdnStateBank(int device, std::uint32_t layers);
+    CudaGdnStateBank(int device, std::uint32_t layers,
+                     bool enable_checkpoint = false);
     ~CudaGdnStateBank();
 
     CudaGdnStateBank(const CudaGdnStateBank&) = delete;
@@ -34,6 +41,8 @@ public:
 
     void begin(std::uint64_t epoch, void* stream);
     void restore(void* stream);
+    void checkpoint(void* stream);
+    void restore_checkpoint(void* stream);
     CudaGdnLayerStateView working(std::uint32_t local_layer) const;
     void commit(std::uint64_t epoch);
     void rollback(std::uint64_t epoch);
@@ -41,6 +50,7 @@ public:
 
     std::uint32_t layers() const;
     std::uint64_t bytes_per_bank() const;
+    std::uint64_t allocated_bytes() const;
 
 private:
     struct Impl;
@@ -90,6 +100,33 @@ void cuda_gdn_recurrent_prefill_bf16(
     const std::uint16_t* a_log,
     const std::uint16_t* dt_bias,
     float* recurrent_state,
+    std::uint16_t* core_output,
+    std::uint32_t tokens,
+    void* stream,
+    int device);
+
+void cuda_gdn_recurrent_prefill_partitioned_bf16(
+    const std::uint16_t* activated_qkv,
+    const std::uint16_t* projected_b,
+    const std::uint16_t* projected_a,
+    const std::uint16_t* a_log,
+    const std::uint16_t* dt_bias,
+    float* recurrent_state,
+    std::uint16_t* core_output,
+    std::uint32_t tokens,
+    void* stream,
+    int device);
+
+// Computes Q/K normalization and decay/beta once per token/head, then shares
+// those parameters across the four independent state-column partitions.
+void cuda_gdn_recurrent_prefill_precomputed_bf16(
+    const std::uint16_t* activated_qkv,
+    const std::uint16_t* projected_b,
+    const std::uint16_t* projected_a,
+    const std::uint16_t* a_log,
+    const std::uint16_t* dt_bias,
+    float* recurrent_state,
+    float* parameter_scratch,
     std::uint16_t* core_output,
     std::uint32_t tokens,
     void* stream,

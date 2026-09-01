@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -48,6 +49,50 @@ bool profile_requested(const char* name) {
     const char* value = std::getenv(name);
     return value && std::strcmp(value, "0") != 0 &&
            std::strcmp(value, "false") != 0;
+}
+
+bool grouped_qsa_prefill_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("Q38_CUDA_PREFILL_QSA");
+        if (!value) return true;
+        return std::strcmp(value, "legacy") != 0 &&
+               std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0;
+    }();
+    return enabled;
+}
+
+bool fused_grouped_qsa_prefill_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("Q38_CUDA_PREFILL_QSA_FUSED");
+        return value && std::strcmp(value, "split") != 0 &&
+               std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0;
+    }();
+    return enabled;
+}
+
+bool partitioned_gdn_prefill_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("Q38_CUDA_PREFILL_GDN");
+        if (!value) return true;
+        return std::strcmp(value, "serial") != 0 &&
+               std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0;
+    }();
+    return enabled;
+}
+
+bool precomputed_gdn_prefill_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("Q38_CUDA_PREFILL_GDN");
+        if (!value) return true;
+        return std::strcmp(value, "partitioned") != 0 &&
+               std::strcmp(value, "serial") != 0 &&
+               std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0;
+    }();
+    return enabled;
 }
 
 Q38PrefillMoeModeV1 prefill_moe_mode() {
@@ -162,6 +207,84 @@ private:
     std::size_t event_count_ = 0;
     std::vector<cudaEvent_t> events_;
     std::vector<std::string> labels_;
+};
+
+// One captured GPU-only fragment.  It deliberately owns no tensor storage:
+// every node points at immutable weights or the backend's lifetime-stable
+// workspace/state allocations.  The owner must therefore destroy graph execs
+// before releasing those allocations.
+class CapturedCudaGraph {
+public:
+    CapturedCudaGraph(int value_device, cudaStream_t stream,
+                      const std::function<void()>& enqueue)
+        : device_(value_device) {
+        check(cudaSetDevice(device_), "cudaSetDevice(graph capture)");
+        // Capture is lazy and happens after transaction inputs/state clones
+        // have been enqueued.  Drain that setup once so it stays outside the
+        // graph and capture begins from an unambiguous stream boundary.
+        check(cudaStreamSynchronize(stream),
+              "cudaStreamSynchronize(graph capture boundary)");
+        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+              "cudaStreamBeginCapture(decode fragment)");
+        bool capturing = true;
+        try {
+            enqueue();
+            const auto end_status = cudaStreamEndCapture(stream, &graph_);
+            // EndCapture terminates capture even when it reports an
+            // invalidated graph. Do not call it a second time from cleanup.
+            capturing = false;
+            check(end_status, "cudaStreamEndCapture(decode fragment)");
+            if (!graph_)
+                throw std::runtime_error(
+                    "CUDA decode fragment capture returned a null graph");
+            check(cudaGraphGetNodes(graph_, nullptr, &nodes_),
+                  "cudaGraphGetNodes(decode fragment)");
+            check(cudaGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0),
+                  "cudaGraphInstantiate(decode fragment)");
+            // The executable owns the instantiated node state. The source
+            // graph is no longer needed after node census and instantiation.
+            check(cudaGraphDestroy(graph_),
+                  "cudaGraphDestroy(instantiated decode fragment)");
+            graph_ = nullptr;
+        } catch (...) {
+            if (capturing) {
+                cudaGraph_t discarded = nullptr;
+                (void)cudaStreamEndCapture(stream, &discarded);
+                if (discarded) (void)cudaGraphDestroy(discarded);
+                (void)cudaGetLastError();
+            }
+            release();
+            throw;
+        }
+    }
+
+    ~CapturedCudaGraph() { release(); }
+
+    CapturedCudaGraph(const CapturedCudaGraph&) = delete;
+    CapturedCudaGraph& operator=(const CapturedCudaGraph&) = delete;
+
+    void launch(cudaStream_t stream) const {
+        if (!exec_) throw std::logic_error("CUDA decode graph is unavailable");
+        check(cudaGraphLaunch(exec_, stream),
+              "cudaGraphLaunch(decode fragment)");
+    }
+
+    std::size_t nodes() const { return nodes_; }
+
+private:
+    void release() noexcept {
+        (void)cudaSetDevice(device_);
+        if (exec_) (void)cudaGraphExecDestroy(exec_);
+        if (graph_) (void)cudaGraphDestroy(graph_);
+        exec_ = nullptr;
+        graph_ = nullptr;
+        nodes_ = 0;
+    }
+
+    int device_ = 0;
+    cudaGraph_t graph_ = nullptr;
+    cudaGraphExec_t exec_ = nullptr;
+    std::size_t nodes_ = 0;
 };
 
 std::uint64_t elements(const DeviceTensorV1& tensor) {
@@ -426,10 +549,9 @@ MtpWeights bind_mtp(const CudaDeviceWeightStore& weights) {
     return result;
 }
 
-// One persistent producer per stage0 backend.  It fills CUDA-pinned host
-// memory directly, so token-0 layer-0 kernels can run while the 16 PLE rows
-// for the transaction are fetched from SSD/cache.  No temporary row vectors
-// or per-transaction thread creation are involved.
+// One persistent producer per stage0 backend.  It warms the non-semantic PLE
+// page cache for a complete known-token transaction, allowing I/O for later
+// device-workspace chunks to overlap the current GPU slab.
 class PleAsyncReader {
 public:
     explicit PleAsyncReader(std::shared_ptr<PleStore> value_store)
@@ -442,41 +564,48 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stopping_ = true;
+            cancel_requested_ = true;
         }
         ready_.notify_all();
+        finished_.notify_all();
         if (worker_.joinable()) worker_.join();
     }
 
     PleAsyncReader(const PleAsyncReader&) = delete;
     PleAsyncReader& operator=(const PleAsyncReader&) = delete;
 
-    void submit(std::vector<std::uint64_t> rows, std::uint8_t* output,
-                std::size_t output_bytes, std::uint16_t* scale_output,
-                std::size_t output_scales) {
+    void submit(std::shared_ptr<const std::vector<std::uint64_t>> rows) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!rows || rows->empty())
+            throw std::invalid_argument("PLE async row set is empty");
         if (request_ready_ || working_ || result_ready_ || stopping_)
             throw std::logic_error("PLE async reader already has work");
         rows_ = std::move(rows);
-        output_ = output;
-        output_bytes_ = output_bytes;
-        scale_output_ = scale_output;
-        output_scales_ = output_scales;
         error_ = nullptr;
-        completed_rows_ = 0;
-        total_rows_ = rows_.size();
+        total_rows_ = rows_->size();
+        cancel_requested_ = false;
         request_ready_ = true;
         ready_.notify_one();
     }
 
-    void wait_until(std::size_t required_rows) {
+    void take(std::size_t first_row, std::size_t row_count,
+              std::uint8_t* output, std::size_t output_bytes,
+              std::uint16_t* scale_output,
+              std::size_t output_scales) {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (required_rows == 0 || required_rows > total_rows_)
-            throw std::invalid_argument("PLE async wait extent is invalid");
-        finished_.wait(lock, [this, required_rows] {
-            return completed_rows_ >= required_rows || result_ready_ ||
-                   stopping_;
+        const auto row_bytes = store_->layout().row_stride_bytes;
+        if (row_count == 0 || first_row > total_rows_ ||
+            row_count > total_rows_ - first_row || !output ||
+            output_bytes != row_count * row_bytes || !scale_output ||
+            output_scales != row_count)
+            throw std::invalid_argument("PLE async take extent is invalid");
+        finished_.wait(lock, [this, first_row] {
+            return (!ready_tiles_.empty() &&
+                    ready_tiles_.front().first_row == first_row) ||
+                   result_ready_ || stopping_;
         });
-        if (completed_rows_ < required_rows) {
+        if (ready_tiles_.empty() ||
+            ready_tiles_.front().first_row != first_row) {
             auto error = error_;
             if (result_ready_) {
                 result_ready_ = false;
@@ -486,67 +615,99 @@ public:
             if (error) std::rethrow_exception(error);
             throw std::runtime_error("PLE async reader stopped early");
         }
-        if (required_rows == total_rows_) {
+        auto tile = std::move(ready_tiles_.front());
+        ready_tiles_.pop_front();
+        ready_.notify_one();
+        if (tile.rows != row_count || tile.bytes.size() != output_bytes ||
+            tile.scales.size() != output_scales)
+            throw std::logic_error("PLE async tile extent differs");
+        const bool final = first_row + row_count == total_rows_;
+        if (final) {
             finished_.wait(lock, [this] { return result_ready_ || stopping_; });
-            auto error = error_;
+            const auto error = error_;
             result_ready_ = false;
             error_ = nullptr;
-            lock.unlock();
             if (error) std::rethrow_exception(error);
         }
+        lock.unlock();
+        std::copy(tile.bytes.begin(), tile.bytes.end(), output);
+        std::copy(tile.scales.begin(), tile.scales.end(), scale_output);
     }
 
-    void wait() { wait_until(total_rows_); }
+    void cancel() noexcept {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!request_ready_ && !working_ && !result_ready_) return;
+        cancel_requested_ = true;
+        ready_.notify_all();
+        finished_.notify_all();
+        finished_.wait(lock, [this] {
+            return result_ready_ ||
+                   (!request_ready_ && !working_) || stopping_;
+        });
+        result_ready_ = false;
+        error_ = nullptr;
+        rows_.reset();
+        ready_tiles_.clear();
+        total_rows_ = 0;
+        cancel_requested_ = false;
+    }
 
 private:
+    struct PleTileResult {
+        std::size_t first_row = 0;
+        std::size_t rows = 0;
+        std::vector<std::uint8_t> bytes;
+        std::vector<std::uint16_t> scales;
+    };
+
     void run() noexcept {
         for (;;) {
-            std::vector<std::uint64_t> rows;
-            std::uint8_t* output = nullptr;
-            std::size_t output_bytes = 0;
-            std::uint16_t* scale_output = nullptr;
-            std::size_t output_scales = 0;
+            std::shared_ptr<const std::vector<std::uint64_t>> rows;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 ready_.wait(lock,
                             [this] { return stopping_ || request_ready_; });
                 if (stopping_ && !request_ready_) return;
                 rows = std::move(rows_);
-                output = output_;
-                output_bytes = output_bytes_;
-                scale_output = scale_output_;
-                output_scales = output_scales_;
                 request_ready_ = false;
                 working_ = true;
             }
             std::exception_ptr error;
             try {
-                const auto row_bytes = store_->layout().row_stride_bytes;
-                if (!output || !scale_output ||
-                    output_bytes != rows.size() * row_bytes ||
-                    output_scales != rows.size())
-                    throw std::invalid_argument(
-                        "PLE async output extent differs");
+                if (!rows || rows->empty())
+                    throw std::invalid_argument("PLE async row set vanished");
                 constexpr std::size_t kRowsPerTile =
                     static_cast<std::size_t>(kPrefillTile) *
                     kQ38PleRowsPerToken;
-                for (std::size_t first = 0; first < rows.size();
+                for (std::size_t first = 0; first < rows->size();
                      first += kRowsPerTile) {
+                    {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        ready_.wait(lock, [this] {
+                            return ready_tiles_.size() < 2 ||
+                                   cancel_requested_ || stopping_;
+                        });
+                        if (cancel_requested_ || stopping_) break;
+                    }
                     const auto count =
-                        std::min<std::size_t>(kRowsPerTile, rows.size() - first);
+                        std::min<std::size_t>(kRowsPerTile,
+                                              rows->size() - first);
                     std::vector<std::uint64_t> tile(
-                        rows.begin() + static_cast<std::ptrdiff_t>(first),
-                        rows.begin() +
+                        rows->begin() + static_cast<std::ptrdiff_t>(first),
+                        rows->begin() +
                             static_cast<std::ptrdiff_t>(first + count));
-                    store_->read_rows_into(
-                        tile, output + first * row_bytes, count * row_bytes);
+                    PleTileResult result;
+                    result.first_row = first;
+                    result.rows = count;
+                    result.bytes = store_->read_rows(tile);
+                    result.scales.resize(count);
                     store_->read_row_scales_into(
-                        tile, scale_output + first, count);
+                        tile, result.scales.data(), result.scales.size());
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
-                        completed_rows_ = first + count;
+                        ready_tiles_.push_back(std::move(result));
+                        finished_.notify_all();
                     }
-                    finished_.notify_all();
                 }
             } catch (...) {
                 error = std::current_exception();
@@ -566,17 +727,14 @@ private:
     std::mutex mutex_;
     std::condition_variable ready_;
     std::condition_variable finished_;
-    std::vector<std::uint64_t> rows_;
-    std::uint8_t* output_ = nullptr;
-    std::size_t output_bytes_ = 0;
-    std::uint16_t* scale_output_ = nullptr;
-    std::size_t output_scales_ = 0;
+    std::shared_ptr<const std::vector<std::uint64_t>> rows_;
+    std::deque<PleTileResult> ready_tiles_;
     std::exception_ptr error_;
-    std::size_t completed_rows_ = 0;
     std::size_t total_rows_ = 0;
     bool request_ready_ = false;
     bool working_ = false;
     bool result_ready_ = false;
+    bool cancel_requested_ = false;
     bool stopping_ = false;
 };
 
@@ -933,6 +1091,31 @@ public:
 }  // namespace
 
 struct CudaStageBackend::Impl {
+    enum class DecodeStaticActionKind : std::uint8_t {
+        kInput,
+        kPle,
+        kPrepareAttention,
+        kGdn,
+        kFinish,
+        kPrepareMoe,
+        kMoe,
+        kOutput,
+    };
+
+    struct DecodeStaticAction {
+        DecodeStaticActionKind kind = DecodeStaticActionKind::kInput;
+        std::uint32_t layer = 0;
+        std::uint16_t* first = nullptr;
+        std::uint16_t* second = nullptr;
+    };
+
+    struct DecodeGraphVariant {
+        std::uintptr_t gdn_working = 0;
+        std::uintptr_t ple_working = 0;
+        std::vector<std::unique_ptr<CapturedCudaGraph>> fragments;
+        std::vector<std::uint32_t> qsa_layers;
+    };
+
     Impl(DeviceStageIndexV1 source_index, CudaStageBackendOptions value_options,
          std::shared_ptr<PleStore> value_ple)
         : options(value_options),
@@ -958,14 +1141,19 @@ struct CudaStageBackend::Impl {
             layers.push_back(bind_layer(weights, layer,
                                         qsa ? qsa_local++ : gdn_local++));
         }
-        gdn_state = std::make_unique<CudaGdnStateBank>(options.device, gdn_local);
+        const bool retained_prefix_checkpoint =
+            options.enable_speculative_checkpoint &&
+            options.stage == Stage::kStage0;
+        gdn_state = std::make_unique<CudaGdnStateBank>(
+            options.device, gdn_local, retained_prefix_checkpoint);
         qsa_state = std::make_unique<CudaQsaStateBank>(
             options.device, qsa_local, options.context_capacity);
         if (options.stage == Stage::kStage0) {
             if (!ple_store || ple_store->layout().storage_dtype != DType::kFp8E4M3 ||
                 ple_store->layout().row_dimension != kQ38PleRowWidth)
                 throw std::invalid_argument("stage0 requires FP8 PLE layout");
-            ple_state = std::make_unique<CudaPleStateBank>(options.device);
+            ple_state = std::make_unique<CudaPleStateBank>(
+                options.device, retained_prefix_checkpoint);
             committed_ple_hash =
                 std::make_unique<PleHashState>(ple_store->layout().hash);
             ple_reader = std::make_unique<PleAsyncReader>(ple_store);
@@ -1002,6 +1190,11 @@ struct CudaStageBackend::Impl {
             decode_profile->mark(label, workspace.stream);
         if (prefill_profile && prefill_profile->active())
             prefill_profile->mark(label, workspace.stream);
+    }
+
+    bool detailed_prefill_profile() const {
+        return prefill_profile && prefill_profile->active() &&
+               profile_requested("Q38_CUDA_PROFILE_PREFILL_DETAIL");
     }
 
     void cuda_gemv_bf16(const CudaMatrixViewV1& matrix,
@@ -1106,29 +1299,36 @@ struct CudaStageBackend::Impl {
                                  kQ38PleRowsPerToken;
         cuda_ple_fp8_rows_to_bf16(rows, scales, workspace.proj5, tokens,
                                   stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("ple_unpack");
         cuda_gemv_bf16(layer.ple.key, workspace.proj5, workspace.hyper_norm,
                        tokens, stream, options.device);
         cuda_gemv_bf16(layer.ple.value, workspace.proj5, workspace.proj6,
                        tokens, stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("ple_key_value");
         cuda_hyper_group_rmsnorm_bf16(
             workspace.hyper_norm, layer.ple.key_norm, workspace.proj1, tokens,
             stream, options.device);
         cuda_hyper_group_rmsnorm_bf16(
             hyper, layer.ple.query_norm, workspace.proj2, tokens, stream,
             options.device);
+        if (detailed_prefill_profile()) profile_mark("ple_norms");
         cuda_ple_gate_prefill_bf16(
             workspace.proj1, workspace.proj2, workspace.proj6,
             workspace.mix_weights, tokens, stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("ple_gate");
         cuda_hyper_group_rmsnorm_bf16(
             workspace.mix_weights, layer.ple.conv_norm, workspace.hyper_norm,
             tokens, stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("ple_conv_norm");
         cuda_ple_conv_prefill_bf16(
             workspace.mix_weights, workspace.hyper_norm, layer.ple.conv,
             ple_state->working(), workspace.proj2, tokens, stream,
             options.device);
+        if (detailed_prefill_profile()) profile_mark("ple_conv");
         cuda_add_bf16(hyper, workspace.proj2, destination,
                       static_cast<std::size_t>(tokens) * kQ38HyperWidth,
                       stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("ple_residual");
     }
 
     void run_gdn(const LayerWeights& layer) {
@@ -1166,20 +1366,37 @@ struct CudaStageBackend::Impl {
                        stream, options.device);
         cuda_gemv_bf16(layer.gdn.a, workspace.mixed, workspace.small1, tokens,
                        stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("gdn_project");
         const auto state = gdn_state->working(layer.state_local);
         cuda_gdn_conv_prefill_bf16(
             workspace.proj1, layer.gdn.conv, state.conv, workspace.proj2,
             tokens, stream, options.device);
-        cuda_gdn_recurrent_prefill_bf16(
-            workspace.proj2, workspace.small0, workspace.small1,
-            layer.gdn.a_log, layer.gdn.dt_bias, state.recurrent,
-            workspace.proj4, tokens, stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("gdn_conv");
+        if (precomputed_gdn_prefill_enabled())
+            cuda_gdn_recurrent_prefill_precomputed_bf16(
+                workspace.proj2, workspace.small0, workspace.small1,
+                layer.gdn.a_log, layer.gdn.dt_bias, state.recurrent,
+                workspace.block_scores, workspace.proj4, tokens, stream,
+                options.device);
+        else if (partitioned_gdn_prefill_enabled())
+            cuda_gdn_recurrent_prefill_partitioned_bf16(
+                workspace.proj2, workspace.small0, workspace.small1,
+                layer.gdn.a_log, layer.gdn.dt_bias, state.recurrent,
+                workspace.proj4, tokens, stream, options.device);
+        else
+            cuda_gdn_recurrent_prefill_bf16(
+                workspace.proj2, workspace.small0, workspace.small1,
+                layer.gdn.a_log, layer.gdn.dt_bias, state.recurrent,
+                workspace.proj4, tokens, stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("gdn_recurrent");
         cuda_gdn_output_norm_prefill_bf16(
             workspace.proj4, workspace.proj3, layer.gdn.norm, workspace.proj0,
             tokens, 1.0e-6f, stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("gdn_output_norm");
         cuda_gemv_bf16(layer.gdn.output, workspace.proj0,
                        workspace.block_output, tokens, stream,
                        options.device);
+        if (detailed_prefill_profile()) profile_mark("gdn_output");
     }
 
     void run_qsa(const LayerWeights& layer, std::uint32_t position,
@@ -1236,25 +1453,64 @@ struct CudaStageBackend::Impl {
                        tokens, stream, options.device);
         cuda_gemv_bf16(layer.sparse.index_qk, workspace.mixed,
                        workspace.small2, tokens, stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("qsa_project");
         cuda_qsa_prepare_prefill_bf16(
             workspace.proj0, workspace.small0, workspace.small1,
             workspace.small2, layer.sparse.q_norm, layer.sparse.k_norm,
             layer.sparse.index_q_norm, layer.sparse.index_k_norm,
             workspace.proj3, workspace.proj4, workspace.proj1, state,
             first_position, tokens, stream, options.device);
-        cuda_qsa_attention_prefill_bf16(
-            workspace.proj3, workspace.proj1, state, first_position, tokens,
+        if (detailed_prefill_profile()) profile_mark("qsa_prepare");
+        cuda_qsa_select_prefill(
+            workspace.proj1, state, first_position, tokens,
             workspace.block_scores,
             kQ38ContextLimit / kQ38QsaBlockTokens,
-            workspace.selected_indices, workspace.attention_scores,
-            workspace.proj0, stream, options.device);
+            workspace.selected_indices, stream, options.device);
+        if (detailed_prefill_profile()) profile_mark("qsa_select");
+        const bool grouped_qsa = grouped_qsa_prefill_enabled();
+        const bool fused_grouped_qsa =
+            grouped_qsa && fused_grouped_qsa_prefill_enabled();
+        if (fused_grouped_qsa) {
+            cuda_qsa_apply_grouped_fused_prefill_bf16(
+                workspace.proj3, state, first_position, tokens,
+                workspace.selected_indices, workspace.attention_scores,
+                workspace.proj0, stream, options.device);
+            if (detailed_prefill_profile())
+                profile_mark("qsa_attention_fused");
+        } else if (grouped_qsa) {
+            cuda_qsa_score_grouped_prefill_bf16(
+                workspace.proj3, state, first_position, tokens,
+                workspace.selected_indices, workspace.attention_scores,
+                stream, options.device);
+        } else {
+            cuda_qsa_score_prefill_bf16(
+                workspace.proj3, state, first_position, tokens,
+                workspace.selected_indices, workspace.attention_scores,
+                stream, options.device);
+        }
+        if (!fused_grouped_qsa) {
+            if (detailed_prefill_profile()) profile_mark("qsa_scores");
+            if (grouped_qsa)
+                cuda_qsa_output_grouped_prefill_bf16(
+                    state, first_position, tokens,
+                    workspace.selected_indices, workspace.attention_scores,
+                    workspace.proj0, stream, options.device);
+            else
+                cuda_qsa_output_prefill_bf16(
+                    state, first_position, tokens,
+                    workspace.selected_indices, workspace.attention_scores,
+                    workspace.proj0, stream, options.device);
+            if (detailed_prefill_profile()) profile_mark("qsa_value");
+        }
         cuda_sigmoid_multiply_bf16(
             workspace.proj0, workspace.proj4, workspace.proj3,
             static_cast<std::size_t>(tokens) * kQ38GdnValueWidth, stream,
             options.device);
+        if (detailed_prefill_profile()) profile_mark("qsa_gate");
         cuda_gemv_bf16(layer.sparse.output, workspace.proj3,
                        workspace.block_output, tokens, stream,
                        options.device);
+        if (detailed_prefill_profile()) profile_mark("qsa_output");
     }
 
     void run_moe(const LayerWeights& layer, std::uint32_t tokens = 1) {
@@ -1272,14 +1528,20 @@ struct CudaStageBackend::Impl {
             profile_mark("moe_topk");
         const bool grouped_prefill =
             tokens > 1 && workspace.moe_route_plan.header != nullptr;
+        const bool detailed_prefill_profile =
+            grouped_prefill && prefill_profile && prefill_profile->active() &&
+            (profile_requested("Q38_CUDA_PROFILE_PREFILL_DETAIL") ||
+             profile_requested("Q38_CUDA_PROFILE_PREFILL_MOE_DETAIL"));
         if (grouped_prefill) {
             cuda_moe_build_route_plan_v1(
                 workspace.expert_ids, tokens, workspace.moe_route_plan,
                 stream, options.device);
+            if (detailed_prefill_profile) profile_mark("moe_route_plan");
             cuda_moe_pack_hidden_v1(
                 workspace.mixed, workspace.moe_route_plan.packed_assignment,
                 tokens * kQ38MoeTopK, workspace.moe_packed_hidden, stream,
                 options.device);
+            if (detailed_prefill_profile) profile_mark("moe_pack_hidden");
             cuda_moe_grouped_gate_up_v1(
                 layer.moe.gate_up_experts, workspace.moe_packed_hidden,
                 workspace.moe_route_plan.packed_assignment,
@@ -1287,12 +1549,14 @@ struct CudaStageBackend::Impl {
                 q38_moe_prefill_max_tasks_v1(tokens),
                 workspace.moe_weighted_mid, prefill_moe_mode(), stream,
                 options.device);
+            if (detailed_prefill_profile) profile_mark("moe_gate_up");
             cuda_moe_grouped_down_v1(
                 layer.moe.down_experts, workspace.moe_weighted_mid,
                 workspace.moe_route_plan.tasks,
                 q38_moe_prefill_max_tasks_v1(tokens),
                 workspace.moe_route_output, prefill_moe_mode(), stream,
                 options.device);
+            if (detailed_prefill_profile) profile_mark("moe_down");
         } else {
             cuda_moe_routed_bf16(
                 layer.moe.gate_up_experts, layer.moe.down_experts,
@@ -1302,8 +1566,9 @@ struct CudaStageBackend::Impl {
                 workspace.moe_accumulation, workspace.proj6, stream,
                 options.device);
         }
-        if (tokens == 1 ||
-            (prefill_profile && prefill_profile->active()))
+        if (!detailed_prefill_profile &&
+            (tokens == 1 ||
+             (prefill_profile && prefill_profile->active())))
             profile_mark("moe_routed");
         cuda_gemv_bf16(layer.moe.shared_gate, workspace.mixed,
                        workspace.small2, tokens, stream, options.device);
@@ -1339,6 +1604,219 @@ struct CudaStageBackend::Impl {
             profile_mark("moe_shared_combine");
     }
 
+    void enqueue_decode_static_action(const DecodeStaticAction& action) {
+        auto stream = reinterpret_cast<void*>(workspace.stream);
+        const auto require_layer = [&]() -> const LayerWeights& {
+            if (action.layer >= layers.size())
+                throw std::logic_error(
+                    "piecewise decode action has an invalid layer");
+            return layers[action.layer];
+        };
+        switch (action.kind) {
+        case DecodeStaticActionKind::kInput:
+            if (options.stage == Stage::kStage0) {
+                cuda_embedding_bf16(embedding, workspace.tokens,
+                                    workspace.proj5, 1, stream,
+                                    options.device);
+                cuda_hyper_repeat_embedding_bf16(
+                    workspace.proj5, workspace.hyper_a, 1, stream,
+                    options.device);
+            } else {
+                check(cudaMemcpyAsync(
+                          workspace.hyper_a, workspace.boundary,
+                          kQ38HyperWidth * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToDevice, workspace.stream),
+                      "cudaMemcpyAsync(graph stage boundary token)");
+            }
+            return;
+        case DecodeStaticActionKind::kPle:
+            run_ple(require_layer(), action.first, action.second, 0);
+            return;
+        case DecodeStaticActionKind::kPrepareAttention:
+            prepare_hyper(require_layer().attention_hyper, action.first);
+            return;
+        case DecodeStaticActionKind::kGdn:
+            run_gdn(require_layer());
+            return;
+        case DecodeStaticActionKind::kFinish:
+            finish_hyper(action.first, action.second);
+            return;
+        case DecodeStaticActionKind::kPrepareMoe:
+            prepare_hyper(require_layer().moe_hyper, action.first);
+            return;
+        case DecodeStaticActionKind::kMoe:
+            run_moe(require_layer());
+            return;
+        case DecodeStaticActionKind::kOutput:
+            if (options.stage == Stage::kStage0) {
+                check(cudaMemcpyAsync(
+                          workspace.boundary, action.first,
+                          kQ38HyperWidth * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToDevice, workspace.stream),
+                      "cudaMemcpyAsync(graph stage0 boundary output)");
+            } else {
+                if (mtp)
+                    check(cudaMemcpyAsync(
+                              workspace.final_hc, action.first,
+                              kQ38HyperWidth * sizeof(std::uint16_t),
+                              cudaMemcpyDeviceToDevice, workspace.stream),
+                          "cudaMemcpyAsync(graph final target HC)");
+                prepare_hyper(final_hyper, action.first);
+                cuda_gemv_bf16(output, workspace.mixed, workspace.logits, 1,
+                               stream, options.device);
+                cuda_argmax_bf16(workspace.logits, kVocabulary,
+                                 workspace.predictions, stream,
+                                 options.device);
+            }
+            return;
+        }
+        throw std::logic_error("unknown piecewise decode action");
+    }
+
+    std::pair<std::uintptr_t, std::uintptr_t> decode_graph_state_key() const {
+        const auto gdn = gdn_state->working(0);
+        const auto gdn_key = reinterpret_cast<std::uintptr_t>(gdn.conv);
+        const auto ple_key = ple_state
+                                  ? reinterpret_cast<std::uintptr_t>(
+                                        ple_state->working())
+                                  : std::uintptr_t{0};
+        return {gdn_key, ple_key};
+    }
+
+    DecodeGraphVariant* find_decode_graph_variant(
+        std::uintptr_t gdn_working, std::uintptr_t ple_working) const {
+        for (const auto& variant : decode_graphs) {
+            if (variant->gdn_working == gdn_working &&
+                variant->ple_working == ple_working)
+                return variant.get();
+        }
+        return nullptr;
+    }
+
+    DecodeGraphVariant& build_decode_graph_variant(
+        std::uintptr_t gdn_working, std::uintptr_t ple_working) {
+        // Each transaction alternates between two GDN/PLE working banks.  A
+        // graph records raw kernel pointers, so keep one variant per pointer
+        // pair rather than replaying a graph against the wrong bank.
+        if (decode_graphs.size() >= 2)
+            throw std::runtime_error(
+                "piecewise decode observed more than two state-bank variants");
+
+        auto variant = std::make_unique<DecodeGraphVariant>();
+        variant->gdn_working = gdn_working;
+        variant->ple_working = ple_working;
+        std::vector<std::vector<DecodeStaticAction>> pieces(1);
+        auto* current = workspace.hyper_a;
+        auto* alternate = workspace.hyper_b;
+        pieces.back().push_back(
+            {DecodeStaticActionKind::kInput, 0, nullptr, nullptr});
+
+        for (std::uint32_t layer_index = 0;
+             layer_index < layers.size(); ++layer_index) {
+            const auto& layer = layers[layer_index];
+            if (layer.has_ple) {
+                pieces.back().push_back({DecodeStaticActionKind::kPle,
+                                         layer_index, current, alternate});
+                std::swap(current, alternate);
+            }
+            pieces.back().push_back(
+                {DecodeStaticActionKind::kPrepareAttention, layer_index,
+                 current, nullptr});
+            if (layer.qsa) {
+                variant->qsa_layers.push_back(layer_index);
+                pieces.emplace_back();
+            } else {
+                pieces.back().push_back(
+                    {DecodeStaticActionKind::kGdn, layer_index, nullptr,
+                     nullptr});
+            }
+            pieces.back().push_back({DecodeStaticActionKind::kFinish,
+                                     layer_index, current, alternate});
+            std::swap(current, alternate);
+            pieces.back().push_back(
+                {DecodeStaticActionKind::kPrepareMoe, layer_index, current,
+                 nullptr});
+            pieces.back().push_back(
+                {DecodeStaticActionKind::kMoe, layer_index, nullptr,
+                 nullptr});
+            pieces.back().push_back({DecodeStaticActionKind::kFinish,
+                                     layer_index, current, alternate});
+            std::swap(current, alternate);
+        }
+        pieces.back().push_back(
+            {DecodeStaticActionKind::kOutput, 0, current, nullptr});
+        if (pieces.size() != variant->qsa_layers.size() + 1)
+            throw std::logic_error(
+                "piecewise decode fragment plan is inconsistent");
+
+        std::uint64_t nodes = 0;
+        for (const auto& piece : pieces) {
+            if (piece.empty())
+                throw std::logic_error(
+                    "piecewise decode produced an empty graph fragment");
+            auto graph = std::make_unique<CapturedCudaGraph>(
+                options.device, workspace.stream, [&]() {
+                    for (const auto& action : piece)
+                        enqueue_decode_static_action(action);
+                });
+            nodes += graph->nodes();
+            variant->fragments.push_back(std::move(graph));
+        }
+        metrics.cuda_graph_captures += variant->fragments.size();
+        metrics.cuda_graph_nodes += nodes;
+        auto* result = variant.get();
+        decode_graphs.push_back(std::move(variant));
+        return *result;
+    }
+
+    bool run_one_piecewise(std::uint32_t position) {
+        if (decode_graph_failed) {
+            ++metrics.cuda_graph_fallbacks;
+            return false;
+        }
+        check_cancelled();
+        // PLE I/O and both H2D copies stay outside capture.  During capture
+        // run_ple only records the GPU conversion/projection/convolution.
+        if (options.stage == Stage::kStage0) ensure_ple_ready(0, 0, 1);
+
+        const auto [gdn_key, ple_key] = decode_graph_state_key();
+        auto* variant = find_decode_graph_variant(gdn_key, ple_key);
+        if (!variant) {
+            // Surface setup/copy failures before classifying a later error as
+            // a graph-capture fallback.
+            check(cudaStreamSynchronize(workspace.stream),
+                  "cudaStreamSynchronize(piecewise graph setup)");
+            try {
+                variant = &build_decode_graph_variant(gdn_key, ple_key);
+            } catch (const std::exception& error) {
+                decode_graph_failed = true;
+                ++metrics.cuda_graph_fallbacks;
+                std::cerr
+                    << "{\"type\":\"q38_cuda_graph_fallback\",\"stage\":"
+                    << static_cast<unsigned>(options.stage)
+                    << ",\"error\":\"" << error.what() << "\"}\n";
+                return false;
+            }
+        }
+        if (!variant ||
+            variant->fragments.size() != variant->qsa_layers.size() + 1)
+            throw std::logic_error(
+                "piecewise decode graph variant is incomplete");
+
+        for (std::size_t index = 0; index < variant->qsa_layers.size();
+             ++index) {
+            check_cancelled();
+            variant->fragments[index]->launch(workspace.stream);
+            ++metrics.cuda_graph_replays;
+            run_qsa(layers[variant->qsa_layers[index]], position,
+                    *qsa_state);
+        }
+        check_cancelled();
+        variant->fragments.back()->launch(workspace.stream);
+        ++metrics.cuda_graph_replays;
+        return true;
+    }
+
     void check_cancelled() const {
         if (provisional_cancellation)
             provisional_cancellation->throw_if_requested();
@@ -1370,7 +1848,7 @@ struct CudaStageBackend::Impl {
         for (const auto& layer : layers) {
             check_cancelled();
             if (layer.has_ple) {
-                ensure_ple_ready(ple_index, 1);
+                ensure_ple_ready(result_index, ple_index, 1);
                 run_ple(layer, current, alternate, ple_index);
                 std::swap(current, alternate);
                 profile_mark("ple");
@@ -1464,10 +1942,11 @@ struct CudaStageBackend::Impl {
             for (const auto& layer : layers) {
                 check_cancelled();
                 if (layer.has_ple) {
-                    ensure_ple_ready(first, tokens);
+                    ensure_ple_ready(chunk_offset + first, first, tokens);
                     run_ple_prefill(layer, current, alternate, first, tokens);
                     std::swap(current, alternate);
-                    if (profile_prefill) profile_mark("ple");
+                    if (profile_prefill && !detailed_prefill_profile())
+                        profile_mark("ple");
                 }
                 prepare_hyper(layer.attention_hyper, current, tokens);
                 if (profile_prefill) profile_mark("attention_hyper");
@@ -1479,7 +1958,7 @@ struct CudaStageBackend::Impl {
                         tokens, *qsa_state);
                 else
                     run_gdn_prefill(layer, tokens);
-                if (profile_prefill)
+                if (profile_prefill && !detailed_prefill_profile())
                     profile_mark(layer.qsa ? "qsa" : "gdn");
                 finish_hyper(current, alternate, tokens);
                 std::swap(current, alternate);
@@ -1548,6 +2027,13 @@ struct CudaStageBackend::Impl {
             run_prefill(count, chunk_offset, write_result);
             return;
         }
+        if (options.enable_piecewise_decode_graph && !decode_profile &&
+            provisional_kind == TxnKind::kDecode && count == 1 &&
+            chunk_offset == 0 && write_result &&
+            run_one_piecewise(static_cast<std::uint32_t>(provisional_base))) {
+            qsa_state->mark_evaluated(provisional_epoch, 1);
+            return;
+        }
         for (std::uint32_t token = 0; token < count; ++token) {
             const auto data_index =
                 provisional_kind == TxnKind::kSpeculative
@@ -1563,9 +2049,13 @@ struct CudaStageBackend::Impl {
 
     void run_mtp_step(const std::uint16_t* target_hc,
                       const std::int32_t* token_device,
-                      std::uint32_t position, bool produce_prediction) {
+                      std::uint32_t position, bool produce_prediction,
+                      std::int32_t* prediction_output = nullptr,
+                      std::uint16_t* output_hc = nullptr) {
         if (!mtp || !mtp_qsa_state || !target_hc || !token_device)
             throw std::logic_error("MTP step is unavailable");
+        if (produce_prediction && !prediction_output)
+            throw std::logic_error("MTP prediction output is unavailable");
         auto stream = reinterpret_cast<void*>(workspace.stream);
 
         // Official Qwen MTP fusion: project the normalized current-token
@@ -1607,24 +2097,33 @@ struct CudaStageBackend::Impl {
             cuda_gemv_bf16(output, workspace.mixed, workspace.logits, 1,
                            stream, options.device);
             cuda_argmax_bf16(workspace.logits, kVocabulary,
-                             workspace.predictions, stream, options.device);
+                             prediction_output, stream, options.device);
         }
+        if (output_hc)
+            check(cudaMemcpyAsync(output_hc, current,
+                                  kQ38HyperWidth * sizeof(std::uint16_t),
+                                  cudaMemcpyDeviceToDevice, workspace.stream),
+                  "cudaMemcpyAsync(MTP recurrent HC)");
     }
 
     std::vector<std::int32_t> run_mtp_draft(
         std::int32_t pending_token, std::uint64_t position,
-        std::uint64_t retained_epoch,
+        std::uint32_t max_draft, std::uint64_t retained_epoch,
         const std::shared_ptr<CancellationToken>& cancellation) {
         if (cancellation) cancellation->throw_if_requested();
         if (options.stage != Stage::kStage1)
             throw std::runtime_error("stage0 cannot draft tokens");
         if (!mtp)
             throw std::logic_error("MTP is disabled for this executor");
-        if (pending_token < 0 ||
+        if (max_draft == 0 || max_draft > kMaximumMtpDraftWidth ||
+            max_draft > workspace.maximum_tokens ||
+            pending_token < 0 ||
             static_cast<std::uint32_t>(pending_token) >= kVocabulary ||
             position != committed_frontier || provisional_epoch != 0 ||
             !mtp_pending_valid || !mtp_qsa_state ||
             mtp_qsa_state->committed_tokens() + 1 != position ||
+            max_draft > mtp_qsa_state->capacity() -
+                            mtp_qsa_state->committed_tokens() ||
             mtp_transaction_active)
             throw std::runtime_error("MTP draft frontier is not ready");
 
@@ -1641,29 +2140,46 @@ struct CudaStageBackend::Impl {
                   "cudaMemcpyAsync(MTP token)");
             mtp_qsa_state->begin(epoch);
             active = true;
-            run_mtp_step(workspace.mtp_pending_hc, workspace.tokens,
-                         static_cast<std::uint32_t>(
-                             mtp_qsa_state->committed_tokens()),
-                         true);
-            mtp_qsa_state->mark_evaluated(epoch, 1);
+            const auto first_position = mtp_qsa_state->committed_tokens();
+            for (std::uint32_t index = 0; index < max_draft; ++index) {
+                if (cancellation) cancellation->throw_if_requested();
+                const auto* target_hc = index == 0
+                                            ? workspace.mtp_pending_hc
+                                            : workspace.mtp_candidate_hc;
+                const auto* token_device = index == 0
+                                               ? workspace.tokens
+                                               : workspace.predictions +
+                                                     index - 1;
+                run_mtp_step(
+                    target_hc, token_device,
+                    static_cast<std::uint32_t>(first_position + index), true,
+                    workspace.predictions + index,
+                    workspace.mtp_candidate_hc);
+                mtp_qsa_state->mark_evaluated(epoch, index + 1);
+            }
             check(cudaMemcpyAsync(workspace.host_predictions,
                                   workspace.predictions,
-                                  sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                  static_cast<std::uint64_t>(max_draft) *
+                                      sizeof(std::int32_t),
+                                  cudaMemcpyDeviceToHost,
                                   workspace.stream),
-                  "cudaMemcpyAsync(MTP prediction)");
+                  "cudaMemcpyAsync(MTP predictions)");
             check(cudaStreamSynchronize(workspace.stream),
                   "cudaStreamSynchronize(MTP draft)");
             if (cancellation) cancellation->throw_if_requested();
             if (retained_epoch != 0) {
                 mtp_transaction_active = true;
                 mtp_transaction_epoch = retained_epoch;
-                mtp_transaction_rows = 1;
+                mtp_transaction_rows = max_draft;
+                mtp_reconciled_rows = 1;
                 active = false;
             } else {
                 mtp_qsa_state->rollback(epoch);
                 active = false;
             }
-            return {workspace.host_predictions[0]};
+            return std::vector<std::int32_t>(workspace.host_predictions,
+                                             workspace.host_predictions +
+                                                 max_draft);
         } catch (...) {
             if (active) mtp_qsa_state->rollback(epoch);
             throw;
@@ -1777,8 +2293,10 @@ struct CudaStageBackend::Impl {
         const bool retained_draft = mtp_transaction_active;
         if (retained_draft) {
             if (mtp_transaction_epoch != epoch ||
-                mtp_transaction_rows != 1 || !mtp_pending_valid ||
-                evaluated < mtp_transaction_rows)
+                mtp_transaction_rows == 0 || !mtp_pending_valid ||
+                provisional_kind != TxnKind::kSpeculative ||
+                provisional_expected != mtp_transaction_rows + 1 ||
+                evaluated == 0 || evaluated > mtp_reconciled_rows)
                 throw std::runtime_error(
                     "retained MTP draft does not match target commit");
         } else {
@@ -1798,32 +2316,13 @@ struct CudaStageBackend::Impl {
                 mtp_transaction_epoch = 0;
                 throw;
             }
-        } else if (retained_draft && evaluated > mtp_transaction_rows) {
-            try {
-                for (std::uint32_t row = mtp_transaction_rows;
-                     row < evaluated; ++row) {
-                    const auto token = provisional_tokens.at(row);
-                    check(cudaMemcpyAsync(workspace.tokens, &token,
-                                          sizeof(token), cudaMemcpyHostToDevice,
-                                          workspace.stream),
-                          "cudaMemcpyAsync(retained MTP token)");
-                    run_mtp_step(
-                        workspace.final_hc +
-                            static_cast<std::uint64_t>(row - 1) *
-                                kQ38HyperWidth,
-                        workspace.tokens,
-                        static_cast<std::uint32_t>(prior_pairs + row), false);
-                    mtp_transaction_rows = row + 1;
-                    mtp_qsa_state->mark_evaluated(
-                        mtp_transaction_epoch, mtp_transaction_rows);
-                }
-            } catch (...) {
-                mtp_qsa_state->rollback(mtp_transaction_epoch);
-                mtp_transaction_active = false;
-                mtp_transaction_epoch = 0;
-                mtp_transaction_rows = 0;
-                throw;
-            }
+        } else if (retained_draft) {
+            // Row zero was retained from canonical target HC. Each deeper
+            // accepted row was reconciled online immediately after the
+            // preceding target row verified its draft, overlapping GPU0's
+            // one-row lookahead. Commit only the reconciled prefix; there is
+            // no serial MTP repair loop on the commit path.
+            mtp_transaction_rows = evaluated;
         }
         check(cudaMemcpyAsync(
                   workspace.mtp_candidate_hc,
@@ -1885,64 +2384,128 @@ struct CudaStageBackend::Impl {
         mtp_candidate_pending_valid = true;
     }
 
-    void start_ple_read(const std::vector<std::int32_t>& token_ids) {
-        if (!ple_reader || ple_read_active)
-            throw std::logic_error("PLE reader is not ready");
-        auto candidate = candidate_ple_hashes.empty()
-                             ? *committed_ple_hash
-                             : candidate_ple_hashes.back();
-        std::vector<std::uint64_t> all_rows;
-        all_rows.reserve(token_ids.size() * kQ38PleRowsPerToken);
-        for (const auto token : token_ids) {
-            const auto rows = candidate.rows({token});
-            all_rows.insert(all_rows.end(), rows.begin(), rows.end());
-            candidate_ple_hashes.push_back(candidate);
-        }
-        ple_read_bytes = all_rows.size() * kQ38PleRowWidth;
-        ple_read_scales = all_rows.size();
-        ple_reader->submit(std::move(all_rows), workspace.host_ple_rows,
-                           ple_read_bytes, workspace.host_ple_scales,
-                           ple_read_scales);
+    void start_ple_prefetch(
+        const SessionTxnV1& txn,
+        const std::vector<std::int32_t>& token_ids,
+        const std::shared_ptr<CancellationToken>& cancellation) {
+        if (options.stage != Stage::kStage0 || !ple_reader ||
+            !committed_ple_hash || txn.kind != TxnKind::kAppendKnown ||
+            txn.status != TxnStatus::kPrepared || txn.epoch == 0 ||
+            txn.epoch <= committed_epoch ||
+            txn.base_target != committed_frontier ||
+            token_ids.size() != txn.evaluated_count || token_ids.empty() ||
+            token_ids.size() <= options.max_transaction_tokens ||
+            provisional_epoch != 0 || states_active || ple_read_active)
+            throw std::logic_error("invalid PLE transaction read-ahead");
+        if (cancellation) cancellation->throw_if_requested();
+        auto candidate = *committed_ple_hash;
+        auto rows = candidate.rows(token_ids);
+        if (cancellation) cancellation->throw_if_requested();
+        ple_read_rows =
+            std::make_shared<const std::vector<std::uint64_t>>(
+                std::move(rows));
+        ple_read_token_base = 0;
+        ple_read_epoch = txn.epoch;
+        ple_reader->submit(ple_read_rows);
         ple_read_active = true;
     }
 
-    void ensure_ple_ready(std::uint32_t token_offset,
+    void start_ple_read(const std::vector<std::int32_t>& token_ids,
+                        std::uint32_t token_offset) {
+        if (!ple_reader)
+            throw std::logic_error("PLE reader is unavailable");
+        auto candidate = candidate_ple_hashes.empty()
+                             ? *committed_ple_hash
+                             : candidate_ple_hashes.back();
+        std::vector<std::uint64_t> chunk_rows;
+        chunk_rows.reserve(token_ids.size() * kQ38PleRowsPerToken);
+        for (const auto token : token_ids) {
+            const auto rows = candidate.rows({token});
+            chunk_rows.insert(chunk_rows.end(), rows.begin(), rows.end());
+            candidate_ple_hashes.push_back(candidate);
+        }
+        if (ple_read_active) {
+            if (ple_read_epoch != provisional_epoch || !ple_read_rows ||
+                token_offset < ple_read_token_base)
+                throw std::logic_error("PLE read-ahead transaction differs");
+            const auto first = static_cast<std::size_t>(
+                                   token_offset - ple_read_token_base) *
+                               kQ38PleRowsPerToken;
+            if (first > ple_read_rows->size() ||
+                chunk_rows.size() > ple_read_rows->size() - first ||
+                !std::equal(chunk_rows.begin(), chunk_rows.end(),
+                            ple_read_rows->begin() +
+                                static_cast<std::ptrdiff_t>(first)))
+                throw std::logic_error("PLE read-ahead rows differ");
+            return;
+        }
+        ple_read_rows = std::make_shared<const std::vector<std::uint64_t>>(
+            std::move(chunk_rows));
+        ple_read_token_base = token_offset;
+        ple_read_epoch = provisional_epoch;
+        ple_reader->submit(ple_read_rows);
+        ple_read_active = true;
+    }
+
+    void ensure_ple_ready(std::uint32_t transaction_token_offset,
+                          std::uint32_t workspace_token_offset,
                           std::uint32_t tokens) {
         if (!ple_read_active) return;
+        if (!ple_read_rows ||
+            transaction_token_offset < ple_read_token_base)
+            throw std::logic_error("PLE read-ahead range is unavailable");
+        const auto local_token_offset =
+            transaction_token_offset - ple_read_token_base;
         const auto first_row =
-            static_cast<std::size_t>(token_offset) * kQ38PleRowsPerToken;
+            static_cast<std::size_t>(local_token_offset) *
+            kQ38PleRowsPerToken;
         const auto row_count =
             static_cast<std::size_t>(tokens) * kQ38PleRowsPerToken;
         const auto required_rows = first_row + row_count;
+        if (first_row > ple_read_rows->size() ||
+            row_count > ple_read_rows->size() - first_row)
+            throw std::logic_error("PLE read-ahead extent is invalid");
+        const auto workspace_first_row =
+            static_cast<std::size_t>(workspace_token_offset) *
+            kQ38PleRowsPerToken;
+        const auto byte_offset = workspace_first_row * kQ38PleRowWidth;
+        const auto byte_count = row_count * kQ38PleRowWidth;
         try {
-            ple_reader->wait_until(required_rows);
-            if (required_rows == ple_read_scales) ple_read_active = false;
+            ple_reader->take(
+                first_row, row_count,
+                workspace.host_ple_rows + byte_offset, byte_count,
+                workspace.host_ple_scales + workspace_first_row, row_count);
         } catch (...) {
             ple_read_active = false;
+            ple_read_rows.reset();
             throw;
         }
-        const auto byte_offset = first_row * kQ38PleRowWidth;
-        const auto byte_count = row_count * kQ38PleRowWidth;
         check(cudaMemcpyAsync(workspace.ple_rows + byte_offset,
                               workspace.host_ple_rows + byte_offset,
                               byte_count, cudaMemcpyHostToDevice,
                               workspace.stream),
               "cudaMemcpyAsync(PLE row tile)");
         check(cudaMemcpyAsync(
-                  workspace.ple_scales + first_row,
-                  workspace.host_ple_scales + first_row,
+                  workspace.ple_scales + workspace_first_row,
+                  workspace.host_ple_scales + workspace_first_row,
                   row_count * sizeof(std::uint16_t),
                   cudaMemcpyHostToDevice, workspace.stream),
               "cudaMemcpyAsync(PLE scale tile)");
+        if (required_rows == ple_read_rows->size()) {
+            ple_read_active = false;
+            ple_read_rows.reset();
+            ple_read_epoch = 0;
+            ple_read_token_base = 0;
+        }
     }
 
     void drain_ple_read() noexcept {
         if (!ple_read_active) return;
-        try {
-            ple_reader->wait();
-        } catch (...) {
-        }
+        ple_reader->cancel();
         ple_read_active = false;
+        ple_read_rows.reset();
+        ple_read_epoch = 0;
+        ple_read_token_base = 0;
     }
 
     static CudaDeviceWeightStore make_weights_for_device(
@@ -1986,6 +2549,7 @@ struct CudaStageBackend::Impl {
     std::uint64_t provisional_base = 0;
     std::uint32_t provisional_expected = 0;
     std::uint32_t provisional_processed = 0;
+    std::uint32_t speculative_checkpoint_count = 0;
     TxnKind provisional_kind = TxnKind::kInvalid;
     bool states_active = false;
     bool mtp_pending_valid = false;
@@ -1993,13 +2557,17 @@ struct CudaStageBackend::Impl {
     bool mtp_transaction_active = false;
     std::uint64_t mtp_transaction_epoch = 0;
     std::uint32_t mtp_transaction_rows = 0;
+    std::uint32_t mtp_reconciled_rows = 0;
     bool ple_read_active = false;
-    std::size_t ple_read_bytes = 0;
-    std::size_t ple_read_scales = 0;
+    std::shared_ptr<const std::vector<std::uint64_t>> ple_read_rows;
+    std::uint32_t ple_read_token_base = 0;
+    std::uint64_t ple_read_epoch = 0;
     std::unique_ptr<CudaEventProfile> decode_profile;
     std::unique_ptr<CudaEventProfile> prefill_profile;
     mutable std::uint64_t tracked_peak_bytes = 0;
     StageBackendMetricsV1 metrics{};
+    bool decode_graph_failed = false;
+    std::vector<std::unique_ptr<DecodeGraphVariant>> decode_graphs;
 };
 
 CudaStageBackend::CudaStageBackend(DeviceStageIndexV1 index,
@@ -2010,6 +2578,16 @@ CudaStageBackend::CudaStageBackend(DeviceStageIndexV1 index,
 CudaStageBackend::~CudaStageBackend() = default;
 
 Stage CudaStageBackend::stage() const { return impl_->options.stage; }
+
+void CudaStageBackend::prefetch_transaction(
+    const SessionTxnV1& txn,
+    const std::vector<std::int32_t>& token_ids,
+    std::shared_ptr<CancellationToken> cancellation) {
+    auto& state = *impl_;
+    check(cudaSetDevice(state.options.device),
+          "cudaSetDevice(PLE transaction read-ahead)");
+    state.start_ple_prefetch(txn, token_ids, cancellation);
+}
 
 StageOutput CudaStageBackend::execute(StageInput input) {
     auto& state = *impl_;
@@ -2047,6 +2625,7 @@ StageOutput CudaStageBackend::execute(StageInput input) {
         state.provisional_base = input.txn.base_target;
         state.provisional_expected = input.txn.evaluated_count;
         state.provisional_processed = 0;
+        state.speculative_checkpoint_count = 0;
         state.provisional_kind = input.txn.kind;
         state.provisional_tokens.clear();
         state.provisional_tokens.reserve(input.txn.evaluated_count);
@@ -2059,7 +2638,8 @@ StageOutput CudaStageBackend::execute(StageInput input) {
             input.txn.kind == TxnKind::kSpeculative &&
             state.mtp_transaction_active &&
             state.mtp_transaction_epoch == input.txn.epoch &&
-            state.mtp_transaction_rows == 1;
+            state.mtp_transaction_rows != 0 &&
+            state.mtp_transaction_rows + 1 == input.txn.evaluated_count;
         if (state.mtp_transaction_active && !retained_mtp_draft)
             throw std::runtime_error(
                 "retained MTP draft does not match target transaction");
@@ -2067,6 +2647,7 @@ StageOutput CudaStageBackend::execute(StageInput input) {
             state.mtp_transaction_active = false;
             state.mtp_transaction_epoch = 0;
             state.mtp_transaction_rows = 0;
+            state.mtp_reconciled_rows = 0;
         }
         state.mtp_candidate_pending_valid = false;
         state.gdn_state->begin(input.txn.epoch, state.workspace.stream);
@@ -2116,7 +2697,7 @@ StageOutput CudaStageBackend::execute(StageInput input) {
                                          state.workspace.stream),
                                      state.options.device);
     } else {
-        state.start_ple_read(input.token_ids);
+        state.start_ple_read(input.token_ids, input.chunk_offset);
     }
 
     state.provisional_tokens.insert(state.provisional_tokens.end(),
@@ -2236,17 +2817,61 @@ std::vector<std::int32_t> CudaStageBackend::draft(
     std::shared_ptr<CancellationToken> cancellation) {
     auto& state = *impl_;
     if (max_draft == 0) return {};
-    return state.run_mtp_draft(pending_token, position, 0, cancellation);
+    return state.run_mtp_draft(pending_token, position, max_draft, 0,
+                               cancellation);
 }
 
 std::vector<std::int32_t> CudaStageBackend::draft_retained(
     std::int32_t pending_token, std::uint64_t position,
-    std::uint64_t transaction_epoch,
+    std::uint32_t max_draft, std::uint64_t transaction_epoch,
     std::shared_ptr<CancellationToken> cancellation) {
-    if (transaction_epoch == 0)
-        throw std::invalid_argument("retained MTP draft epoch is zero");
-    return impl_->run_mtp_draft(pending_token, position, transaction_epoch,
-                                cancellation);
+    if (max_draft == 0 || transaction_epoch == 0)
+        throw std::invalid_argument("retained MTP draft extent is invalid");
+    return impl_->run_mtp_draft(pending_token, position, max_draft,
+                                transaction_epoch, cancellation);
+}
+
+void CudaStageBackend::checkpoint_speculative_prefix(
+    std::uint64_t transaction_epoch, std::uint32_t prefix_tokens) {
+    auto& state = *impl_;
+    check(cudaSetDevice(state.options.device),
+          "cudaSetDevice(speculative prefix checkpoint)");
+    if (state.options.stage != Stage::kStage0 ||
+        state.provisional_epoch != transaction_epoch ||
+        state.provisional_kind != TxnKind::kSpeculative ||
+        !state.states_active || prefix_tokens == 0 ||
+        prefix_tokens != state.provisional_processed ||
+        prefix_tokens >= state.provisional_expected)
+        throw std::runtime_error("speculative prefix checkpoint is invalid");
+    state.gdn_state->checkpoint(state.workspace.stream);
+    if (state.ple_state)
+        state.ple_state->checkpoint(state.workspace.stream);
+    state.speculative_checkpoint_count = prefix_tokens;
+}
+
+void CudaStageBackend::reconcile_retained_draft(
+    std::uint64_t transaction_epoch, std::uint32_t target_row) {
+    auto& state = *impl_;
+    check(cudaSetDevice(state.options.device),
+          "cudaSetDevice(reconcile retained MTP draft)");
+    if (state.options.stage != Stage::kStage1 || !state.mtp ||
+        !state.mtp_qsa_state || !state.mtp_transaction_active ||
+        state.mtp_transaction_epoch != transaction_epoch ||
+        state.provisional_epoch != transaction_epoch ||
+        state.provisional_kind != TxnKind::kSpeculative ||
+        target_row >= state.mtp_transaction_rows ||
+        state.provisional_processed != target_row + 1 ||
+        state.mtp_reconciled_rows != target_row + 1)
+        throw std::runtime_error("retained MTP reconciliation is invalid");
+    state.check_cancelled();
+    const auto prior_pairs = state.mtp_qsa_state->committed_tokens();
+    state.run_mtp_step(
+        state.workspace.final_hc +
+            static_cast<std::uint64_t>(target_row) * kQ38HyperWidth,
+        state.workspace.predictions + target_row,
+        static_cast<std::uint32_t>(prior_pairs + target_row + 1), false);
+    state.mtp_qsa_state->mark_evaluated(transaction_epoch, target_row + 2);
+    state.mtp_reconciled_rows = target_row + 2;
 }
 
 void CudaStageBackend::abandon_retained_draft(
@@ -2256,36 +2881,63 @@ void CudaStageBackend::abandon_retained_draft(
           "cudaSetDevice(abandon MTP draft)");
     if (!state.mtp_transaction_active) return;
     if (state.mtp_transaction_epoch != transaction_epoch ||
-        state.mtp_transaction_rows != 1)
+        state.mtp_transaction_rows == 0)
         throw std::runtime_error("retained MTP draft epoch mismatch");
     state.mtp_qsa_state->rollback(state.mtp_transaction_epoch);
     state.mtp_transaction_active = false;
     state.mtp_transaction_epoch = 0;
     state.mtp_transaction_rows = 0;
+    state.mtp_reconciled_rows = 0;
 }
 
 void CudaStageBackend::commit(std::uint64_t epoch,
                               std::uint32_t state_commit_count) {
     auto& state = *impl_;
     check(cudaSetDevice(state.options.device), "cudaSetDevice(stage commit)");
+    const bool complete =
+        state.provisional_processed == state.provisional_expected;
+    const bool online_exact =
+        state.provisional_kind == TxnKind::kSpeculative &&
+        state.provisional_processed == state_commit_count &&
+        state.provisional_processed < state.provisional_expected;
+    const bool online_lookahead =
+        state.options.stage == Stage::kStage0 &&
+        state.provisional_kind == TxnKind::kSpeculative &&
+        state.provisional_processed == state_commit_count + 1 &&
+        state.speculative_checkpoint_count == state_commit_count;
     if (epoch != state.provisional_epoch || !state.states_active ||
-        state.provisional_processed != state.provisional_expected ||
         state_commit_count == 0 ||
-        state_commit_count > state.provisional_processed)
+        state_commit_count > state.provisional_processed ||
+        (!complete && !online_exact && !online_lookahead))
         throw std::runtime_error("CUDA backend commit does not match transaction");
     if (state_commit_count < state.provisional_processed) {
-        state.gdn_state->restore(state.workspace.stream);
-        if (state.ple_state) state.ple_state->restore(state.workspace.stream);
-        if (state.options.stage == Stage::kStage0 && state.ple_reader) {
-            state.drain_ple_read();
-            state.candidate_ple_hashes.clear();
-            state.start_ple_read(std::vector<std::int32_t>(
-                state.provisional_tokens.begin(),
-                state.provisional_tokens.begin() + state_commit_count));
+        if (online_lookahead) {
+            // Stage0 may be exactly one row ahead when stage1 observes the
+            // first mismatch. Restore the prefix captured before that row;
+            // QSA is append-only and commits the shorter extent directly.
+            state.gdn_state->restore_checkpoint(state.workspace.stream);
+            if (state.ple_state)
+                state.ple_state->restore_checkpoint(state.workspace.stream);
+            check(cudaStreamSynchronize(state.workspace.stream),
+                  "cudaStreamSynchronize(speculative checkpoint restore)");
+        } else {
+            // Non-retained speculative callers still use the conservative
+            // replay path until they adopt online prefix checkpoints.
+            state.gdn_state->restore(state.workspace.stream);
+            if (state.ple_state)
+                state.ple_state->restore(state.workspace.stream);
+            if (state.options.stage == Stage::kStage0 && state.ple_reader) {
+                state.drain_ple_read();
+                state.candidate_ple_hashes.clear();
+                state.start_ple_read(std::vector<std::int32_t>(
+                    state.provisional_tokens.begin(),
+                    state.provisional_tokens.begin() + state_commit_count),
+                    0);
+            }
+            state.run_tokens(state_commit_count, 0, false);
+            check(cudaStreamSynchronize(state.workspace.stream),
+                  "cudaStreamSynchronize(partial replay)");
         }
-        state.run_tokens(state_commit_count, 0, false);
-        check(cudaStreamSynchronize(state.workspace.stream),
-              "cudaStreamSynchronize(partial replay)");
     }
     if (state.options.stage == Stage::kStage1 && state.mtp) {
         if (state.provisional_kind == TxnKind::kAppendKnown) {
@@ -2310,6 +2962,7 @@ void CudaStageBackend::commit(std::uint64_t epoch,
         state.mtp_transaction_active = false;
         state.mtp_transaction_epoch = 0;
         state.mtp_transaction_rows = 0;
+        state.mtp_reconciled_rows = 0;
     }
     if (state.options.stage == Stage::kStage1 && state.mtp) {
         check(cudaMemcpyAsync(state.workspace.mtp_pending_hc,
@@ -2327,6 +2980,7 @@ void CudaStageBackend::commit(std::uint64_t epoch,
     state.provisional_epoch = 0;
     state.provisional_expected = 0;
     state.provisional_processed = 0;
+    state.speculative_checkpoint_count = 0;
     state.provisional_kind = TxnKind::kInvalid;
     state.provisional_tokens.clear();
     state.provisional_cancellation.reset();
@@ -2372,6 +3026,7 @@ void CudaStageBackend::rollback(std::uint64_t epoch) {
     state.provisional_epoch = 0;
     state.provisional_expected = 0;
     state.provisional_processed = 0;
+    state.speculative_checkpoint_count = 0;
     state.provisional_kind = TxnKind::kInvalid;
     state.provisional_tokens.clear();
     state.provisional_cancellation.reset();
@@ -2411,6 +3066,7 @@ void CudaStageBackend::reset_session() {
     state.mtp_candidate_pending_valid = false;
     state.mtp_transaction_epoch = 0;
     state.mtp_transaction_rows = 0;
+    state.mtp_reconciled_rows = 0;
 }
 
 StageBackendMetricsV1 CudaStageBackend::metrics() const {
@@ -2431,7 +3087,7 @@ StageBackendMetricsV1 CudaStageBackend::metrics() const {
     result.weight_preserved_other_bytes =
         weight_stats.preserved_other_bytes;
     result.qsa_state_bytes = state.qsa_state->allocated_bytes();
-    result.gdn_state_bytes = 2ull * state.gdn_state->bytes_per_bank();
+    result.gdn_state_bytes = state.gdn_state->allocated_bytes();
     result.ple_state_bytes =
         state.ple_state ? state.ple_state->allocated_bytes() : 0;
     result.mtp_state_bytes = state.workspace.mtp_state_bytes +
@@ -2506,7 +3162,7 @@ std::unique_ptr<DualStageExecutor> make_cuda_executor(
     const std::string& ple_path, const ExecutorOptions& executor_options,
     int stage0_device, int stage1_device, std::uint64_t ple_cache_bytes,
     PleIoModeV1 ple_io_mode, std::uint32_t ple_queue_depth,
-    bool enable_mtp) {
+    bool enable_mtp, bool enable_piecewise_decode_graph) {
     std::string identity_error;
     if (!validate_session_identity(executor_options.identity,
                                    &identity_error) ||
@@ -2529,10 +3185,13 @@ std::unique_ptr<DualStageExecutor> make_cuda_executor(
     options0.device = stage0_device;
     options0.max_transaction_tokens = executor_options.append_chunk_tokens;
     options0.context_capacity = executor_options.context_limit;
+    options0.enable_speculative_checkpoint = enable_mtp;
+    options0.enable_piecewise_decode_graph = enable_piecewise_decode_graph;
     CudaStageBackendOptions options1 = options0;
     options1.stage = Stage::kStage1;
     options1.device = stage1_device;
     options1.enable_mtp = enable_mtp;
+    options1.enable_speculative_checkpoint = false;
     auto production_executor_options = executor_options;
     production_executor_options.backend_failure_is_fatal = true;
     return std::make_unique<DualStageExecutor>(

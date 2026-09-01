@@ -9,6 +9,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -65,6 +67,13 @@ void validate_grouped_mode(Q38PrefillMoeModeV1 mode) {
         throw std::invalid_argument("invalid grouped prefill MoE mode");
 }
 
+bool shared_moe_activation_tile_enabled() {
+    const char* value = std::getenv("Q38_CUDA_PREFILL_MOE_A");
+    return value && (std::strcmp(value, "shared") == 0 ||
+                     std::strcmp(value, "1") == 0 ||
+                     std::strcmp(value, "true") == 0);
+}
+
 __device__ __forceinline__ float load_bf16(const std::uint16_t* source,
                                             std::uint64_t index) {
     return __bfloat162float(
@@ -102,6 +111,39 @@ __device__ __forceinline__ __nv_bfloat16 dequant_weight_bf16(
         if (quantized >= 8) quantized -= 16;
     }
     return __float2bfloat16_rn(static_cast<float>(quantized) * scale);
+}
+
+template <bool Tiled>
+__device__ __forceinline__ __nv_bfloat162 dequant_weight_pair_w4_bf16(
+    const void* data, std::uint64_t matrix_elements, std::uint32_t columns,
+    std::uint32_t expert, std::uint32_t row, std::uint32_t first_column,
+    float scale) {
+    const std::uint64_t local =
+        static_cast<std::uint64_t>(row) * columns + first_column;
+    std::uint64_t packed_index = 0;
+    if constexpr (Tiled) {
+        constexpr std::uint32_t kTile = 16;
+        constexpr std::uint32_t kTileBytes = kTile * kTile / 2;
+        const auto tile =
+            static_cast<std::uint64_t>(row / kTile) * (columns / kTile) +
+            first_column / kTile;
+        packed_index =
+            static_cast<std::uint64_t>(expert) * (matrix_elements / 2) +
+            tile * kTileBytes + (row % kTile) * (kTile / 2) +
+            (first_column % kTile) / 2;
+    } else {
+        packed_index =
+            static_cast<std::uint64_t>(expert) * (matrix_elements / 2) +
+            (local >> 1);
+    }
+    const auto packed =
+        static_cast<const std::uint8_t*>(data)[packed_index];
+    int low = packed & 0x0f;
+    int high = packed >> 4;
+    if (low >= 8) low -= 16;
+    if (high >= 8) high -= 16;
+    return __floats2bfloat162_rn(static_cast<float>(low) * scale,
+                                static_cast<float>(high) * scale);
 }
 
 __device__ __forceinline__ std::uint64_t hash_word(std::uint64_t hash,
@@ -154,8 +196,15 @@ __global__ void build_route_plan_kernel(
     __syncthreads();
 
     std::uint32_t count = 0;
-    for (std::uint32_t assignment = 0; assignment < routes; ++assignment)
-        count += route_experts[assignment] == lane ? 1u : 0u;
+    for (std::uint32_t assignment = 0; assignment < routes; ++assignment) {
+        if (route_experts[assignment] != lane) continue;
+        // Preserve the assignment's stable rank within this expert while the
+        // expert-owned lane is already doing the counting pass.  After the
+        // global offsets exist, every thread can scatter assignments in O(N)
+        // total work instead of making every expert scan all routes again.
+        plan.assignment_to_packed[assignment] = count;
+        ++count;
+    }
     plan.expert_counts[lane] = static_cast<std::uint16_t>(count);
     __syncthreads();
 
@@ -184,12 +233,15 @@ __global__ void build_route_plan_kernel(
     }
     __syncthreads();
 
-    std::uint32_t packed = plan.expert_offsets[lane];
-    for (std::uint32_t assignment = 0; assignment < routes; ++assignment) {
-        if (route_experts[assignment] != lane) continue;
+    for (std::uint32_t assignment = lane; assignment < routes;
+         assignment += blockDim.x) {
+        const auto expert = route_experts[assignment];
+        if (expert == kInvalidExpert) continue;
+        const std::uint32_t packed =
+            plan.expert_offsets[expert] +
+            plan.assignment_to_packed[assignment];
         plan.packed_assignment[packed] = assignment;
         plan.assignment_to_packed[assignment] = packed;
-        ++packed;
     }
     const std::uint32_t expert_count = plan.expert_counts[lane];
     const std::uint32_t expert_tasks =
@@ -253,7 +305,7 @@ __global__ void pack_hidden_kernel(const std::uint16_t* hidden,
                    column];
 }
 
-template <int WeightBits>
+template <int WeightBits, bool Tiled = false, bool SharedA = true>
 __global__ void grouped_gate_up_kernel(
     const void* data, const std::uint16_t* scales,
     const std::uint16_t* packed_hidden,
@@ -267,15 +319,15 @@ __global__ void grouped_gate_up_kernel(
     const std::uint32_t lane = threadIdx.x & 31;
     const std::uint32_t projection = warp / 4;
     const std::uint32_t output_slice = warp & 3;
-    const std::uint32_t middle_base = blockIdx.x * 64 + output_slice * 16;
-    const std::uint32_t weight_row_base =
-        projection * kQ38MoeIntermediate + middle_base;
-
     extern __shared__ unsigned char shared_raw[];
     auto* shared_a = reinterpret_cast<__nv_bfloat16*>(shared_raw);
-    auto* shared_b = shared_a + kWmmaTile * kWmmaTile;
+    constexpr std::uint32_t kSharedATiles = SharedA ? 1 : kMmqWarps;
+    auto* shared_b = shared_a + kSharedATiles * kWmmaTile * kWmmaTile;
     auto* shared_accum = reinterpret_cast<float*>(
         shared_b + kMmqWarps * kWmmaTile * kWmmaTile);
+    auto* warp_a =
+        shared_a + (SharedA ? 0 : warp * kWmmaTile * kWmmaTile);
+    auto* warp_b = shared_b + warp * kWmmaTile * kWmmaTile;
 
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
                    wmma::row_major>
@@ -292,81 +344,126 @@ __global__ void grouped_gate_up_kernel(
         static_cast<std::uint64_t>(rows) * columns;
     constexpr std::uint64_t matrix_scale_elements =
         static_cast<std::uint64_t>(rows) * (columns / 128);
+    float w4_row_scales[4] = {};
     for (std::uint32_t column_base = 0; column_base < columns;
          column_base += kWmmaTile) {
-        const std::uint32_t a_index = threadIdx.x;
-        const std::uint32_t local_row = a_index / kWmmaTile;
-        const std::uint32_t local_column = a_index % kWmmaTile;
-        if (local_row < task.valid_rows) {
-            const std::uint64_t packed_row = task.packed_begin + local_row;
-            shared_a[a_index] = reinterpret_cast<const __nv_bfloat16*>(
-                packed_hidden)[packed_row * columns + column_base +
-                               local_column];
-        } else {
-            shared_a[a_index] = __float2bfloat16_rn(0.0f);
+        constexpr std::uint32_t kPackedTileElements =
+            kWmmaTile * kWmmaTile / 2;
+        const std::uint32_t a_lane = SharedA ? threadIdx.x : lane;
+        const std::uint32_t a_stride = SharedA ? blockDim.x : 32;
+        for (std::uint32_t pair = a_lane; pair < kPackedTileElements;
+             pair += a_stride) {
+            const std::uint32_t local_row = pair / (kWmmaTile / 2);
+            const std::uint32_t pair_column = pair % (kWmmaTile / 2);
+            if (local_row < task.valid_rows) {
+                const std::uint64_t packed_row =
+                    task.packed_begin + local_row;
+                reinterpret_cast<__nv_bfloat162*>(warp_a)[pair] =
+                    reinterpret_cast<const __nv_bfloat162*>(packed_hidden)[
+                        (packed_row * columns + column_base) / 2 +
+                        pair_column];
+            } else {
+                reinterpret_cast<__nv_bfloat162*>(warp_a)[pair] =
+                    __floats2bfloat162_rn(0.0f, 0.0f);
+            }
         }
-        for (std::uint32_t b_index = threadIdx.x;
-             b_index < kMmqWarps * kWmmaTile * kWmmaTile;
-             b_index += blockDim.x) {
-            const std::uint32_t target_warp =
-                b_index / (kWmmaTile * kWmmaTile);
-            const std::uint32_t element =
-                b_index % (kWmmaTile * kWmmaTile);
-            const std::uint32_t output_column = element / kWmmaTile;
-            const std::uint32_t k_column = element % kWmmaTile;
-            const std::uint32_t target_projection = target_warp / 4;
-            const std::uint32_t target_slice = target_warp & 3;
-            const std::uint32_t weight_row =
-                target_projection * kQ38MoeIntermediate + blockIdx.x * 64 +
-                target_slice * 16 + output_column;
-            shared_b[b_index] = dequant_weight_bf16<WeightBits>(
-                data, scales, matrix_elements, matrix_scale_elements, columns,
-                task.expert, weight_row, column_base + k_column);
+        if constexpr (WeightBits == 8) {
+            for (std::uint32_t element = lane;
+                 element < kWmmaTile * kWmmaTile; element += 32) {
+                const std::uint32_t output_column = element / kWmmaTile;
+                const std::uint32_t k_column = element % kWmmaTile;
+                const std::uint32_t weight_row =
+                    projection * kQ38MoeIntermediate + blockIdx.x * 64 +
+                    output_slice * 16 + output_column;
+                warp_b[element] = dequant_weight_bf16<8>(
+                    data, scales, matrix_elements, matrix_scale_elements,
+                    columns, task.expert, weight_row,
+                    column_base + k_column);
+            }
         }
-        __syncthreads();
-        wmma::load_matrix_sync(a_fragment, shared_a, kWmmaTile);
-        wmma::load_matrix_sync(
-            b_fragment,
-            shared_b + warp * kWmmaTile * kWmmaTile, kWmmaTile);
+        if constexpr (WeightBits == 4) {
+#pragma unroll
+            for (std::uint32_t iteration = 0; iteration < 4; ++iteration) {
+                if ((column_base & 127u) != 0) continue;
+                const std::uint32_t packed_element = lane + iteration * 32;
+                const std::uint32_t output_column =
+                    packed_element / (kWmmaTile / 2);
+                const std::uint32_t weight_row =
+                    projection * kQ38MoeIntermediate + blockIdx.x * 64 +
+                    output_slice * 16 + output_column;
+                float scale = 0.0f;
+                if ((lane & 7u) == 0)
+                    scale = load_bf16(
+                        scales,
+                        static_cast<std::uint64_t>(task.expert) *
+                                matrix_scale_elements +
+                            static_cast<std::uint64_t>(weight_row) *
+                                (columns / 128) +
+                            column_base / 128);
+                w4_row_scales[iteration] = __shfl_sync(
+                    0xffffffffu, scale, static_cast<int>(lane & ~7u));
+            }
+#pragma unroll
+            for (std::uint32_t packed_element = lane;
+                 packed_element < kPackedTileElements;
+                 packed_element += 32) {
+                const std::uint32_t output_column =
+                    packed_element / (kWmmaTile / 2);
+                const std::uint32_t pair_column =
+                    packed_element % (kWmmaTile / 2);
+                const std::uint32_t weight_row =
+                    projection * kQ38MoeIntermediate + blockIdx.x * 64 +
+                    output_slice * 16 + output_column;
+                reinterpret_cast<__nv_bfloat162*>(warp_b)[packed_element] =
+                    dequant_weight_pair_w4_bf16<Tiled>(
+                        data, matrix_elements, columns, task.expert, weight_row,
+                        column_base + pair_column * 2,
+                        w4_row_scales[packed_element / 32]);
+            }
+        }
+        if constexpr (SharedA)
+            __syncthreads();
+        else
+            __syncwarp();
+        wmma::load_matrix_sync(a_fragment, warp_a, kWmmaTile);
+        wmma::load_matrix_sync(b_fragment, warp_b, kWmmaTile);
         wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
-        __syncthreads();
+        // Every warp consumes the same activation tile.  Do not let the first
+        // warp reaching the next K tile overwrite it while a sibling warp is
+        // still issuing its current WMMA load.
+        if constexpr (SharedA) __syncthreads();
     }
     wmma::store_matrix_sync(
         shared_accum + warp * kWmmaTile * kWmmaTile, accumulator, kWmmaTile,
         wmma::mem_row_major);
     __syncthreads();
 
-    for (std::uint32_t element = threadIdx.x;
-         element < kWmmaTile * 64; element += blockDim.x) {
-        const std::uint32_t local_row = element / 64;
-        const std::uint32_t middle_column = element % 64;
-        if (local_row >= task.valid_rows) continue;
-        const std::uint32_t fragment = middle_column / kWmmaTile;
-        const std::uint32_t fragment_column = middle_column % kWmmaTile;
-        const std::uint32_t fragment_index =
-            local_row * kWmmaTile + fragment_column;
-        const float gate = __bfloat162float(__float2bfloat16_rn(
-            shared_accum[fragment * kWmmaTile * kWmmaTile +
-                         fragment_index]));
-        const float up = __bfloat162float(__float2bfloat16_rn(
-            shared_accum[(fragment + 4) * kWmmaTile * kWmmaTile +
-                         fragment_index]));
-        const float activated = __bfloat162float(__float2bfloat16_rn(
-            gate / (1.0f + expf(-gate)) * up));
-        const std::uint32_t packed_row = task.packed_begin + local_row;
-        const std::uint32_t assignment = packed_assignment[packed_row];
-        store_bf16(weighted_mid,
-                   static_cast<std::uint64_t>(packed_row) *
-                           kQ38MoeIntermediate +
-                       blockIdx.x * 64 + middle_column,
-                   activated * token_rank_weights[assignment]);
+    if (warp < 4) {
+        for (std::uint32_t element = lane;
+             element < kWmmaTile * kWmmaTile; element += 32) {
+            const std::uint32_t local_row = element / kWmmaTile;
+            const std::uint32_t fragment_column = element % kWmmaTile;
+            if (local_row >= task.valid_rows) continue;
+            const std::uint32_t middle_column =
+                warp * kWmmaTile + fragment_column;
+            const float gate = __bfloat162float(__float2bfloat16_rn(
+                shared_accum[warp * kWmmaTile * kWmmaTile + element]));
+            const float up = __bfloat162float(__float2bfloat16_rn(
+                shared_accum[(warp + 4) * kWmmaTile * kWmmaTile + element]));
+            const float activated = __bfloat162float(__float2bfloat16_rn(
+                gate / (1.0f + expf(-gate)) * up));
+            const std::uint32_t packed_row = task.packed_begin + local_row;
+            const std::uint32_t assignment = packed_assignment[packed_row];
+            store_bf16(weighted_mid,
+                       static_cast<std::uint64_t>(packed_row) *
+                               kQ38MoeIntermediate +
+                           blockIdx.x * 64 + middle_column,
+                       activated * token_rank_weights[assignment]);
+        }
     }
-    (void)lane;
-    (void)middle_base;
-    (void)weight_row_base;
 }
 
-template <int WeightBits>
+template <int WeightBits, bool Tiled = false, bool SharedA = true>
 __global__ void grouped_down_kernel(
     const void* data, const std::uint16_t* scales,
     const std::uint16_t* weighted_mid, const Q38ExpertMmqTaskV1* tasks,
@@ -375,13 +472,18 @@ __global__ void grouped_down_kernel(
     const Q38ExpertMmqTaskV1 task = tasks[blockIdx.y];
     if (task.valid_rows == 0) return;
     const std::uint32_t warp = threadIdx.x / 32;
+    const std::uint32_t lane = threadIdx.x & 31;
     const std::uint32_t output_base = blockIdx.x * 128 + warp * 16;
 
     extern __shared__ unsigned char shared_raw[];
     auto* shared_a = reinterpret_cast<__nv_bfloat16*>(shared_raw);
-    auto* shared_b = shared_a + kWmmaTile * kWmmaTile;
+    constexpr std::uint32_t kSharedATiles = SharedA ? 1 : kMmqWarps;
+    auto* shared_b = shared_a + kSharedATiles * kWmmaTile * kWmmaTile;
     auto* shared_accum = reinterpret_cast<float*>(
         shared_b + kMmqWarps * kWmmaTile * kWmmaTile);
+    auto* warp_a =
+        shared_a + (SharedA ? 0 : warp * kWmmaTile * kWmmaTile);
+    auto* warp_b = shared_b + warp * kWmmaTile * kWmmaTile;
 
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
                    wmma::row_major>
@@ -398,62 +500,102 @@ __global__ void grouped_down_kernel(
         static_cast<std::uint64_t>(rows) * columns;
     constexpr std::uint64_t matrix_scale_elements =
         static_cast<std::uint64_t>(rows) * (columns / 128);
+    float w4_row_scales[4] = {};
     for (std::uint32_t column_base = 0; column_base < columns;
          column_base += kWmmaTile) {
-        const std::uint32_t a_index = threadIdx.x;
-        const std::uint32_t local_row = a_index / kWmmaTile;
-        const std::uint32_t local_column = a_index % kWmmaTile;
-        if (local_row < task.valid_rows) {
-            const std::uint64_t packed_row = task.packed_begin + local_row;
-            shared_a[a_index] = reinterpret_cast<const __nv_bfloat16*>(
-                weighted_mid)[packed_row * columns + column_base +
-                              local_column];
-        } else {
-            shared_a[a_index] = __float2bfloat16_rn(0.0f);
+        constexpr std::uint32_t kPackedTileElements =
+            kWmmaTile * kWmmaTile / 2;
+        const std::uint32_t a_lane = SharedA ? threadIdx.x : lane;
+        const std::uint32_t a_stride = SharedA ? blockDim.x : 32;
+        for (std::uint32_t pair = a_lane; pair < kPackedTileElements;
+             pair += a_stride) {
+            const std::uint32_t local_row = pair / (kWmmaTile / 2);
+            const std::uint32_t pair_column = pair % (kWmmaTile / 2);
+            if (local_row < task.valid_rows) {
+                const std::uint64_t packed_row =
+                    task.packed_begin + local_row;
+                reinterpret_cast<__nv_bfloat162*>(warp_a)[pair] =
+                    reinterpret_cast<const __nv_bfloat162*>(weighted_mid)[
+                        (packed_row * columns + column_base) / 2 +
+                        pair_column];
+            } else {
+                reinterpret_cast<__nv_bfloat162*>(warp_a)[pair] =
+                    __floats2bfloat162_rn(0.0f, 0.0f);
+            }
         }
-        for (std::uint32_t b_index = threadIdx.x;
-             b_index < kMmqWarps * kWmmaTile * kWmmaTile;
-             b_index += blockDim.x) {
-            const std::uint32_t target_warp =
-                b_index / (kWmmaTile * kWmmaTile);
-            const std::uint32_t element =
-                b_index % (kWmmaTile * kWmmaTile);
-            const std::uint32_t output_column = element / kWmmaTile;
-            const std::uint32_t k_column = element % kWmmaTile;
-            const std::uint32_t weight_row =
-                blockIdx.x * 128 + target_warp * 16 + output_column;
-            shared_b[b_index] = dequant_weight_bf16<WeightBits>(
-                data, scales, matrix_elements, matrix_scale_elements, columns,
-                task.expert, weight_row, column_base + k_column);
+        if constexpr (WeightBits == 8) {
+            for (std::uint32_t element = lane;
+                 element < kWmmaTile * kWmmaTile; element += 32) {
+                const std::uint32_t output_column = element / kWmmaTile;
+                const std::uint32_t k_column = element % kWmmaTile;
+                const std::uint32_t weight_row =
+                    blockIdx.x * 128 + warp * 16 + output_column;
+                warp_b[element] = dequant_weight_bf16<8>(
+                    data, scales, matrix_elements, matrix_scale_elements,
+                    columns, task.expert, weight_row,
+                    column_base + k_column);
+            }
         }
-        __syncthreads();
-        wmma::load_matrix_sync(a_fragment, shared_a, kWmmaTile);
-        wmma::load_matrix_sync(
-            b_fragment,
-            shared_b + warp * kWmmaTile * kWmmaTile, kWmmaTile);
+        if constexpr (WeightBits == 4) {
+#pragma unroll
+            for (std::uint32_t iteration = 0; iteration < 4; ++iteration) {
+                if ((column_base & 127u) != 0) continue;
+                const std::uint32_t packed_element = lane + iteration * 32;
+                const std::uint32_t output_column =
+                    packed_element / (kWmmaTile / 2);
+                const std::uint32_t weight_row =
+                    blockIdx.x * 128 + warp * 16 + output_column;
+                float scale = 0.0f;
+                if ((lane & 7u) == 0)
+                    scale = load_bf16(
+                        scales,
+                        static_cast<std::uint64_t>(task.expert) *
+                                matrix_scale_elements +
+                            static_cast<std::uint64_t>(weight_row) *
+                                (columns / 128) +
+                            column_base / 128);
+                w4_row_scales[iteration] = __shfl_sync(
+                    0xffffffffu, scale, static_cast<int>(lane & ~7u));
+            }
+#pragma unroll
+            for (std::uint32_t packed_element = lane;
+                 packed_element < kPackedTileElements;
+                 packed_element += 32) {
+                const std::uint32_t output_column =
+                    packed_element / (kWmmaTile / 2);
+                const std::uint32_t pair_column =
+                    packed_element % (kWmmaTile / 2);
+                const std::uint32_t weight_row =
+                    blockIdx.x * 128 + warp * 16 + output_column;
+                reinterpret_cast<__nv_bfloat162*>(warp_b)[packed_element] =
+                    dequant_weight_pair_w4_bf16<Tiled>(
+                        data, matrix_elements, columns, task.expert, weight_row,
+                        column_base + pair_column * 2,
+                        w4_row_scales[packed_element / 32]);
+            }
+        }
+        if constexpr (SharedA)
+            __syncthreads();
+        else
+            __syncwarp();
+        wmma::load_matrix_sync(a_fragment, warp_a, kWmmaTile);
+        wmma::load_matrix_sync(b_fragment, warp_b, kWmmaTile);
         wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
-        __syncthreads();
+        if constexpr (SharedA) __syncthreads();
     }
     wmma::store_matrix_sync(
         shared_accum + warp * kWmmaTile * kWmmaTile, accumulator, kWmmaTile,
         wmma::mem_row_major);
-    __syncthreads();
-    for (std::uint32_t element = threadIdx.x;
-         element < kMmqWarps * kWmmaTile * kWmmaTile;
-         element += blockDim.x) {
-        const std::uint32_t target_warp =
-            element / (kWmmaTile * kWmmaTile);
-        const std::uint32_t fragment_index =
-            element % (kWmmaTile * kWmmaTile);
-        const std::uint32_t local_row = fragment_index / kWmmaTile;
-        const std::uint32_t output_column = fragment_index % kWmmaTile;
+    for (std::uint32_t element = lane;
+         element < kWmmaTile * kWmmaTile; element += 32) {
+        const std::uint32_t local_row = element / kWmmaTile;
+        const std::uint32_t output_column = element % kWmmaTile;
         if (local_row >= task.valid_rows) continue;
         const std::uint32_t packed_row = task.packed_begin + local_row;
         route_output[static_cast<std::uint64_t>(packed_row) * rows +
-                     blockIdx.x * 128 + target_warp * 16 + output_column] =
-            shared_accum[element];
+                     output_base + output_column] =
+            shared_accum[warp * kWmmaTile * kWmmaTile + element];
     }
-    (void)output_base;
 }
 
 __global__ void reduce_top10_and_combine_shared_kernel(
@@ -568,29 +710,66 @@ void cuda_moe_grouped_gate_up_v1(
         !weighted_mid || !stream)
         throw std::invalid_argument("invalid grouped prefill gate/up input");
     select_device(device);
-    constexpr std::size_t shared_bytes =
-        (kWmmaTile * kWmmaTile +
-         kMmqWarps * kWmmaTile * kWmmaTile) *
+    const bool shared_a = shared_moe_activation_tile_enabled();
+    const std::size_t a_tiles = shared_a ? 1 : kMmqWarps;
+    const std::size_t shared_bytes =
+        ((a_tiles + kMmqWarps) * kWmmaTile * kWmmaTile) *
             sizeof(__nv_bfloat16) +
         kMmqWarps * kWmmaTile * kWmmaTile * sizeof(float);
     const dim3 grid(kGateUpOutputTiles, task_count);
     if (gate_up_experts.descriptor->format ==
         DeviceWeightFormatV1::kW8A16SymG128) {
-        grouped_gate_up_kernel<8><<<
-            grid, kMmqThreads, shared_bytes,
-            reinterpret_cast<cudaStream_t>(stream)>>>(
-            gate_up_experts.data,
-            static_cast<const std::uint16_t*>(gate_up_experts.scales),
-            packed_hidden, packed_assignment, token_rank_weights, tasks,
-            weighted_mid);
+        if (shared_a)
+            grouped_gate_up_kernel<8, false, true><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                gate_up_experts.data,
+                static_cast<const std::uint16_t*>(gate_up_experts.scales),
+                packed_hidden, packed_assignment, token_rank_weights, tasks,
+                weighted_mid);
+        else
+            grouped_gate_up_kernel<8, false, false><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                gate_up_experts.data,
+                static_cast<const std::uint16_t*>(gate_up_experts.scales),
+                packed_hidden, packed_assignment, token_rank_weights, tasks,
+                weighted_mid);
+    } else if (gate_up_experts.layout ==
+               CudaWeightLayoutV1::kMoeW4Tile16x16) {
+        if (shared_a)
+            grouped_gate_up_kernel<4, true, true><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                gate_up_experts.data,
+                static_cast<const std::uint16_t*>(gate_up_experts.scales),
+                packed_hidden, packed_assignment, token_rank_weights, tasks,
+                weighted_mid);
+        else
+            grouped_gate_up_kernel<4, true, false><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                gate_up_experts.data,
+                static_cast<const std::uint16_t*>(gate_up_experts.scales),
+                packed_hidden, packed_assignment, token_rank_weights, tasks,
+                weighted_mid);
     } else {
-        grouped_gate_up_kernel<4><<<
-            grid, kMmqThreads, shared_bytes,
-            reinterpret_cast<cudaStream_t>(stream)>>>(
-            gate_up_experts.data,
-            static_cast<const std::uint16_t*>(gate_up_experts.scales),
-            packed_hidden, packed_assignment, token_rank_weights, tasks,
-            weighted_mid);
+        if (shared_a)
+            grouped_gate_up_kernel<4, false, true><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                gate_up_experts.data,
+                static_cast<const std::uint16_t*>(gate_up_experts.scales),
+                packed_hidden, packed_assignment, token_rank_weights, tasks,
+                weighted_mid);
+        else
+            grouped_gate_up_kernel<4, false, false><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                gate_up_experts.data,
+                static_cast<const std::uint16_t*>(gate_up_experts.scales),
+                packed_hidden, packed_assignment, token_rank_weights, tasks,
+                weighted_mid);
     }
     check(cudaPeekAtLastError(), "grouped_gate_up_kernel");
 }
@@ -610,27 +789,60 @@ void cuda_moe_grouped_down_v1(const CudaTensorViewV1& down_experts,
         !route_output || !stream)
         throw std::invalid_argument("invalid grouped prefill down input");
     select_device(device);
-    constexpr std::size_t shared_bytes =
-        (kWmmaTile * kWmmaTile +
-         kMmqWarps * kWmmaTile * kWmmaTile) *
+    const bool shared_a = shared_moe_activation_tile_enabled();
+    const std::size_t a_tiles = shared_a ? 1 : kMmqWarps;
+    const std::size_t shared_bytes =
+        ((a_tiles + kMmqWarps) * kWmmaTile * kWmmaTile) *
             sizeof(__nv_bfloat16) +
         kMmqWarps * kWmmaTile * kWmmaTile * sizeof(float);
     const dim3 grid(kDownOutputTiles, task_count);
     if (down_experts.descriptor->format ==
         DeviceWeightFormatV1::kW8A16SymG128) {
-        grouped_down_kernel<8><<<
-            grid, kMmqThreads, shared_bytes,
-            reinterpret_cast<cudaStream_t>(stream)>>>(
-            down_experts.data,
-            static_cast<const std::uint16_t*>(down_experts.scales),
-            weighted_mid, tasks, route_output);
+        if (shared_a)
+            grouped_down_kernel<8, false, true><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                down_experts.data,
+                static_cast<const std::uint16_t*>(down_experts.scales),
+                weighted_mid, tasks, route_output);
+        else
+            grouped_down_kernel<8, false, false><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                down_experts.data,
+                static_cast<const std::uint16_t*>(down_experts.scales),
+                weighted_mid, tasks, route_output);
+    } else if (down_experts.layout ==
+               CudaWeightLayoutV1::kMoeW4Tile16x16) {
+        if (shared_a)
+            grouped_down_kernel<4, true, true><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                down_experts.data,
+                static_cast<const std::uint16_t*>(down_experts.scales),
+                weighted_mid, tasks, route_output);
+        else
+            grouped_down_kernel<4, true, false><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                down_experts.data,
+                static_cast<const std::uint16_t*>(down_experts.scales),
+                weighted_mid, tasks, route_output);
     } else {
-        grouped_down_kernel<4><<<
-            grid, kMmqThreads, shared_bytes,
-            reinterpret_cast<cudaStream_t>(stream)>>>(
-            down_experts.data,
-            static_cast<const std::uint16_t*>(down_experts.scales),
-            weighted_mid, tasks, route_output);
+        if (shared_a)
+            grouped_down_kernel<4, false, true><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                down_experts.data,
+                static_cast<const std::uint16_t*>(down_experts.scales),
+                weighted_mid, tasks, route_output);
+        else
+            grouped_down_kernel<4, false, false><<<
+                grid, kMmqThreads, shared_bytes,
+                reinterpret_cast<cudaStream_t>(stream)>>>(
+                down_experts.data,
+                static_cast<const std::uint16_t*>(down_experts.scales),
+                weighted_mid, tasks, route_output);
     }
     check(cudaPeekAtLastError(), "grouped_down_kernel");
 }

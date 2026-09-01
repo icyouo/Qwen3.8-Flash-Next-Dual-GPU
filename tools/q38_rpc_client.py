@@ -27,6 +27,7 @@ OPCODES = {
     "stats": 7,
     "cancel": 8,
     "reset": 9,
+    "logits": 10,
 }
 
 STATUSES = {
@@ -188,6 +189,12 @@ def main() -> int:
     subcommands.add_parser("stats")
     subcommands.add_parser("cancel")
     subcommands.add_parser("reset")
+    logits = subcommands.add_parser("logits")
+    logits.add_argument(
+        "--raw",
+        action="store_true",
+        help="include exact raw BF16 logits encoded as little-endian hex",
+    )
     append = subcommands.add_parser("append")
     append.add_argument("tokens", nargs="+", type=parse_integer)
     subcommands.add_parser("seed")
@@ -209,6 +216,8 @@ def main() -> int:
     elif arguments.command == "spec":
         call_arguments["argument0"] = arguments.steps
         call_arguments["argument1"] = arguments.max_draft
+    elif arguments.command == "logits":
+        call_arguments["argument0"] = 1 if arguments.raw else 0
     with Client(
         arguments.socket, arguments.session_hash, arguments.request_id
     ) as client:

@@ -100,6 +100,7 @@ struct TimedDraftOutput {
 struct RetainedDraftRequest {
     std::int32_t pending_token = -1;
     std::uint64_t position = 0;
+    std::uint32_t max_draft = 0;
 };
 
 class LatencyTracker {
@@ -224,10 +225,12 @@ struct DualStageExecutor::Impl {
             throw std::invalid_argument("transaction chunk size is zero");
         if (retained_draft &&
             (kind != TxnKind::kSpeculative || chunk_tokens != 1 ||
-             eval_tokens.size() != 2 ||
+             retained_draft->max_draft == 0 ||
+             eval_tokens.size() !=
+                 static_cast<std::size_t>(retained_draft->max_draft) + 1 ||
              retained_draft->pending_token != eval_tokens.front()))
             throw std::invalid_argument(
-                "retained draft requires a two-row speculative transaction");
+                "retained draft extent differs from speculative transaction");
         const auto transaction_start = std::chrono::steady_clock::now();
         std::string error;
         const auto evaluated = static_cast<std::uint32_t>(eval_tokens.size());
@@ -299,30 +302,46 @@ struct DualStageExecutor::Impl {
                         StageBackend& backend) {
                         const auto start = std::chrono::steady_clock::now();
                         auto tokens = backend.draft_retained(
-                            request.pending_token, request.position, epoch,
-                            cancellation);
+                            request.pending_token, request.position,
+                            request.max_draft, epoch, cancellation);
                         return TimedDraftOutput{std::move(tokens),
                                                 elapsed_ns(start)};
                     }));
             }
 
             StageOutput output1;
+            if (kind == TxnKind::kAppendKnown &&
+                txn.evaluated_count > chunk_tokens) {
+                auto prefetch = worker0.submit(
+                    [txn, tokens = eval_tokens, cancellation](
+                        StageBackend& backend) mutable {
+                        backend.prefetch_transaction(
+                            txn, tokens, std::move(cancellation));
+                    });
+                prefetch.get();
+            }
             auto pending0 = submit_stage0(0);
             if (pending_draft) {
                 auto timed_draft = pending_draft->get();
                 stats.draft_ns += timed_draft.execute_ns;
                 draft_latency.record(timed_draft.execute_ns);
                 stats.drafted_tokens += timed_draft.tokens.size();
-                if (timed_draft.tokens.size() != 1)
+                if (timed_draft.tokens.size() !=
+                    retained_draft->max_draft)
                     throw std::runtime_error(
-                        "retained draft backend did not return one token");
-                const auto token = timed_draft.tokens.front();
-                if (token < 0 ||
-                    static_cast<std::uint32_t>(token) >= options.vocab_size)
-                    throw std::runtime_error(
-                        "draft backend returned a token outside the vocabulary");
-                eval_tokens[1] = token;
+                        "retained draft backend returned a partial width");
+                for (std::size_t index = 0;
+                     index < timed_draft.tokens.size(); ++index) {
+                    const auto token = timed_draft.tokens[index];
+                    if (token < 0 ||
+                        static_cast<std::uint32_t>(token) >=
+                            options.vocab_size)
+                        throw std::runtime_error(
+                            "draft backend returned a token outside the vocabulary");
+                    eval_tokens[index + 1] = token;
+                }
             }
+            std::uint32_t verified_extent = txn.evaluated_count;
             while (pending0) {
                 if (cancellation) cancellation->throw_if_requested();
                 auto timed0 = pending0->future.get();
@@ -343,15 +362,18 @@ struct DualStageExecutor::Impl {
                     throw std::runtime_error(
                         "stage0 boundary does not match the transaction chunk");
 
+                const auto current_offset = pending0->offset;
                 StageInput input1;
                 input1.txn = txn;
                 input1.token_ids = std::move(pending0->tokens);
                 input1.boundary = std::move(output0.boundary);
                 input1.chunk_offset = pending0->offset;
                 input1.final_chunk = pending0->final_chunk;
-                input1.need_logits = sampler.sampled() &&
-                                     pending0->final_chunk &&
-                                     kind != TxnKind::kSpeculative;
+                input1.need_logits =
+                    (sampler.sampled() ||
+                     options.retain_last_logits_for_diagnostics) &&
+                    pending0->final_chunk &&
+                    kind != TxnKind::kSpeculative;
                 input1.cancellation = cancellation;
                 const auto stage1_start = std::chrono::steady_clock::now();
                 auto stage1 = worker1.submit(
@@ -360,6 +382,15 @@ struct DualStageExecutor::Impl {
                         return backend.execute(std::move(input));
                     });
                 const auto next_offset = pending0->offset + pending0->count;
+                if (retained_draft && next_offset < txn.evaluated_count) {
+                    auto checkpoint = worker0.submit(
+                        [epoch = txn.epoch, next_offset](
+                            StageBackend& backend) {
+                            backend.checkpoint_speculative_prefix(
+                                epoch, next_offset);
+                        });
+                    checkpoint.get();
+                }
                 auto next0 = next_offset < txn.evaluated_count
                                  ? submit_stage0(next_offset)
                                  : nullptr;
@@ -368,6 +399,45 @@ struct DualStageExecutor::Impl {
                 stats.stage1_execute_ns += stage1_ns;
                 stage1_latency.record(stage1_ns);
                 if (cancellation) cancellation->throw_if_requested();
+                if (output1.next_token < 0 ||
+                    static_cast<std::uint32_t>(output1.next_token) >=
+                        options.vocab_size)
+                    throw std::runtime_error(
+                        "stage1 returned a token outside the vocabulary");
+
+                if (retained_draft && next_offset < txn.evaluated_count) {
+                    const auto draft_token = eval_tokens[next_offset];
+                    const bool accepted = output1.next_token == draft_token;
+                    const bool accepted_stop =
+                        accepted &&
+                        std::binary_search(options.stop_token_ids.begin(),
+                                           options.stop_token_ids.end(),
+                                           draft_token);
+                    if (accepted && !accepted_stop) {
+                        auto reconcile = worker1.submit(
+                            [epoch = txn.epoch, current_offset](
+                                StageBackend& backend) {
+                                backend.reconcile_retained_draft(
+                                    epoch, current_offset);
+                            });
+                        reconcile.get();
+                    } else {
+                        // GPU0 was launched one row ahead to preserve the
+                        // two-stage pipeline. Wait for that single lookahead;
+                        // its recurrent state is discarded from the prefix
+                        // checkpoint during backend commit.
+                        if (next0) {
+                            auto lookahead = next0->future.get();
+                            stats.stage0_execute_ns += lookahead.execute_ns;
+                            stage0_latency.record(lookahead.execute_ns);
+                        }
+                        verified_extent = next_offset;
+                        output1.state_commit_count = verified_extent;
+                        if (accepted_stop) output1.next_token = draft_token;
+                        pending0.reset();
+                        break;
+                    }
+                }
                 pending0 = std::move(next0);
             }
 
@@ -398,6 +468,12 @@ struct DualStageExecutor::Impl {
                         "sampler returned a token outside the vocabulary");
             }
 
+            if (options.retain_last_logits_for_diagnostics &&
+                kind != TxnKind::kSpeculative &&
+                output1.logits_bf16.size() != options.vocab_size)
+                throw std::runtime_error(
+                    "diagnostic logits size differs from vocabulary");
+
             if (kind == TxnKind::kSpeculative &&
                 !options.stop_token_ids.empty()) {
                 // output1.state_commit_count includes the pending input row
@@ -417,12 +493,22 @@ struct DualStageExecutor::Impl {
                 }
             }
 
+            if (retained_draft && verified_extent < txn.evaluated_count) {
+                if (!engine.shorten_speculative(verified_extent, &error))
+                    throw std::runtime_error(
+                        "speculative shortening failed: " + error);
+                stats.evaluated_tokens -=
+                    txn.evaluated_count - verified_extent;
+            }
+
             if (cancellation) cancellation->seal();
 
+            const auto coordinated_evaluated =
+                engine.active_transaction().evaluated_count;
             if (!engine.acknowledge(Stage::kStage0, txn.epoch,
-                                    txn.evaluated_count, &error) ||
+                                    coordinated_evaluated, &error) ||
                 !engine.acknowledge(Stage::kStage1, txn.epoch,
-                                    txn.evaluated_count, &error))
+                                    coordinated_evaluated, &error))
                 throw std::runtime_error("stage acknowledge failed: " + error);
 
             const std::uint32_t state_commit =
@@ -461,6 +547,20 @@ struct DualStageExecutor::Impl {
             }
             stats.state_committed_tokens += state_commit;
             stats.published_tokens += event.newly_published;
+            if (options.retain_last_logits_for_diagnostics) {
+                if (kind == TxnKind::kSpeculative) {
+                    last_logit_snapshot.reset();
+                } else {
+                    LogitSnapshotV1 snapshot;
+                    snapshot.transaction_epoch = event.epoch;
+                    snapshot.target_frontier = event.target;
+                    snapshot.transaction_kind = event.kind;
+                    snapshot.selected_token = output1.next_token;
+                    snapshot.logits_bf16 =
+                        std::move(output1.logits_bf16);
+                    last_logit_snapshot = std::move(snapshot);
+                }
+            }
             transaction_latency.record(elapsed_ns(transaction_start));
             return PairResult{event, std::move(output1)};
         } catch (const ExecutionDeadlineExceeded&) {
@@ -492,6 +592,7 @@ struct DualStageExecutor::Impl {
     std::vector<std::int32_t> tokens;
     std::int32_t last_sample = -1;
     bool have_last_sample = false;
+    std::optional<LogitSnapshotV1> last_logit_snapshot;
     bool poisoned = false;
     ExecutorStatsV1 stats{};
     LatencyTracker transaction_latency;
@@ -590,6 +691,8 @@ DecodeResult DualStageExecutor::speculative_step(
     std::shared_ptr<CancellationToken> cancellation) {
     impl_->ensure_healthy();
     if (cancellation) cancellation->throw_if_requested();
+    if (max_draft > kMaximumMtpDraftWidth)
+        throw std::invalid_argument("MTP draft width exceeds 64");
     // Target-only fallback is mandatory until sampled rejection semantics can
     // consume both target and draft probabilities. Never substitute argmax.
     if (impl_->sampler.sampled())
@@ -606,42 +709,20 @@ DecodeResult DualStageExecutor::speculative_step(
         std::min<std::uint64_t>(max_draft, remaining - 1));
     if (capped_draft == 0) return decode_one(std::move(cancellation));
     const auto pending = impl_->tokens.at(f.target);
-    const bool retained_draft = capped_draft == 1;
-    std::vector<std::int32_t> eval;
-    PairResult pair;
-    if (retained_draft) {
-        eval = {pending, 0};
-        const RetainedDraftRequest request{pending, f.target};
-        pair = impl_->run_transaction(TxnKind::kSpeculative, eval, 1,
-                                      std::move(cancellation), 0, &request);
-    } else {
-        const auto draft_start = std::chrono::steady_clock::now();
-        auto drafts = impl_->worker1.submit(
-            [pending, position = f.target, capped_draft,
-             cancellation](StageBackend& backend) {
-                return backend.draft(pending, position, capped_draft,
-                                     cancellation);
-            }).get();
-        const auto draft_ns = elapsed_ns(draft_start);
-        impl_->stats.draft_ns += draft_ns;
-        impl_->draft_latency.record(draft_ns);
-        impl_->stats.drafted_tokens += drafts.size();
-        if (drafts.size() > capped_draft)
-            throw std::runtime_error(
-                "draft backend exceeded the requested width");
-        for (const auto token : drafts) {
-            if (token < 0 || static_cast<std::uint32_t>(token) >=
-                                 impl_->options.vocab_size)
-                throw std::runtime_error(
-                    "draft backend returned a token outside the vocabulary");
-        }
-        eval.reserve(drafts.size() + 1);
-        eval.push_back(pending);
-        eval.insert(eval.end(), drafts.begin(), drafts.end());
-        pair = impl_->run_transaction(TxnKind::kSpeculative, eval,
-                                      static_cast<std::uint32_t>(eval.size()),
-                                      std::move(cancellation));
-    }
+    std::vector<std::int32_t> eval(
+        static_cast<std::size_t>(capped_draft) + 1, 0);
+    eval.front() = pending;
+    const RetainedDraftRequest request{pending, f.target, capped_draft};
+    auto pair = impl_->run_transaction(TxnKind::kSpeculative, eval, 1,
+                                       std::move(cancellation), 0, &request);
+    // SessionTxnEngine guarantees a non-empty prefix bounded by the N+1 rows.
+    // Do not introduce a new failure point after both backends have committed.
+    const auto accepted_drafts = pair.commit.newly_published - 1;
+    impl_->stats.accepted_draft_tokens += accepted_drafts;
+    impl_->stats.rejected_draft_tokens += capped_draft - accepted_drafts;
+    impl_->stats.maximum_draft_width =
+        std::max<std::uint64_t>(impl_->stats.maximum_draft_width,
+                                capped_draft);
 
     DecodeResult result;
     result.commit = pair.commit;
@@ -687,6 +768,7 @@ void DualStageExecutor::reset_session() {
     impl_->tokens.clear();
     impl_->last_sample = -1;
     impl_->have_last_sample = false;
+    impl_->last_logit_snapshot.reset();
 }
 
 const SessionFrontiersV1& DualStageExecutor::frontiers() const {
@@ -759,6 +841,11 @@ StateSnapshotV1 DualStageExecutor::snapshot() const {
                                : 0u);
     result.canonical_tokens = impl_->tokens;
     return result;
+}
+
+std::optional<LogitSnapshotV1>
+DualStageExecutor::diagnostic_logit_snapshot() const {
+    return impl_->last_logit_snapshot;
 }
 
 void DualStageExecutor::fail_closed() { impl_->poisoned = true; }
