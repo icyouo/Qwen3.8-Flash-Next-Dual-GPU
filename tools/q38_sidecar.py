@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import secrets
 import sys
 import time
@@ -32,6 +33,215 @@ from q38_control_plane import (  # noqa: E402
 
 
 MAX_BODY_BYTES = 16 << 20
+FUNCTION_NAME = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+def _function_tools(value: object) -> list[dict[str, object]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ControlPlaneError(400, "invalid_tools", "tools must be a list")
+    result: list[dict[str, object]] = []
+    names: set[str] = set()
+    for tool in value:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            raise ControlPlaneError(
+                400, "invalid_tools", "only function tools are supported"
+            )
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            raise ControlPlaneError(400, "invalid_tools", "tool.function must be an object")
+        name = function.get("name")
+        if not isinstance(name, str) or not FUNCTION_NAME.fullmatch(name):
+            raise ControlPlaneError(400, "invalid_tools", "tool function name is invalid")
+        if name in names:
+            raise ControlPlaneError(400, "invalid_tools", "tool function names must be unique")
+        names.add(name)
+        result.append(tool)
+    return result
+
+
+def _tool_choice(
+    value: object, tools: list[dict[str, object]]
+) -> tuple[list[dict[str, object]], str | None]:
+    if value is None or value == "auto":
+        return tools, None
+    if value == "none":
+        return [], None
+    if value == "required":
+        if not tools:
+            raise ControlPlaneError(400, "invalid_tool_choice", "required needs tools")
+        return tools, "You must call at least one available function in this response."
+    if isinstance(value, dict) and value.get("type") == "function":
+        function = value.get("function")
+        name = function.get("name") if isinstance(function, dict) else None
+        selected = [tool for tool in tools if tool["function"]["name"] == name]  # type: ignore[index]
+        if not selected:
+            raise ControlPlaneError(
+                400, "invalid_tool_choice", "selected tool is not available"
+            )
+        return selected, f"You must call the {name} function in this response."
+    raise ControlPlaneError(400, "invalid_tool_choice", "tool_choice is invalid")
+
+
+def _normalize_messages(
+    value: object, required_instruction: str | None = None
+) -> list[dict[str, object]]:
+    if not isinstance(value, list) or not value:
+        raise ControlPlaneError(400, "invalid_messages", "messages must be a non-empty list")
+    messages: list[dict[str, object]] = []
+    for message in value:
+        if not isinstance(message, dict) or not isinstance(message.get("role"), str):
+            raise ControlPlaneError(400, "invalid_messages", "each message needs a role")
+        normalized = dict(message)
+        calls = normalized.get("tool_calls")
+        if calls is not None:
+            if normalized["role"] != "assistant" or not isinstance(calls, list):
+                raise ControlPlaneError(400, "invalid_messages", "tool_calls are invalid")
+            normalized_calls: list[dict[str, object]] = []
+            for call in calls:
+                if not isinstance(call, dict) or call.get("type", "function") != "function":
+                    raise ControlPlaneError(400, "invalid_messages", "tool call is invalid")
+                function = call.get("function")
+                if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+                    raise ControlPlaneError(400, "invalid_messages", "tool call function is invalid")
+                arguments = function.get("arguments", {})
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError as error:
+                        raise ControlPlaneError(
+                            400, "invalid_messages", "tool call arguments are not JSON"
+                        ) from error
+                if not isinstance(arguments, dict):
+                    raise ControlPlaneError(
+                        400, "invalid_messages", "tool call arguments must be an object"
+                    )
+                normalized_calls.append(
+                    {**call, "function": {**function, "arguments": arguments}}
+                )
+            normalized["tool_calls"] = normalized_calls
+        messages.append(normalized)
+    if required_instruction:
+        if messages[0]["role"] == "system":
+            content = messages[0].get("content")
+            if content is not None and not isinstance(content, str):
+                raise ControlPlaneError(
+                    400, "invalid_messages", "system content must be text for tool_choice"
+                )
+            messages[0]["content"] = (
+                required_instruction
+                if not content
+                else f"{content}\n\n{required_instruction}"
+            )
+        else:
+            messages.insert(0, {"role": "system", "content": required_instruction})
+    return messages
+
+
+def _strip_reasoning(text: str) -> tuple[str | None, str]:
+    value = text.strip()
+    if value.startswith("<think>"):
+        value = value[len("<think>") :]
+    if "</think>" not in value:
+        return None, value
+    reasoning, visible = value.split("</think>", 1)
+    return reasoning.strip() or None, visible.strip()
+
+
+def _parameter_value(value: str) -> object:
+    stripped = value.strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return stripped
+
+
+def _parse_tool_output(
+    text: str, request_id: str
+) -> tuple[str | None, str | None, list[dict[str, object]]]:
+    reasoning, visible = _strip_reasoning(text)
+    visible = visible.removesuffix("<|im_end|>").strip()
+    calls: list[dict[str, object]] = []
+    content_parts: list[str] = []
+    cursor = 0
+    while True:
+        start = visible.find("<tool_call>", cursor)
+        if start < 0:
+            content_parts.append(visible[cursor:])
+            break
+        content_parts.append(visible[cursor:start])
+        end = visible.find("</tool_call>", start)
+        if end < 0:
+            raise ControlPlaneError(502, "invalid_tool_call", "unterminated tool_call")
+        block = visible[start + len("<tool_call>") : end].strip()
+        function_start = block.find("<function=")
+        function_header_end = block.find(">", function_start)
+        function_end = block.rfind("</function>")
+        if function_start != 0 or function_header_end < 0 or function_end < function_header_end:
+            raise ControlPlaneError(502, "invalid_tool_call", "invalid function block")
+        name = block[len("<function=") : function_header_end]
+        if not FUNCTION_NAME.fullmatch(name):
+            raise ControlPlaneError(502, "invalid_tool_call", "invalid function name")
+        parameters = block[function_header_end + 1 : function_end]
+        arguments: dict[str, object] = {}
+        parameter_cursor = 0
+        while parameter_cursor < len(parameters):
+            if not parameters[parameter_cursor:].strip():
+                break
+            parameter_cursor += len(parameters[parameter_cursor:]) - len(
+                parameters[parameter_cursor:].lstrip()
+            )
+            if not parameters.startswith("<parameter=", parameter_cursor):
+                raise ControlPlaneError(502, "invalid_tool_call", "invalid parameter block")
+            header_end = parameters.find(">", parameter_cursor)
+            if header_end < 0:
+                raise ControlPlaneError(502, "invalid_tool_call", "invalid parameter header")
+            parameter_name = parameters[
+                parameter_cursor + len("<parameter=") : header_end
+            ]
+            if not FUNCTION_NAME.fullmatch(parameter_name) or parameter_name in arguments:
+                raise ControlPlaneError(502, "invalid_tool_call", "invalid parameter name")
+            parameter_end = parameters.find("</parameter>", header_end)
+            if parameter_end < 0:
+                raise ControlPlaneError(502, "invalid_tool_call", "unterminated parameter")
+            arguments[parameter_name] = _parameter_value(
+                parameters[header_end + 1 : parameter_end]
+            )
+            parameter_cursor = parameter_end + len("</parameter>")
+        calls.append(
+            {
+                "id": f"call_q38_{request_id.rsplit('-', 1)[-1]}_{len(calls)}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(
+                        arguments, separators=(",", ":"), ensure_ascii=False
+                    ),
+                },
+            }
+        )
+        cursor = end + len("</tool_call>")
+    content = "".join(content_parts).strip() or None
+    return reasoning, content, calls
+
+
+def _validate_output_tools(
+    calls: list[dict[str, object]],
+    tools: list[dict[str, object]],
+    required: bool,
+) -> None:
+    if required and not calls:
+        raise ControlPlaneError(
+            502, "tool_call_required", "model did not produce the required tool call"
+        )
+    available = {tool["function"]["name"] for tool in tools}  # type: ignore[index]
+    for call in calls:
+        name = call["function"]["name"]  # type: ignore[index]
+        if name not in available:
+            raise ControlPlaneError(
+                502, "unknown_tool_call", f"model called unavailable function {name}"
+            )
 
 
 class SidecarApplication:
@@ -277,13 +487,21 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
                 "tokenizer_unavailable",
                 "OpenAI message input requires --tokenizer; use token-native endpoints otherwise",
             )
-        if body.get("tools"):
+        tools = _function_tools(body.get("tools"))
+        selected_tools, required_instruction = _tool_choice(
+            body.get("tool_choice"), tools
+        )
+        messages = _normalize_messages(body.get("messages"), required_instruction)
+        enable_thinking = body.get("enable_thinking", body.get("q38_enable_thinking"))
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
             raise ControlPlaneError(
-                400, "unsupported_tools", "raw-token-v1 does not enable tool parsing"
+                400, "invalid_reasoning", "enable_thinking must be a boolean"
             )
-        messages = body.get("messages")
-        if not isinstance(messages, list) or not messages:
-            raise ControlPlaneError(400, "invalid_messages", "messages must be a non-empty list")
+        reasoning_effort = body.get("reasoning_effort")
+        if reasoning_effort is not None and not isinstance(reasoning_effort, str):
+            raise ControlPlaneError(
+                400, "invalid_reasoning", "reasoning_effort must be a string"
+            )
         active = self.app.control.active_session()
         requested_session = body.get("session_id")
         if active is None:
@@ -292,7 +510,12 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
             raise ControlPlaneError(409, "session_mismatch", "another session is active")
         session_id = str(active["id"])
         encode_started = time.perf_counter_ns()
-        history = self.app.codec.encode_chat(messages)
+        history = self.app.codec.encode_chat(
+            messages,
+            tools=selected_tools or None,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+        )
         tokenize_ns = time.perf_counter_ns() - encode_started
         max_tokens = int(body.get("max_tokens", body.get("max_completion_tokens", 1)))
         mode = str(body.get("q38_mode", "plain"))
@@ -308,15 +531,33 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
         )
         request_id = f"chatcmpl-q38-{time.time_ns()}"
         if body.get("stream", False):
-            self._chat_stream(pairs, request_id, session_id, tokenize_ns)
+            self._chat_stream(
+                pairs, request_id, session_id, tokenize_ns,
+                tool_parsing=bool(selected_tools),
+                selected_tools=selected_tools,
+                tool_call_required=required_instruction is not None,
+            )
             return
         events_and_timing = list(pairs)
         output_tokens = [
             token for event, _timing in events_and_timing for token in event.token_ids
         ]
         text = self.app.codec.decode(output_tokens)
+        reasoning: str | None = None
+        content: str | None = text
+        tool_calls: list[dict[str, object]] = []
+        if selected_tools:
+            reasoning, content, tool_calls = _parse_tool_output(text, request_id)
+            _validate_output_tools(
+                tool_calls, selected_tools, required_instruction is not None
+            )
         last = events_and_timing[-1][0]
         timing = events_and_timing[-1][1]
+        message: dict[str, object] = {"role": "assistant", "content": content}
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         self._json(
             200,
             {
@@ -327,8 +568,8 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": last.finish_reason,
+                        "message": message,
+                        "finish_reason": "tool_calls" if tool_calls else last.finish_reason,
                     }
                 ],
                 "usage": {
@@ -354,7 +595,21 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
         request_id: str,
         session_id: str,
         tokenize_ns: int,
+        *,
+        tool_parsing: bool = False,
+        selected_tools: list[dict[str, object]] | None = None,
+        tool_call_required: bool = False,
     ) -> None:
+        if tool_parsing:
+            self._chat_stream_tools(
+                pairs,
+                request_id,
+                session_id,
+                tokenize_ns,
+                selected_tools or [],
+                tool_call_required,
+            )
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -392,6 +647,78 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
                 b"data: " + json.dumps(chunk, separators=(",", ":"), ensure_ascii=False).encode() + b"\n\n"
             )
             self.wfile.flush()
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        self.close_connection = True
+
+    def _chat_stream_tools(
+        self,
+        pairs: Iterator[tuple[CommittedTokenEvent, dict[str, int]]],
+        request_id: str,
+        session_id: str,
+        tokenize_ns: int,
+        selected_tools: list[dict[str, object]],
+        tool_call_required: bool,
+    ) -> None:
+        events_and_timing = list(pairs)
+        output_tokens = [
+            token for event, _timing in events_and_timing for token in event.token_ids
+        ]
+        text = self.app.codec.decode(output_tokens)  # type: ignore[union-attr]
+        reasoning, content, tool_calls = _parse_tool_output(text, request_id)
+        _validate_output_tools(tool_calls, selected_tools, tool_call_required)
+        last = events_and_timing[-1][0]
+        timing = events_and_timing[-1][1]
+        delta: dict[str, object] = {"role": "assistant", "content": content}
+        if reasoning:
+            delta["reasoning_content"] = reasoning
+        if tool_calls:
+            delta["tool_calls"] = [
+                {"index": index, **call} for index, call in enumerate(tool_calls)
+            ]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": self.app.control.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            "q38": {
+                "session_id": session_id,
+                "revision": last.revision,
+                "committed_tokens": last.committed_tokens,
+                "remaining_tokens": last.remaining_tokens,
+                "tokenize_ns": tokenize_ns,
+                **timing,
+            },
+        }
+        self.wfile.write(
+            b"data: "
+            + json.dumps(chunk, separators=(",", ":"), ensure_ascii=False).encode()
+            + b"\n\n"
+        )
+        final = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": self.app.control.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls" if tool_calls else last.finish_reason,
+                }
+            ],
+        }
+        self.wfile.write(
+            b"data: "
+            + json.dumps(final, separators=(",", ":"), ensure_ascii=False).encode()
+            + b"\n\n"
+        )
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
         self.close_connection = True

@@ -382,7 +382,11 @@ GET  /v1/q38/metrics
 When the official tokenizer is configured, the sidecar also exposes
 `GET /v1/models`, `GET /v1/models/{id}`, and
 `POST /v1/chat/completions`. The codec does not enter the ExecutorRPC ABI or
-own model state.
+own model state. Chat completions accept OpenAI function `tools`, `tool_choice`,
+assistant `tool_calls`, and `role: tool` follow-ups. Qwen's official XML tool
+syntax is parsed into OpenAI `tool_calls`; tool-enabled streaming buffers the
+candidate until the complete call is structurally valid, then emits
+`delta.tool_calls`.
 
 ## Validation and roadmap
 

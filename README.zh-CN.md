@@ -337,7 +337,10 @@ GET  /v1/q38/metrics
 
 配置官方 tokenizer 后，sidecar 还会提供 `GET /v1/models`、
 `GET /v1/models/{id}` 和 `POST /v1/chat/completions`。Codec 不进入 ExecutorRPC ABI，
-也不拥有模型状态。
+也不拥有模型状态。Chat completions 支持 OpenAI function `tools`、`tool_choice`、历史
+assistant `tool_calls` 和后续 `role: tool`；Qwen 官方 XML tool syntax 会转换成 OpenAI
+`tool_calls`。Tool 模式的流式响应会先缓冲到完整调用通过结构校验，再输出
+`delta.tool_calls`。
 
 ## 验证与路线图
 

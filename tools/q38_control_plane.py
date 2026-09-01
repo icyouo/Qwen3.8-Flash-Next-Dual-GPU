@@ -553,9 +553,24 @@ class HuggingFaceCodec:
         eos = self.tokenizer.eos_token_id
         self.stop_token_ids = () if eos is None else (int(eos),)
 
-    def encode_chat(self, messages: Sequence[dict[str, object]]) -> list[int]:
+    def encode_chat(
+        self,
+        messages: Sequence[dict[str, object]],
+        *,
+        tools: Sequence[dict[str, object]] | None = None,
+        enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
+    ) -> list[int]:
+        template_options: dict[str, object] = {}
+        if tools is not None:
+            template_options["tools"] = list(tools)
+        if enable_thinking is not None:
+            template_options["enable_thinking"] = enable_thinking
+        if reasoning_effort is not None:
+            template_options["reasoning_effort"] = reasoning_effort
         values = self.tokenizer.apply_chat_template(
-            list(messages), tokenize=True, add_generation_prompt=True
+            list(messages), tokenize=True, add_generation_prompt=True,
+            **template_options,
         )
         # transformers 5 returns BatchEncoding here, while transformers 4
         # returned the token list directly. Keep the codec independent of

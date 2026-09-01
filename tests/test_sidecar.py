@@ -13,7 +13,16 @@ from pathlib import Path
 TOOLS = Path(__file__).parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
 
-from q38_sidecar import Q38HttpServer, SidecarApplication  # noqa: E402
+from q38_sidecar import (  # noqa: E402
+    Q38HttpServer,
+    SidecarApplication,
+    _function_tools,
+    _normalize_messages,
+    _parse_tool_output,
+    _tool_choice,
+    _validate_output_tools,
+)
+from q38_control_plane import ControlPlaneError  # noqa: E402
 
 
 class FakeControl:
@@ -66,6 +75,99 @@ class ModelsEndpointTest(unittest.TestCase):
         status, body = self.get("/v1/models", authorized=False)
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["code"], "unauthorized")  # type: ignore[index]
+
+
+class ToolProtocolTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get current weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ]
+
+    def test_parses_qwen_tool_xml_into_openai_calls(self) -> None:
+        text = """check the city
+</think>
+
+<tool_call>
+<function=get_weather>
+<parameter=city>
+上海
+</parameter>
+<parameter=days>
+2
+</parameter>
+</function>
+</tool_call><|im_end|>"""
+        reasoning, content, calls = _parse_tool_output(text, "chatcmpl-q38-42")
+        self.assertEqual(reasoning, "check the city")
+        self.assertIsNone(content)
+        self.assertEqual(calls[0]["type"], "function")
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")  # type: ignore[index]
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),  # type: ignore[index]
+            {"city": "上海", "days": 2},
+        )
+
+    def test_normalizes_openai_tool_history_for_qwen_template(self) -> None:
+        messages = _normalize_messages(
+            [
+                {"role": "user", "content": "weather"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city":"上海"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "sunny"},
+            ]
+        )
+        function = messages[1]["tool_calls"][0]["function"]  # type: ignore[index]
+        self.assertEqual(function["arguments"], {"city": "上海"})
+
+    def test_tool_choice_filters_or_disables_tools(self) -> None:
+        tools = _function_tools(self.tools)
+        selected, instruction = _tool_choice("required", tools)
+        self.assertEqual(selected, tools)
+        self.assertIn("must call", instruction)
+        disabled, instruction = _tool_choice("none", tools)
+        self.assertEqual(disabled, [])
+        self.assertIsNone(instruction)
+        forced, instruction = _tool_choice(
+            {"type": "function", "function": {"name": "get_weather"}}, tools
+        )
+        self.assertEqual(len(forced), 1)
+        self.assertIn("get_weather", instruction)
+
+    def test_rejects_missing_or_unavailable_model_tool_call(self) -> None:
+        tools = _function_tools(self.tools)
+        with self.assertRaises(ControlPlaneError) as missing:
+            _validate_output_tools([], tools, True)
+        self.assertEqual(missing.exception.code, "tool_call_required")
+        _reasoning, _content, calls = _parse_tool_output(
+            "<tool_call><function=delete_world></function></tool_call>",
+            "chatcmpl-q38-43",
+        )
+        with self.assertRaises(ControlPlaneError) as unavailable:
+            _validate_output_tools(calls, tools, False)
+        self.assertEqual(unavailable.exception.code, "unknown_tool_call")
 
 
 if __name__ == "__main__":
