@@ -164,6 +164,10 @@ public:
     virtual void commit(std::uint64_t epoch,
                         std::uint32_t state_commit_count) = 0;
     virtual void rollback(std::uint64_t epoch) = 0;
+    // Drops all mutable session state while retaining immutable weights and
+    // non-semantic caches. The executor calls this only under its writer
+    // lease and outside an active transaction.
+    virtual void reset_session();
     virtual StageBackendMetricsV1 metrics() const;
 };
 

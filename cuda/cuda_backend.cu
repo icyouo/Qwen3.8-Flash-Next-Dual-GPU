@@ -2381,6 +2381,38 @@ void CudaStageBackend::rollback(std::uint64_t epoch) {
     ++state.metrics.rollbacks;
 }
 
+void CudaStageBackend::reset_session() {
+    auto& state = *impl_;
+    check(cudaSetDevice(state.options.device), "cudaSetDevice(stage reset)");
+    if (state.provisional_epoch != 0 || state.states_active ||
+        state.mtp_transaction_active)
+        throw std::logic_error("cannot reset an active CUDA transaction");
+
+    state.drain_ple_read();
+    auto* stream = reinterpret_cast<void*>(state.workspace.stream);
+    state.gdn_state->reset(stream);
+    state.qsa_state->reset();
+    if (state.ple_state) state.ple_state->reset(stream);
+    if (state.committed_ple_hash) state.committed_ple_hash->reset();
+    if (state.mtp_qsa_state) state.mtp_qsa_state->reset();
+    check(cudaStreamSynchronize(state.workspace.stream),
+          "cudaStreamSynchronize(stage reset)");
+
+    state.committed_frontier = 0;
+    state.committed_epoch = 0;
+    state.provisional_base = 0;
+    state.provisional_expected = 0;
+    state.provisional_processed = 0;
+    state.provisional_kind = TxnKind::kInvalid;
+    state.provisional_tokens.clear();
+    state.provisional_cancellation.reset();
+    state.candidate_ple_hashes.clear();
+    state.mtp_pending_valid = false;
+    state.mtp_candidate_pending_valid = false;
+    state.mtp_transaction_epoch = 0;
+    state.mtp_transaction_rows = 0;
+}
+
 StageBackendMetricsV1 CudaStageBackend::metrics() const {
     const auto& state = *impl_;
     auto result = state.metrics;

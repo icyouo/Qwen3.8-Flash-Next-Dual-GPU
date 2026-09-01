@@ -81,6 +81,11 @@ class FakeTransport:
             return self.response(opcode, values)
         if opcode == OPCODES["state"]:
             return self.response(opcode)
+        if opcode == OPCODES["reset"]:
+            self.tokens.clear()
+            self.target = 0
+            self.epoch = 0
+            return self.response(opcode, message="session state reset")
         if opcode == OPCODES["stats"]:
             return self.response(opcode, message=json.dumps({"schema": "q38.metrics.v1"}))
         raise AssertionError(opcode)
@@ -154,16 +159,41 @@ class ControlPlaneTest(unittest.TestCase):
             list(enabled.generate(enabled_session, 3, mode="mtp", mtp_width=2))
         self.assertEqual(width.exception.code, "invalid_generation_mode")
 
-    def test_full_history_accepts_only_exact_extension(self) -> None:
-        _transport, control, session = self.make()
+    def test_full_history_rebuilds_non_extension_and_keeps_fast_path(self) -> None:
+        transport, control, session = self.make()
         control.append_tokens(session, [1, 2, 3])
         state, timing = control.append_full_history(session, [1, 2, 3, 4, 5])
         self.assertEqual(state["committed_tokens"], 5)
         self.assertEqual(timing["prefix_tokens"], 3)
-        with self.assertRaises(ControlPlaneError) as caught:
-            control.append_full_history(session, [1, 9, 3, 4, 5])
-        self.assertEqual(caught.exception.code, "cold_rebuild_required")
+        self.assertFalse(timing["cold_rebuild"])
+        self.assertEqual(timing["cache_status"], "incremental_hit")
+        state, timing = control.append_full_history(session, [1, 9, 3, 4, 5])
         self.assertEqual(control.session(session)["committed_tokens"], 5)
+        self.assertEqual(state["committed_tokens"], 5)
+        self.assertEqual(timing["prefix_tokens"], 0)
+        self.assertEqual(timing["suffix_tokens"], 5)
+        self.assertTrue(timing["cold_rebuild"])
+        self.assertEqual(timing["cache_status"], "cold_rebuild")
+        self.assertEqual(transport.calls.count(OPCODES["reset"]), 1)
+
+        _state, timing = control.append_full_history(
+            session, [1, 9, 3, 4, 5, 6]
+        )
+        self.assertFalse(timing["cold_rebuild"])
+        self.assertEqual(timing["cache_status"], "incremental_hit")
+        self.assertEqual(timing["prefix_tokens"], 5)
+
+    def test_replacing_explicit_session_evicts_resident_state(self) -> None:
+        transport, control, session = self.make()
+        control.append_tokens(session, [1, 2, 3])
+        replacement = control.replace_session("s2")
+        self.assertEqual(replacement["id"], "s2")
+        self.assertEqual(replacement["committed_tokens"], 0)
+        self.assertTrue(replacement["cold_rebuild"])
+        state, timing = control.append_full_history("s2", [7, 8])
+        self.assertEqual(state["committed_tokens"], 2)
+        self.assertTrue(timing["cold_rebuild"])
+        self.assertEqual(transport.tokens, [7, 8])
 
     def test_full_history_continues_after_generated_pending_token(self) -> None:
         transport, control, session = self.make()
@@ -187,8 +217,13 @@ class ControlPlaneTest(unittest.TestCase):
         self.assertEqual(control.session(session)["committed_tokens"], 3)
 
     def test_metrics_are_versioned_json(self) -> None:
-        _transport, control, _session = self.make()
-        self.assertEqual(control.metrics()["schema"], "q38.metrics.v1")
+        _transport, control, session = self.make()
+        _state, timing = control.append_full_history(session, [1, 2])
+        self.assertEqual(timing["cache_status"], "cold_start")
+        metrics = control.metrics()
+        self.assertEqual(metrics["schema"], "q38.metrics.v1")
+        self.assertEqual(metrics["session_cache"]["cold_starts"], 1)
+        self.assertEqual(metrics["session_cache"]["resident_slots"], 1)
 
     def test_only_one_live_session(self) -> None:
         _transport, control, _session = self.make()

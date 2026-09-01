@@ -52,6 +52,10 @@ std::vector<std::int32_t> StageBackend::draft_retained(
 
 void StageBackend::abandon_retained_draft(std::uint64_t) {}
 
+void StageBackend::reset_session() {
+    throw std::logic_error("backend does not support session reset");
+}
+
 StageBackendMetricsV1 StageBackend::metrics() const { return {}; }
 
 MockStageBackend::MockStageBackend(Stage stage, std::uint32_t hidden_width,
@@ -248,6 +252,19 @@ void MockStageBackend::rollback(std::uint64_t epoch) {
     provisional_digest_ = 0;
     provisional_tokens_.clear();
     ++metrics_.rollbacks;
+}
+
+void MockStageBackend::reset_session() {
+    if (provisional_epoch_ != 0)
+        throw std::logic_error("cannot reset an active backend transaction");
+    committed_frontier_ = 0;
+    committed_epoch_ = 0;
+    provisional_base_ = 0;
+    provisional_expected_ = 0;
+    provisional_processed_ = 0;
+    provisional_kind_ = TxnKind::kInvalid;
+    provisional_digest_ = 0;
+    provisional_tokens_.clear();
 }
 
 }  // namespace q38

@@ -213,7 +213,8 @@ artifact/session identity，任何不一致都会 fail closed。
 
 - Append、decode、MTP 共用一个 semantic writer 与 commit 顺序。
 - Chunked append 对整个请求保持原子性，并要求双 stage acknowledge；失败完整回滚。
-- 只允许 suffix continuation：不会静默重算或替换已有 prefix；发生 fork 必须 cold rebuild。
+- 精确 prefix continuation 会复用 resident GPU state，只计算 suffix；新聊天或历史 fork
+  会原子 cold rebuild 可变会话状态，同时保留权重与非语义 PLE/matrix cache。
 - QSA/GDN/PLE/MTP/RNG provisional state 只在 commit 后发布。
 - 无 P2P 的 pinned-host transport，包含 position 与 payload integrity 校验。
 - 支持 cancellation、deadline、request-ID idempotency 和 stop-token-aware commit。
@@ -327,7 +328,20 @@ curl -sS -N -X POST \
   -d '{"append_token_ids":[1,2,3],"max_new_tokens":64,"stream":true}'
 ```
 
-如果提供 `full_token_ids`，它必须是 server canonical prefix 的精确 extension。运维接口：
+当前运行时只有一个 GPU 常驻会话槽。`full_token_ids` 若是当前 canonical prefix 的精确
+extension，就复用 GPU 状态并只计算 suffix；若它来自新聊天或历史分叉，executor 会原子
+清除 QSA/GDN/PLE/MTP、sampler 与 token ledger 的可变会话状态，再对新历史执行 cold
+prefill，不再返回 HTTP 409。权重、有限容量的 PLE host cache 与 CUDA prefill matrix
+cache 都会保留。
+
+响应通过 `q38.cache_status` 区分 `cold_start`、`incremental_hit` 与
+`cold_rebuild`，同时给出 `cold_rebuild` 和 `reset_ns`。向
+`/v1/chat/completions` 传入不同的 `session_id` 会显式驱逐当前 resident logical
+session。`GET /v1/q38/metrics` 会返回该单槽策略及命中/重建计数。
+
+这属于语义正确的单槽会话/cache 管理，并不宣称多个会话的 KV 同时驻留。返回已被驱逐的
+聊天时，客户端仍需重放完整历史并 cold prefill；多槽 KV、LRU state swap 与 radix prefix
+cache 是后续扩展。运维接口：
 
 ```text
 POST /v1/q38/cancel

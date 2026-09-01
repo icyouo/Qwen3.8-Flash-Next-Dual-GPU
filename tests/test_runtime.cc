@@ -783,6 +783,29 @@ void test_executor_rpc_service() {
     CHECK(response.header.frontiers.canonical == options.context_limit);
     CHECK(response.tokens.empty());
 
+    auto reset = rpc_request(q38::ExecutorRpcOpcodeV1::kReset, 32,
+                             options.session_hash);
+    response = service.handle(reset);
+    CHECK(response.header.status == q38::ExecutorRpcStatusV1::kOk);
+    CHECK(response.header.frontiers.canonical == 0);
+    CHECK(response.header.frontiers.target == 0);
+    CHECK(response.header.frontiers.stage0 == 0);
+    CHECK(response.header.frontiers.stage1 == 0);
+    CHECK(response.header.frontiers.draft == 0);
+    CHECK(response.header.frontiers.epoch == 0);
+    CHECK(executor->canonical_tokens().empty());
+    CHECK(executor->sampler_state().canonical_tokens == 0);
+
+    auto after_reset = rpc_request(q38::ExecutorRpcOpcodeV1::kAppend, 33,
+                                   options.session_hash);
+    after_reset.tokens = {21, 22};
+    after_reset.header.token_count = 2;
+    after_reset.header.payload_bytes = 2 * sizeof(std::int32_t);
+    response = service.handle(after_reset);
+    CHECK(response.header.status == q38::ExecutorRpcStatusV1::kOk);
+    CHECK(response.header.frontiers.canonical == 2);
+    CHECK(executor->canonical_tokens() == after_reset.tokens);
+
     auto stale = rpc_request(q38::ExecutorRpcOpcodeV1::kAppend, 4,
                              options.session_hash);
     stale.tokens = {8};
@@ -791,7 +814,7 @@ void test_executor_rpc_service() {
     response = service.handle(stale);
     CHECK(response.header.status ==
           q38::ExecutorRpcStatusV1::kFailedPrecondition);
-    CHECK(response.header.frontiers.canonical == options.context_limit);
+    CHECK(response.header.frontiers.canonical == 2);
 }
 
 void test_executor_rpc_cancel_and_deadline() {

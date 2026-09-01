@@ -26,6 +26,7 @@ OPCODES = {
     "spec": 6,
     "stats": 7,
     "cancel": 8,
+    "reset": 9,
 }
 
 STATUSES = {
@@ -186,6 +187,7 @@ def main() -> int:
     subcommands.add_parser("state")
     subcommands.add_parser("stats")
     subcommands.add_parser("cancel")
+    subcommands.add_parser("reset")
     append = subcommands.add_parser("append")
     append.add_argument("tokens", nargs="+", type=parse_integer)
     subcommands.add_parser("seed")

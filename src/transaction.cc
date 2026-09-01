@@ -1,6 +1,7 @@
 #include "q38/transaction.h"
 
 #include <limits>
+#include <stdexcept>
 
 namespace q38 {
 
@@ -196,6 +197,15 @@ bool SessionTxnEngine::rollback(std::string* error) {
     stage0_ack_ = false;
     stage1_ack_ = false;
     return validate_frontiers(frontiers_, error);
+}
+
+void SessionTxnEngine::reset() {
+    if (active_)
+        throw std::logic_error("cannot reset an active transaction");
+    frontiers_ = SessionFrontiersV1{};
+    txn_ = SessionTxnV1{};
+    stage0_ack_ = false;
+    stage1_ack_ = false;
 }
 
 }  // namespace q38

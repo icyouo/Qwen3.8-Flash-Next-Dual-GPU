@@ -507,7 +507,7 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
         if active is None:
             active = self.app.control.create_session(requested_session)
         elif requested_session and requested_session != active["id"]:
-            raise ControlPlaneError(409, "session_mismatch", "another session is active")
+            active = self.app.control.replace_session(str(requested_session))
         session_id = str(active["id"])
         encode_started = time.perf_counter_ns()
         history = self.app.codec.encode_chat(
@@ -582,7 +582,6 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
                     "revision": last.revision,
                     "committed_tokens": last.committed_tokens,
                     "remaining_tokens": last.remaining_tokens,
-                    "cold_rebuild": False,
                     "tokenize_ns": tokenize_ns,
                     **timing,
                 },
@@ -591,7 +590,9 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
 
     def _chat_stream(
         self,
-        pairs: Iterator[tuple[CommittedTokenEvent, dict[str, int]]],
+        pairs: Iterator[
+            tuple[CommittedTokenEvent, dict[str, int | bool | str]]
+        ],
         request_id: str,
         session_id: str,
         tokenize_ns: int,
@@ -653,7 +654,9 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
 
     def _chat_stream_tools(
         self,
-        pairs: Iterator[tuple[CommittedTokenEvent, dict[str, int]]],
+        pairs: Iterator[
+            tuple[CommittedTokenEvent, dict[str, int | bool | str]]
+        ],
         request_id: str,
         session_id: str,
         tokenize_ns: int,

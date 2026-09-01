@@ -51,6 +51,7 @@ bool valid_opcode(ExecutorRpcOpcodeV1 opcode) {
     case ExecutorRpcOpcodeV1::kSpeculative:
     case ExecutorRpcOpcodeV1::kStats:
     case ExecutorRpcOpcodeV1::kCancel:
+    case ExecutorRpcOpcodeV1::kReset:
         return true;
     case ExecutorRpcOpcodeV1::kInvalid:
         return false;
@@ -62,7 +63,8 @@ bool is_writer_opcode(ExecutorRpcOpcodeV1 opcode) {
     return opcode == ExecutorRpcOpcodeV1::kAppend ||
            opcode == ExecutorRpcOpcodeV1::kSeed ||
            opcode == ExecutorRpcOpcodeV1::kDecode ||
-           opcode == ExecutorRpcOpcodeV1::kSpeculative;
+           opcode == ExecutorRpcOpcodeV1::kSpeculative ||
+           opcode == ExecutorRpcOpcodeV1::kReset;
 }
 
 struct RequestFingerprint {
@@ -289,6 +291,7 @@ bool validate_executor_rpc_request(const ExecutorRpcRequestV1& request,
     case ExecutorRpcOpcodeV1::kSeed:
     case ExecutorRpcOpcodeV1::kStats:
     case ExecutorRpcOpcodeV1::kCancel:
+    case ExecutorRpcOpcodeV1::kReset:
         if (!request.tokens.empty() || header.argument0 != 0 ||
             header.argument1 != 0)
             return fail(error, "executor RPC operation takes no payload");
@@ -451,6 +454,15 @@ ExecutorRpcResponseV1 ExecutorRpcServiceV1::handle(
                         response.tokens = std::move(result.published_tokens);
                         break;
                     }
+                    case ExecutorRpcOpcodeV1::kReset:
+                        // Session reset is the commit point: after either
+                        // backend starts clearing state it cannot be cancelled
+                        // or rolled back safely.
+                        cancellation->throw_if_requested();
+                        cancellation->seal();
+                        state.executor->reset_session();
+                        response.message = "session state reset";
+                        break;
                     default:
                         throw std::logic_error(
                             "non-writer entered writer dispatch");
@@ -509,6 +521,12 @@ ExecutorRpcResponseV1 ExecutorRpcServiceV1::handle(
                     state.active_cancellation.reset();
                 }
                 finalize_response(&response, state.published_frontiers);
+                if (request.header.opcode == ExecutorRpcOpcodeV1::kReset) {
+                    // Responses from the old semantic session must never be
+                    // replayed after its device state has been discarded.
+                    state.writer_response_order.clear();
+                    state.writer_responses.clear();
+                }
                 state.writer_response_order.push_back(
                     request.header.request_id);
                 state.writer_responses.emplace(

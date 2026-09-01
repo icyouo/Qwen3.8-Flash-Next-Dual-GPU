@@ -27,6 +27,7 @@ WRITER_OPCODES = {
     OPCODES["seed"],
     OPCODES["decode"],
     OPCODES["spec"],
+    OPCODES["reset"],
 }
 TOKEN = struct.Struct("<i")
 
@@ -238,6 +239,11 @@ class Q38ControlPlane:
         self._writer = threading.Lock()
         self._state = threading.Lock()
         self._session: SessionRecord | None = None
+        self._cache_counters = {
+            "cold_starts": 0,
+            "cold_rebuilds": 0,
+            "incremental_hits": 0,
+        }
 
     def _read_state(self) -> Response:
         return _require_ok(self.transport.call(OPCODES["state"]), "state")
@@ -266,6 +272,28 @@ class Q38ControlPlane:
             with self._state:
                 self._session = created
             return created.public()
+
+    def replace_session(self, session_id: str | None = None) -> dict[str, object]:
+        """Atomically evict the resident logical session and activate a new one."""
+
+        with self._writer:
+            response = _require_ok(
+                self.transport.call(
+                    OPCODES["reset"], timeout_ms=self.default_timeout_ms
+                ),
+                "reset",
+            )
+            self._verify_reset_frontiers(response)
+            replacement = SessionRecord(
+                session_id=session_id or f"q38-{uuid.uuid4().hex}",
+                context_limit=self.context_limit,
+                model=self.model,
+                revision=1,
+                cold_rebuild=True,
+            )
+            with self._state:
+                self._session = replacement
+            return replacement.public()
 
     def _session_checked(self, session_id: str) -> SessionRecord:
         with self._state:
@@ -316,6 +344,29 @@ class Q38ControlPlane:
                 "executor pending-token range violates the Q38 contract",
             )
 
+    def _verify_reset_frontiers(self, response: Response) -> None:
+        if any(response.frontiers[:5]):
+            raise ControlPlaneError(
+                503,
+                "reset_divergence",
+                "executor reset did not clear every semantic frontier",
+            )
+
+    def _reset_record_locked(
+        self, record: SessionRecord, timeout_ms: int
+    ) -> int:
+        started = time.perf_counter_ns()
+        response = _require_ok(
+            self.transport.call(OPCODES["reset"], timeout_ms=timeout_ms),
+            "reset",
+        )
+        self._verify_reset_frontiers(response)
+        record.canonical_tokens.clear()
+        record.hashes = ()
+        record.revision += 1
+        record.cold_rebuild = True
+        return time.perf_counter_ns() - started
+
     def _append_locked(
         self,
         record: SessionRecord,
@@ -355,25 +406,49 @@ class Q38ControlPlane:
         record: SessionRecord,
         history_tokens: Sequence[int],
         timeout_ms: int,
-    ) -> dict[str, int]:
+    ) -> dict[str, int | bool | str]:
         started = time.perf_counter_ns()
         values = self._validate_tokens(history_tokens)
+        if len(values) > self.context_limit:
+            raise ControlPlaneError(
+                422,
+                "context_length_exceeded",
+                "prompt exceeds the 262,144-token budget",
+            )
         canonical = record.canonical_tokens
+        empty_before = not canonical
         matching = len(values) >= len(canonical) and values[: len(canonical)] == canonical
         validation_ns = time.perf_counter_ns() - started
+        reset_ns = 0
+        rebuilt = record.cold_rebuild and not canonical
         if not matching:
-            record.cold_rebuild = True
-            raise ControlPlaneError(
-                409,
-                "cold_rebuild_required",
-                "full-history tokens are not an exact extension of the live session",
-            )
+            reset_ns = self._reset_record_locked(record, timeout_ms)
+            canonical = record.canonical_tokens
+            rebuilt = True
         suffix = values[len(canonical) :]
         self._append_locked(record, suffix, timeout_ms)
+        record.cold_rebuild = rebuilt
+        cache_status = (
+            "cold_rebuild"
+            if rebuilt
+            else "cold_start"
+            if empty_before
+            else "incremental_hit"
+        )
+        counter = {
+            "cold_start": "cold_starts",
+            "cold_rebuild": "cold_rebuilds",
+            "incremental_hit": "incremental_hits",
+        }[cache_status]
+        with self._state:
+            self._cache_counters[counter] += 1
         return {
             "prefix_tokens": len(values) - len(suffix),
             "suffix_tokens": len(suffix),
             "prefix_validation_ns": validation_ns,
+            "reset_ns": reset_ns,
+            "cold_rebuild": rebuilt,
+            "cache_status": cache_status,
         }
 
     def append_full_history(
@@ -382,7 +457,7 @@ class Q38ControlPlane:
         history_tokens: Sequence[int],
         *,
         timeout_ms: int | None = None,
-    ) -> tuple[dict[str, object], dict[str, int]]:
+    ) -> tuple[dict[str, object], dict[str, int | bool | str]]:
         with self._writer:
             record = self._session_checked(session_id)
             timing = self._append_full_history_locked(
@@ -499,7 +574,7 @@ class Q38ControlPlane:
         mode: str = "plain",
         mtp_width: int = 1,
         timeout_ms: int | None = None,
-    ) -> Iterator[tuple[CommittedTokenEvent, dict[str, int]]]:
+    ) -> Iterator[tuple[CommittedTokenEvent, dict[str, int | bool | str]]]:
         """Append an exact suffix and generate under one semantic writer lease."""
 
         with self._writer:
@@ -530,11 +605,21 @@ class Q38ControlPlane:
     def metrics(self) -> dict[str, object]:
         response = _require_ok(self.transport.call(OPCODES["stats"]), "stats")
         try:
-            return json.loads(response.message)
+            result = json.loads(response.message)
         except json.JSONDecodeError as error:
             raise ControlPlaneError(
                 503, "invalid_metrics", "executor returned invalid metrics JSON"
             ) from error
+        with self._state:
+            result["session_cache"] = {
+                **self._cache_counters,
+                "resident_slots": 1,
+                "resident_session_id": (
+                    None if self._session is None else self._session.session_id
+                ),
+                "policy": "single_resident_exact_prefix",
+            }
+        return result
 
 
 class HuggingFaceCodec:

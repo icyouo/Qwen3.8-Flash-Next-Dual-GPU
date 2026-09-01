@@ -28,6 +28,8 @@ enum class ExecutorRpcOpcodeV1 : std::uint32_t {
     kStats = 7,
     // request_id identifies the active writer request to cancel.
     kCancel = 8,
+    // Atomically drops mutable session state without unloading weights.
+    kReset = 9,
 };
 
 enum class ExecutorRpcStatusV1 : std::uint32_t {

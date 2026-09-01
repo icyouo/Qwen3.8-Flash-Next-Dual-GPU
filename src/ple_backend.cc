@@ -101,6 +101,16 @@ void PleStage0Backend::rollback(std::uint64_t epoch) {
     provisional_processed_ = 0;
 }
 
+void PleStage0Backend::reset_session() {
+    if (provisional_epoch_ != 0)
+        throw std::logic_error("cannot reset an active PLE transaction");
+    inner_->reset_session();
+    committed_hash_.reset();
+    candidate_hashes_.clear();
+    provisional_expected_ = 0;
+    provisional_processed_ = 0;
+}
+
 StageBackendMetricsV1 PleStage0Backend::metrics() const {
     auto result = inner_->metrics();
     const auto cache = store_->cache_stats();

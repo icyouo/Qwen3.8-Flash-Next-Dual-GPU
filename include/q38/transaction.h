@@ -41,6 +41,7 @@ public:
     bool decide(std::uint32_t state_commit_count, std::string* error);
     bool commit(CommitEventV1* event, std::string* error);
     bool rollback(std::string* error);
+    void reset();
 
 private:
     bool fail(std::string* error, const char* message) const;

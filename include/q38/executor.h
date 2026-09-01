@@ -59,6 +59,7 @@ public:
     DecodeResult speculative_step(
         std::uint32_t max_draft,
         std::shared_ptr<CancellationToken> cancellation = {});
+    void reset_session();
 
     const SessionFrontiersV1& frontiers() const;
     const std::vector<std::int32_t>& canonical_tokens() const;

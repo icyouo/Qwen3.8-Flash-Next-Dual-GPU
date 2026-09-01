@@ -28,6 +28,7 @@ public:
     void commit(std::uint64_t epoch,
                 std::uint32_t state_commit_count) override;
     void rollback(std::uint64_t epoch) override;
+    void reset_session() override;
     StageBackendMetricsV1 metrics() const override;
 
 private:

@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <future>
 #include <functional>
 #include <mutex>
@@ -652,6 +653,40 @@ DecodeResult DualStageExecutor::speculative_step(
     impl_->sampler.commit_tokens(result.published_tokens);
     impl_->last_sample = pair.stage1.next_token;
     return result;
+}
+
+void DualStageExecutor::reset_session() {
+    impl_->ensure_healthy();
+    if (impl_->engine.has_active_transaction())
+        throw std::logic_error("cannot reset an active executor transaction");
+    try {
+        auto reset0 = impl_->worker0.submit(
+            [](StageBackend& backend) { backend.reset_session(); });
+        auto reset1 = impl_->worker1.submit(
+            [](StageBackend& backend) { backend.reset_session(); });
+        std::exception_ptr failure;
+        try {
+            reset0.get();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        try {
+            reset1.get();
+        } catch (...) {
+            if (!failure) failure = std::current_exception();
+        }
+        if (failure) std::rethrow_exception(failure);
+    } catch (...) {
+        // A reset cannot be rolled back after one device has completed it.
+        impl_->poisoned = true;
+        ++impl_->stats.failures;
+        throw;
+    }
+    impl_->engine.reset();
+    impl_->sampler.reset();
+    impl_->tokens.clear();
+    impl_->last_sample = -1;
+    impl_->have_last_sample = false;
 }
 
 const SessionFrontiersV1& DualStageExecutor::frontiers() const {

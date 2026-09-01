@@ -245,8 +245,10 @@ layout are part of the artifact/session identity and are checked fail-closed.
 
 - One semantic writer and one commit order for append, decode, and MTP.
 - Request-atomic chunked append with dual-stage acknowledgement and rollback.
-- Suffix-only continuation: an existing prefix is never silently recomputed or
-  replaced; a fork requires a cold rebuild.
+- Exact-prefix continuation reuses the resident GPU state and evaluates only
+  the suffix. A new conversation or history fork performs an atomic cold
+  rebuild of mutable session state while retaining weights and non-semantic
+  PLE/matrix caches.
 - Provisional QSA/GDN/PLE/MTP/RNG state is published only after commit.
 - No-P2P pinned-host transport with position and payload-integrity checks.
 - Cancellation, deadline, request-ID idempotency, and stop-token-aware commit.
@@ -353,7 +355,8 @@ lane passes its correctness and memory gates.
 
 ## API
 
-Create the single live session:
+The current runtime has one GPU-resident session slot. Create its initial
+logical session:
 
 ```sh
 curl -sS -X POST http://127.0.0.1:30000/v1/q38/sessions \
@@ -370,8 +373,22 @@ curl -sS -N -X POST \
   -d '{"append_token_ids":[1,2,3],"max_new_tokens":64,"stream":true}'
 ```
 
-`full_token_ids`, when supplied, must be an exact extension of the canonical
-server prefix. Available operational endpoints include:
+With `full_token_ids`, an exact extension of the resident canonical prefix is
+an incremental cache hit. A non-extension is treated as a new conversation or
+fork: the executor atomically resets QSA/GDN/PLE/MTP/sampler state and cold
+prefills the supplied history instead of returning HTTP 409. Immutable weights,
+the bounded PLE host cache, and the CUDA prefill matrix cache remain resident.
+Responses report `q38.cache_status` as `cold_start`, `incremental_hit`, or
+`cold_rebuild`, plus `cold_rebuild` and `reset_ns`. Passing a different
+`session_id` to `/v1/chat/completions` explicitly evicts the resident logical
+session under the same rule.
+
+This is correct single-slot session/cache management, not multi-session KV
+residency. Returning to an evicted conversation requires its client to replay
+full history and cold-prefill it. Multi-slot KV state, LRU state swap, and a
+radix prefix cache are future extensions; the API does not claim those hits
+today. `GET /v1/q38/metrics` includes the session-cache policy and hit/rebuild
+counters. Available operational endpoints include:
 
 ```text
 POST /v1/q38/cancel

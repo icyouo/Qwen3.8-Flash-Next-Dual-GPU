@@ -65,6 +65,7 @@ public:
     void commit(const SamplerDecisionV1& decision);
     void commit_tokens(const std::vector<std::int32_t>& tokens);
     void commit_token(std::int32_t token);
+    void reset();
 
 private:
     std::uint32_t vocabulary_ = 0;

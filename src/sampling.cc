@@ -171,4 +171,10 @@ void TransactionalSampler::commit_token(std::int32_t token) {
                     UINT64_C(0x9e3779b97f4a7c15)));
 }
 
+void TransactionalSampler::reset() {
+    state_ = SamplerStateV1{};
+    state_.rng_state = config_.seed;
+    std::fill(counts_.begin(), counts_.end(), 0);
+}
+
 }  // namespace q38
