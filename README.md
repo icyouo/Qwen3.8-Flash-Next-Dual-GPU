@@ -54,21 +54,20 @@ original native prefill baseline and exceeds the prior DS4 performance class.
 The input was a repeated synthetic token sequence, so this is a real CUDA and
 state-machine benchmark, not a text-quality result.
 
-The latest ordinary-mode checkpoint (MTP disabled) also measured as follows.
-The 32K row deliberately keeps fine-grained CUDA stage profiling enabled; the
-other two rows do not.
+The latest ordinary-mode checkpoint (MTP disabled) measured prefill and decode
+together with the same runtime binary. Profiling was disabled for every row;
+decode is five real GPU steps immediately after the listed cold prefill.
 
-| Actual prefill tokens | Profiling | Append time | Prefill |
-|---:|---|---:|---:|
-| 4,096 | off | 2.736 s | **1,497.04 tok/s** |
-| 32,768 | detailed | 19.640 s | **1,668.40 tok/s** |
-| 262,080 | off | 174.363 s | **1,503.07 tok/s** |
+| Actual context | Append time | Prefill | Decode | ITL p50 |
+|---:|---:|---:|---:|---:|
+| 4,096 | 2.736 s | **1,497.04 tok/s** | **29.75 tok/s** | 31.60 ms |
+| 32,768 | 19.313 s | **1,696.65 tok/s** | **29.65 tok/s** | 31.74 ms |
+| 262,080 | 174.363 s | **1,503.07 tok/s** | **26.82 tok/s** | 34.24 ms |
 
-The 32K gate repeated at 1,668.40--1,668.72 tok/s. Relative to the preceding
-published checkpoint, the three rows improved by 12.8%, 15.1%, and 13.3%,
-respectively. In the final 256K run, the following five decode steps reached
-26.82 tok/s with 34.24 ms ITL p50; decode kernels were not changed by this
-prefill revision.
+Relative to the preceding published prefill checkpoint, the three rows
+improved by 12.8%, 17.0%, and 13.3%, respectively. A separate detailed-profile
+32K gate reached 1,668.40--1,668.72 tok/s while collecting per-kernel CUDA
+events. Decode kernels were not changed by this prefill revision.
 
 The same build also passed a five-turn coding-style continuation probe. The
 first turn was a cold 4K prefill; each later turn reused the live recurrent and
@@ -89,11 +88,12 @@ radix-cache or prompt-cache simulations.
 
 ### Decode
 
-Prefill and decode deliberately use different kernel families. After a
-pipelined 4K prefill, a 64-token decode probe reached **27.89 tok/s** with
-35.01 ms ITL p50.
+Prefill and decode deliberately use different kernel families. The current
+same-build, same-run figures are in the combined table above. The table below
+is retained as a historical operating-mode comparison from the earlier decode
+optimization milestone; it is not the current release checkpoint.
 
-| Run | Context + output | Stage 0 | Stage 1 + head | ITL p50 | Decode |
+| Historical run | Context + output | Stage 0 | Stage 1 + head | ITL p50 | Decode |
 |---|---:|---:|---:|---:|---:|
 | q38 high-throughput (`durability=off`) | 8,195 + 32 | 18.89 ms | 19.21 ms | 38.65 ms | **25.81 tok/s** |
 | q38 strict durability | 8,195 + 32 | 19.08 ms | 19.21 ms | 43.87 ms | **22.84 tok/s** |
@@ -106,10 +106,12 @@ ms end-to-end p50. Strict mode is slower because every successful mutating RPC
 waits for `fdatasync`. Benchmark results must therefore always name their
 durability mode.
 
-#### Long-context exact-QSA
+#### Historical long-context exact-QSA optimization
 
-The exact parallel selector and tiled attention path remove the earlier decode
+The exact parallel selector and tiled attention path removed the earlier decode
 collapse without changing the 512-block selection budget or tie semantics.
+These rows record that optimization milestone; use the combined table above
+for the current binary's release checkpoint.
 
 | Context | Previous decode | Exact-QSA R2 | Speedup | ITL p50, before → R2 |
 |---:|---:|---:|---:|---:|

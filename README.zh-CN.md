@@ -45,18 +45,18 @@ MTP。
 native prefill 提升 **20.0×**，超过了此前 DS4 的性能级别。输入为重复的合成 token，
 因此它是真实 CUDA 与状态机性能测试，不是文本质量结论。
 
-最新版普通模式（关闭 MTP）的实测如下。32K 一行有意开启了细粒度 CUDA stage profiling，
-其余两行关闭 profiling。
+最新版普通模式（关闭 MTP）使用同一个 runtime binary 连续测量 prefill 与 decode。所有行
+都关闭 profiling；Decode 是相应冷启动 prefill 完成后紧接着执行的五步真实 GPU 计算。
 
-| 实际 prefill tokens | Profiling | Append 时间 | Prefill |
-|---:|---|---:|---:|
-| 4,096 | 关闭 | 2.736 s | **1,497.04 tok/s** |
-| 32,768 | 细粒度 | 19.640 s | **1,668.40 tok/s** |
-| 262,080 | 关闭 | 174.363 s | **1,503.07 tok/s** |
+| 实际上下文 | Append 时间 | Prefill | Decode | ITL p50 |
+|---:|---:|---:|---:|---:|
+| 4,096 | 2.736 s | **1,497.04 tok/s** | **29.75 tok/s** | 31.60 ms |
+| 32,768 | 19.313 s | **1,696.65 tok/s** | **29.65 tok/s** | 31.74 ms |
+| 262,080 | 174.363 s | **1,503.07 tok/s** | **26.82 tok/s** | 34.24 ms |
 
-32K 门禁复测结果稳定在 1,668.40--1,668.72 tok/s。相较上一版已发布 checkpoint，三档
-分别提升 12.8%、15.1% 和 13.3%。最终 256K 测试后的五步 decode 为 26.82 tok/s、
-ITL p50 34.24 ms；本次 prefill 修改没有改变 decode kernels。
+相较上一版已发布 prefill checkpoint，三档分别提升 12.8%、17.0% 和 13.3%。另一次开启
+逐 kernel CUDA event 的 32K 细粒度 profile 为 1,668.40--1,668.72 tok/s。本次 prefill
+修改没有改变 decode kernels。
 
 同一 build 还通过了五轮 coding 风格增量测试。首轮冷启动 prefill 4K，随后每一轮都复用
 在线 recurrent/QSA 状态并追加一段新的 1,024-token suffix。多计算的一个 token 是会话
@@ -75,10 +75,11 @@ incremental hit，不是 radix cache 或 prompt cache 模拟。
 
 ### Decode
 
-Prefill 和 decode 有意使用两套不同 kernel family。完成流水 4K prefill 后继续生成 64
-tokens，实测 **27.89 tok/s**、ITL p50 35.01 ms。
+Prefill 和 decode 有意使用两套不同 kernel family。当前同一 build、同一轮测试的数据见
+上面的联合表。下表仅保留为早期 decode 优化节点的历史运行模式对照，不代表当前版本
+checkpoint。
 
-| 运行 | Context + output | Stage 0 | Stage 1 + head | ITL p50 | Decode |
+| 历史运行 | Context + output | Stage 0 | Stage 1 + head | ITL p50 | Decode |
 |---|---:|---:|---:|---:|---:|
 | q38 高吞吐（`durability=off`） | 8,195 + 32 | 18.89 ms | 19.21 ms | 38.65 ms | **25.81 tok/s** |
 | q38 严格持久化 | 8,195 + 32 | 19.08 ms | 19.21 ms | 43.87 ms | **22.84 tok/s** |
@@ -90,10 +91,11 @@ tokens，实测 **27.89 tok/s**、ITL p50 35.01 ms。
 是因为每个成功的变更 RPC 都要等待 `fdatasync`；所以任何性能数据都必须同时标明
 durability mode。
 
-#### 长上下文 exact-QSA
+#### 历史长上下文 exact-QSA 优化
 
 精确并行 selector 与 tiled attention 消除了此前的长上下文 decode 崩塌，同时没有修改
-512-block 选择预算或 tie 语义。
+512-block 选择预算或 tie 语义。下表记录的是该优化节点；当前 binary 的发布基线以上面的
+Prefill/Decode 联合表为准。
 
 | Context | 优化前 decode | Exact-QSA R2 | 加速 | ITL p50，优化前 → R2 |
 |---:|---:|---:|---:|---:|
