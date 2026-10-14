@@ -16,6 +16,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Iterator, Protocol, Sequence
 
@@ -28,6 +29,7 @@ WRITER_OPCODES = {
     OPCODES["decode"],
     OPCODES["spec"],
     OPCODES["reset"],
+    OPCODES["replace_pending_terminal"],
 }
 TOKEN = struct.Struct("<i")
 
@@ -77,6 +79,8 @@ class ExecutorTransport:
         self._lock = threading.Lock()
         self._next_request_id = max(1, time.time_ns())
         self._active_request_id: int | None = None
+        self._connection_scope = threading.local()
+        self._active_owner: threading.Event | None = None
 
     def _reserve_request_id(self) -> int:
         with self._lock:
@@ -100,31 +104,64 @@ class ExecutorTransport:
     ) -> Response:
         request_id = self._reserve_request_id()
         writer = opcode in WRITER_OPCODES
+        owner = getattr(self._connection_scope, "stop", None)
         if writer:
             with self._lock:
+                if owner is not None and owner.is_set():
+                    raise ControlPlaneError(499, "stream_cancelled", "stream was cancelled")
                 if self._active_request_id is not None:
                     raise ControlPlaneError(
                         409, "writer_busy", "another executor writer is active"
                     )
                 self._active_request_id = request_id
+                self._active_owner = owner
         try:
-            with Client(self.socket_path, self.session_hash, request_id) as client:
-                response = client.call(
-                    opcode,
-                    tokens=list(tokens or ()),
-                    argument0=argument0,
-                    argument1=argument1,
-                    timeout_ms=timeout_ms,
-                )
+            scoped = getattr(self._connection_scope, "client", None)
+            connection = nullcontext(scoped) if scoped is not None else Client(self.socket_path, self.session_hash, request_id)
+            with connection as client:
+                client._next_request_id = request_id
+                # Never retry a failed writer: it may already have committed.
+                response = client.call(opcode, tokens=list(tokens or ()),
+                    argument0=argument0, argument1=argument1, timeout_ms=timeout_ms)
         finally:
             if writer:
                 with self._lock:
                     if self._active_request_id == request_id:
                         self._active_request_id = None
+                        self._active_owner = None
         return response
 
+    @contextmanager
+    def writer_connection(self, stop_event: threading.Event | None = None):
+        """Reuse one connection only within a single semantic writer lease."""
+        if getattr(self._connection_scope, "client", None) is not None:
+            yield
+            return
+        client = Client(self.socket_path, self.session_hash)
+        self._connection_scope.client = client
+        self._connection_scope.stop = stop_event
+        try:
+            yield
+        finally:
+            self._connection_scope.client = None
+            self._connection_scope.stop = None
+            client.close()
+
     def cancel_active(self) -> Response | None:
-        request_id = self.active_request_id
+        with self._lock:
+            request_id = self._active_request_id
+            if self._active_owner is not None:
+                self._active_owner.set()
+        return self._cancel_request(request_id)
+
+    def cancel_owned(self, owner: threading.Event) -> Response | None:
+        """Stop this producer, and cancel only the RPC admitted for its owner."""
+        with self._lock:
+            owner.set()
+            request_id = self._active_request_id if self._active_owner is owner else None
+        return self._cancel_request(request_id)
+
+    def _cancel_request(self, request_id: int | None) -> Response | None:
         if request_id is None:
             return None
         # ExecutorRPC V1 deliberately uses the Cancel frame's request_id as
@@ -175,8 +212,26 @@ class SessionRecord:
     cold_rebuild: bool = False
     hashes: tuple[str, ...] = ()
 
-    def refresh_hashes(self) -> None:
-        self.hashes = block_hashes(self.canonical_tokens)
+    _hashed_tokens: int = field(default=0, init=False, repr=False, compare=False)
+    _complete_hashes: list[str] = field(default_factory=list, init=False, repr=False, compare=False)
+    _partial_hash: object = field(default_factory=hashlib.sha256, init=False, repr=False, compare=False)
+
+    def refresh_hashes(self, *, rebuild: bool = False) -> None:
+        if rebuild or len(self.canonical_tokens) < self._hashed_tokens:
+            self._hashed_tokens = 0
+            self._complete_hashes.clear()
+            self._partial_hash = hashlib.sha256()
+        while self._hashed_tokens < len(self.canonical_tokens):
+            boundary = (self._hashed_tokens // 1024 + 1) * 1024
+            end = min(boundary, len(self.canonical_tokens))
+            self._partial_hash.update(_token_bytes(self.canonical_tokens[self._hashed_tokens:end]))
+            self._hashed_tokens = end
+            if end == boundary:
+                self._complete_hashes.append(self._partial_hash.hexdigest())
+                self._partial_hash = hashlib.sha256()
+        self.hashes = tuple(self._complete_hashes)
+        if self._hashed_tokens % 1024:
+            self.hashes += (self._partial_hash.hexdigest(),)
 
     def public(self) -> dict[str, object]:
         committed = len(self.canonical_tokens)
@@ -220,6 +275,7 @@ class Q38ControlPlane:
         default_timeout_ms: int = 3_600_000,
         mtp_enabled: bool = True,
         mtp_max_draft: int = 64,
+        reuse_terminal_prefix: bool = False,
     ) -> None:
         if (
             context_limit <= 0
@@ -236,13 +292,17 @@ class Q38ControlPlane:
         self.default_timeout_ms = default_timeout_ms
         self.mtp_enabled = mtp_enabled
         self.mtp_max_draft = mtp_max_draft
+        self.reuse_terminal_prefix = reuse_terminal_prefix
         self._writer = threading.Lock()
         self._state = threading.Lock()
         self._session: SessionRecord | None = None
+        self._stream_guard = threading.Lock()
+        self._stream_stop: threading.Event | None = None
         self._cache_counters = {
             "cold_starts": 0,
             "cold_rebuilds": 0,
             "incremental_hits": 0,
+            "terminal_prefix_hits": 0,
         }
 
     def _read_state(self) -> Response:
@@ -362,7 +422,7 @@ class Q38ControlPlane:
         )
         self._verify_reset_frontiers(response)
         record.canonical_tokens.clear()
-        record.hashes = ()
+        record.refresh_hashes(rebuild=True)
         record.revision += 1
         record.cold_rebuild = True
         return time.perf_counter_ns() - started
@@ -418,6 +478,31 @@ class Q38ControlPlane:
         canonical = record.canonical_tokens
         empty_before = not canonical
         matching = len(values) >= len(canonical) and values[: len(canonical)] == canonical
+        replaced = False
+        if (not matching and self.reuse_terminal_prefix and canonical and len(values) > len(canonical)
+            and canonical[-1] in self.stop_token_ids
+            and values[:len(canonical)-1] == canonical[:-1]):
+            state = self._read_state()
+            self._verify_executor_frontiers(state, len(canonical))
+            c, target, stage0, stage1, draft, epoch = state.frontiers
+            if c == target + 1 and stage0 == stage1 == draft == target and epoch <= 0xffffffff:
+                response = self.transport.call(OPCODES['replace_pending_terminal'],
+                    tokens=[canonical[-1],values[len(canonical)-1]], argument0=c, argument1=epoch,
+                    timeout_ms=timeout_ms)
+                if response.status == 1:
+                    # Sampled/unsupported sessions may decline this optional
+                    # operation. Fallback only after an unchanged-state reply.
+                    if response.frontiers != state.frontiers:
+                        raise ControlPlaneError(503, 'frontier_divergence', 'declined pending replacement changed state')
+                else:
+                    _require_ok(response, 'replace_pending_terminal')
+                    self._verify_executor_frontiers(response, len(canonical))
+                    if response.frontiers != (*state.frontiers[:5], epoch + 1):
+                        raise ControlPlaneError(503, 'frontier_divergence', 'pending replacement advanced unexpected frontiers')
+                    canonical[-1] = values[len(canonical)-1]
+                    record.revision += 1
+                    record.refresh_hashes(rebuild=True)
+                    matching = replaced = True
         validation_ns = time.perf_counter_ns() - started
         reset_ns = 0
         rebuilt = record.cold_rebuild and not canonical
@@ -442,13 +527,15 @@ class Q38ControlPlane:
         }[cache_status]
         with self._state:
             self._cache_counters[counter] += 1
+            self._cache_counters['terminal_prefix_hits'] += int(replaced)
         return {
-            "prefix_tokens": len(values) - len(suffix),
-            "suffix_tokens": len(suffix),
+            "prefix_tokens": len(values) - len(suffix) - int(replaced),
+            "suffix_tokens": len(suffix) + int(replaced),
             "prefix_validation_ns": validation_ns,
             "reset_ns": reset_ns,
             "cold_rebuild": rebuilt,
             "cache_status": cache_status,
+            "terminal_prefix_reused": replaced,
         }
 
     def append_full_history(
@@ -473,6 +560,7 @@ class Q38ControlPlane:
         mode: str,
         mtp_width: int,
         timeout_ms: int,
+        stop_event: threading.Event | None = None,
     ) -> Iterator[CommittedTokenEvent]:
         if max_new_tokens <= 0:
             raise ControlPlaneError(
@@ -495,8 +583,10 @@ class Q38ControlPlane:
             raise ControlPlaneError(409, "empty_prompt", "generation requires a prompt")
 
         generated = 0
+        state = self._read_state()
         while generated < max_new_tokens:
-            state = self._read_state()
+            if stop_event is not None and stop_event.is_set():
+                raise ControlPlaneError(499, "stream_cancelled", "stream was cancelled")
             self._verify_executor_frontiers(state, len(record.canonical_tokens))
             canonical, target = state.frontiers[:2]
             remaining = max_new_tokens - generated
@@ -528,10 +618,15 @@ class Q38ControlPlane:
             values = self._validate_tokens(response.tokens)
             expected = len(record.canonical_tokens) + len(values)
             self._verify_executor_frontiers(response, expected)
+            state = response
             record.canonical_tokens.extend(values)
             record.revision += 1
             record.refresh_hashes()
             generated += len(values)
+            # A cancellation can race an OK commit. Canonical bookkeeping must
+            # reflect that commit even if its SSE event will not be delivered.
+            if stop_event is not None and stop_event.is_set():
+                raise ControlPlaneError(499, "stream_cancelled", "stream was cancelled")
             hit_stop = any(token in self.stop_token_ids for token in values)
             finish = "stop" if hit_stop else (
                 "length" if generated == max_new_tokens else None
@@ -555,7 +650,7 @@ class Q38ControlPlane:
         mtp_width: int = 1,
         timeout_ms: int | None = None,
     ) -> Iterator[CommittedTokenEvent]:
-        with self._writer:
+        with self._writer, (self.transport.writer_connection() if hasattr(self.transport, "writer_connection") else nullcontext()):
             record = self._session_checked(session_id)
             yield from self._generate_locked(
                 record,
@@ -574,10 +669,15 @@ class Q38ControlPlane:
         mode: str = "plain",
         mtp_width: int = 1,
         timeout_ms: int | None = None,
+        stop_event: threading.Event | None = None,
     ) -> Iterator[tuple[CommittedTokenEvent, dict[str, int | bool | str]]]:
         """Append an exact suffix and generate under one semantic writer lease."""
 
-        with self._writer:
+        connection = (self.transport.writer_connection(stop_event) if stop_event is not None
+                      else self.transport.writer_connection()) if hasattr(self.transport, "writer_connection") else nullcontext()
+        with self._writer, self._stream_lease(stop_event), connection:
+            if stop_event is not None and stop_event.is_set():
+                raise ControlPlaneError(499, "stream_cancelled", "stream was cancelled")
             record = self._session_checked(session_id)
             effective_timeout = timeout_ms or self.default_timeout_ms
             timing = self._append_full_history_locked(
@@ -589,10 +689,38 @@ class Q38ControlPlane:
                 mode=mode,
                 mtp_width=mtp_width,
                 timeout_ms=effective_timeout,
+                stop_event=stop_event,
             ):
                 yield event, timing
 
+    @contextmanager
+    def _stream_lease(self, stop_event: threading.Event | None):
+        with self._stream_guard:
+            self._stream_stop = stop_event
+        try:
+            yield
+        finally:
+            with self._stream_guard:
+                self._stream_stop = None
+
+    def stop_stream(self, owner: threading.Event) -> None:
+        with self._stream_guard:
+            owner.set()
+            if self._stream_stop is owner and hasattr(self.transport, "cancel_owned"):
+                self.transport.cancel_owned(owner)
+
     def cancel(self) -> dict[str, object]:
+        with self._stream_guard:
+            if self._stream_stop is not None:
+                owner = self._stream_stop
+                owner.set()
+                response = self.transport.cancel_owned(owner) if hasattr(self.transport, "cancel_owned") else None
+                # Status 2 is an already-finished writer racing cancellation;
+                # the owner's stop flag still prevents another transaction.
+                if response is not None and response.status != 2:
+                    _require_ok(response, "cancel")
+                return {"cancelled_request_id": None if response is None else response.request_id,
+                        "status": "cancel_requested"}
         target = self.transport.active_request_id
         if target is None:
             raise ControlPlaneError(409, "no_active_writer", "no writer is active")
@@ -637,6 +765,10 @@ class HuggingFaceCodec:
         )
         eos = self.tokenizer.eos_token_id
         self.stop_token_ids = () if eos is None else (int(eos),)
+        vocab = self.tokenizer.get_vocab()
+        self.output_end_token_ids = frozenset(self.stop_token_ids) | {
+            vocab[tag] for tag in ("<|im_end|>", "<|endoftext|>") if tag in vocab
+        }
 
     def encode_chat(
         self,
@@ -667,6 +799,80 @@ class HuggingFaceCodec:
         return [int(token) for token in values]
 
     def decode(self, tokens: Sequence[int]) -> str:
+        # Keep reasoning/tool delimiters for the response parser, but never
+        # publish a turn terminator or text following it. This also keeps
+        # cumulative streaming decodes stable after the first terminator.
+        visible = []
+        for token in tokens:
+            if token in self.output_end_token_ids:
+                break
+            visible.append(token)
         return self.tokenizer.decode(
-            list(tokens), skip_special_tokens=False, clean_up_tokenization_spaces=False
+            visible, skip_special_tokens=False, clean_up_tokenization_spaces=False
         )
+
+    def stream_decoder(self) -> "StreamingTextDecoder":
+        return StreamingTextDecoder(self)
+
+
+class StreamingTextDecoder:
+    """Decode new IDs once; hold incomplete UTF-8 until its next token arrives.
+
+    Use the tokenizer's own streaming decoder for a ByteLevel backend. Other
+    tokenizers retain a cumulative fallback. A single final batch decode checks
+    the emitted prefix and flushes a truncated byte sequence exactly as decode().
+    """
+
+    def __init__(self, codec: HuggingFaceCodec) -> None:
+        self.codec = codec
+        self.tokens: list[int] = []
+        self.fragments: list[str] = []
+        self.previous = ""
+        self.ended = False
+        self.finalized = False
+        self.backend = getattr(getattr(codec, "tokenizer", None), "backend_tokenizer", None)
+        self.stream = None
+        if self.backend is not None:
+            try:
+                from tokenizers.decoders import DecodeStream
+                decoder = json.loads(self.backend.decoder.__getstate__())
+                if decoder.get("type") == "ByteLevel":
+                    self.stream = DecodeStream(skip_special_tokens=False)
+            except (ImportError, AttributeError, TypeError, ValueError):
+                pass
+
+    def push(self, tokens: Sequence[int], *, final: bool = False) -> str:
+        if self.finalized:
+            raise RuntimeError("stream decoder already finalized")
+        end_ids = getattr(self.codec, "output_end_token_ids", ())
+        visible: list[int] = []
+        for token in tokens:
+            if self.ended:
+                break
+            if token in end_ids:
+                self.ended = True
+                break
+            visible.append(token)
+        self.tokens.extend(visible)
+        if self.stream is not None:
+            fragment = (self.stream.step(self.backend, visible) or "") if visible else ""
+        else:
+            decoded = self.codec.decode(self.tokens)
+            # A replacement at the end may be a split UTF-8 character rather
+            # than actual output. Publishing it would require retracting SSE.
+            stable = decoded if final or self.ended else decoded.rstrip("\ufffd")
+            if not stable.startswith(self.previous):
+                raise RuntimeError("tokenizer changed an already emitted prefix")
+            fragment = stable[len(self.previous):]
+            self.previous = stable
+        self.fragments.append(fragment)
+        if final:
+            decoded = self.codec.decode(self.tokens)
+            emitted = "".join(self.fragments)
+            if not decoded.startswith(emitted):
+                raise RuntimeError("streamed text differs from final tokenizer decode")
+            tail = decoded[len(emitted):]
+            self.fragments.append(tail)
+            fragment += tail
+            self.finalized = True
+        return fragment

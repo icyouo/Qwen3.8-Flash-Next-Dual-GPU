@@ -222,7 +222,7 @@ __global__ void expert_down_decode_kernel(
     const void* data, const std::uint16_t* scales,
     const std::uint16_t* activated, const std::int32_t* expert_ids,
     const float* expert_weights, std::uint32_t top_k,
-    std::uint16_t* routed_output) {
+    std::uint16_t* routed_output, float* partial_output_f32) {
     constexpr std::uint32_t rows = kQ38HiddenWidth;
     constexpr std::uint32_t columns = kQ38MoeIntermediate;
     extern __shared__ std::uint16_t cached_activated[];
@@ -251,8 +251,10 @@ __global__ void expert_down_decode_kernel(
         }
         __syncthreads();
     }
-    if (row < rows && lane == 0)
-        store_bf16(routed_output, row, total);
+    if (row < rows && lane == 0) {
+        if (partial_output_f32) partial_output_f32[row] = total;
+        else store_bf16(routed_output, row, total);
+    }
 }
 
 __global__ void expert_gate_up_kernel(
@@ -353,7 +355,8 @@ void validate_expert_tensor(const CudaTensorViewV1& tensor,
                             std::uint32_t rows, std::uint32_t columns) {
     if (tensor.empty() || !tensor.data || !tensor.scales ||
         tensor.descriptor->shape.size() != 3 ||
-        tensor.descriptor->shape[0] != kQ38MoeExperts ||
+        (tensor.descriptor->shape[0] != kQ38MoeExperts &&
+         tensor.descriptor->shape[0] * 2u != kQ38MoeExperts) ||
         tensor.descriptor->shape[1] != rows ||
         tensor.descriptor->shape[2] != columns ||
         tensor.descriptor->group_size != 128 ||
@@ -371,7 +374,7 @@ void cuda_moe_routed_bf16(
     std::uint32_t tokens, std::uint32_t top_k,
     std::uint16_t* gate_up_scratch, std::uint16_t* activated_scratch,
     float* accumulation_scratch, std::uint16_t* routed_output, void* stream,
-    int device) {
+    int device, float* partial_output_f32) {
     validate_expert_tensor(gate_up_experts, 2 * kQ38MoeIntermediate,
                            kQ38HiddenWidth);
     validate_expert_tensor(down_experts, kQ38HiddenWidth,
@@ -434,7 +437,7 @@ void cuda_moe_routed_bf16(
                     down_experts.data,
                     static_cast<const std::uint16_t*>(down_experts.scales),
                     activated_scratch, expert_ids, expert_weights, top_k,
-                    routed_output);
+                    routed_output, partial_output_f32);
         } else if (down_experts.layout ==
                    CudaWeightLayoutV1::kMoeW4Tile16x16) {
             expert_down_decode_kernel<4, true>
@@ -443,7 +446,7 @@ void cuda_moe_routed_bf16(
                     down_experts.data,
                     static_cast<const std::uint16_t*>(down_experts.scales),
                     activated_scratch, expert_ids, expert_weights, top_k,
-                    routed_output);
+                    routed_output, partial_output_f32);
         } else {
             expert_down_decode_kernel<4, false>
                 <<<down_blocks, kDecodeThreads, down_shared_bytes,
@@ -451,7 +454,7 @@ void cuda_moe_routed_bf16(
                     down_experts.data,
                     static_cast<const std::uint16_t*>(down_experts.scales),
                     activated_scratch, expert_ids, expert_weights, top_k,
-                    routed_output);
+                    routed_output, partial_output_f32);
         }
         check(cudaPeekAtLastError(), "decode routed MoE kernels");
         return;
@@ -478,6 +481,12 @@ void cuda_moe_routed_bf16(
         static_cast<const std::uint16_t*>(down_experts.scales),
         activated_scratch, expert_ids, expert_weights, top_k,
         accumulation_scratch);
+    if (partial_output_f32) {
+        check(cudaMemcpyAsync(partial_output_f32, accumulation_scratch,
+            accumulation_elements * sizeof(float), cudaMemcpyDeviceToDevice,
+            stream_value), "copy routed MoE FP32 partial");
+        return;
+    }
     const auto blocks = static_cast<unsigned>((accumulation_elements + 255) / 256);
     float_to_bf16_kernel<<<blocks, 256, 0, stream_value>>>(
         accumulation_scratch, routed_output, accumulation_elements);

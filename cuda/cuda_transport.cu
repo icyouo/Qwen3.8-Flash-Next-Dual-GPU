@@ -79,10 +79,14 @@ void launch_boundary_checksum(const std::uint16_t* words,
 struct RingState {
     struct Slot {
         std::uint16_t* host = nullptr;
+        std::uint16_t* device_payload = nullptr;
+        cudaEvent_t produced = nullptr;
         unsigned long long* checksum_host = nullptr;
         unsigned long long* checksum_device = nullptr;
         cudaEvent_t checksum_ready = nullptr;
         cudaEvent_t ready = nullptr;
+        cudaEvent_t consumed = nullptr;
+        bool consumer_pending = false;
         bool leased = false;
     };
 
@@ -97,12 +101,25 @@ struct RingState {
                          options.hidden_width;
         check(cudaSetDevice(options.producer_device), "cudaSetDevice(producer)");
         try {
+            if (options.asynchronous_copy)
+                check(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking),
+                      "cudaStreamCreate(boundary copy)");
             slots.resize(options.slots);
             for (auto& slot : slots) {
-                check(cudaHostAlloc(reinterpret_cast<void**>(&slot.host),
+                if (options.asynchronous_copy || options.device_only) {
+                    check(cudaMalloc(reinterpret_cast<void**>(&slot.device_payload),
+                        capacity_words * sizeof(std::uint16_t)),
+                        "cudaMalloc(boundary slot payload)");
+                    check(cudaEventCreateWithFlags(&slot.produced, cudaEventDisableTiming),
+                        "cudaEventCreate(boundary produced)");
+                }
+                if (!options.device_only) check(cudaHostAlloc(reinterpret_cast<void**>(&slot.host),
                                     capacity_words * sizeof(std::uint16_t),
                                     cudaHostAllocPortable),
                       "cudaHostAlloc(boundary)");
+                if (options.device_only)
+                    check(cudaEventCreateWithFlags(&slot.consumed, cudaEventDisableTiming),
+                          "cudaEventCreate(boundary consumed)");
                 check(cudaHostAlloc(
                           reinterpret_cast<void**>(&slot.checksum_host),
                           sizeof(*slot.checksum_host), cudaHostAllocPortable),
@@ -128,7 +145,14 @@ struct RingState {
 
     void release() noexcept {
         (void)cudaSetDevice(options.producer_device);
+        if (copy_stream) (void)cudaStreamSynchronize(copy_stream);
         for (auto& slot : slots) {
+            if (slot.consumer_pending) (void)cudaEventSynchronize(slot.consumed);
+            if (slot.consumed) (void)cudaEventDestroy(slot.consumed);
+            if (slot.produced) (void)cudaEventDestroy(slot.produced);
+            if (slot.device_payload) (void)cudaFree(slot.device_payload);
+            slot.produced = nullptr;
+            slot.device_payload = nullptr;
             if (slot.checksum_ready)
                 (void)cudaEventDestroy(slot.checksum_ready);
             if (slot.ready) (void)cudaEventDestroy(slot.ready);
@@ -143,8 +167,11 @@ struct RingState {
             slot.checksum_host = nullptr;
             slot.host = nullptr;
         }
+        if (copy_stream) (void)cudaStreamDestroy(copy_stream);
+        copy_stream = nullptr;
     }
 
+    cudaStream_t copy_stream = nullptr;
     CudaBoundaryRingOptions options;
     std::size_t capacity_words = 0;
     std::vector<Slot> slots;
@@ -169,7 +196,22 @@ public:
     }
 
     const std::uint16_t* data() const override {
+        if (state_->options.device_only)
+            throw std::logic_error("device boundary requires a device consumer");
         return state_->slots[slot_].host;
+    }
+    const std::uint16_t* device_data(int device) const override {
+        return state_->options.device_only && device == state_->options.producer_device
+            ? state_->slots[slot_].device_payload : nullptr;
+    }
+    void record_device_consumer(int device, void* stream) const override {
+        if (!device_data(device) || !stream)
+            throw std::invalid_argument("invalid device boundary consumer");
+        check(cudaSetDevice(device), "select boundary consumer event device");
+        auto& value = state_->slots[slot_];
+        check(cudaEventRecord(value.consumed, static_cast<cudaStream_t>(stream)),
+              "record device boundary consumer");
+        value.consumer_pending = true;
     }
     std::size_t size() const override { return words_; }
     std::uint32_t slot() const override {
@@ -180,6 +222,7 @@ public:
               "cudaSetDevice(boundary wait)");
         check(cudaEventSynchronize(state_->slots[slot_].ready),
               "cudaEventSynchronize(boundary)");
+        if (state_->options.device_only) return;
         const auto actual = boundary_payload_checksum(
             state_->slots[slot_].host, words_);
         if (actual != *state_->slots[slot_].checksum_host)
@@ -239,6 +282,26 @@ std::shared_ptr<const BoundaryLease> CudaBoundaryRing::copy_from_device(
         check(cudaSetDevice(state.options.producer_device),
               "cudaSetDevice(boundary copy)");
         auto stream = reinterpret_cast<cudaStream_t>(producer_stream);
+        if (state.slots[selected].consumer_pending) {
+            check(cudaStreamWaitEvent(stream, state.slots[selected].consumed, 0),
+                  "wait device boundary slot consumer");
+            state.slots[selected].consumer_pending = false;
+        }
+        if (state.slots[selected].device_payload) {
+            // Snapshot the reusable producer buffer into the leased device
+            // slot before allowing the next stage0 chunk to overwrite it.
+            check(cudaMemcpyAsync(state.slots[selected].device_payload, device_source,
+                words * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice, stream),
+                "cudaMemcpyAsync(boundary device slot)");
+            device_source = state.slots[selected].device_payload;
+        }
+        if (state.copy_stream) {
+            check(cudaEventRecord(state.slots[selected].produced, stream),
+                  "cudaEventRecord(boundary produced)");
+            check(cudaStreamWaitEvent(state.copy_stream, state.slots[selected].produced, 0),
+                  "cudaStreamWaitEvent(boundary produced)");
+            stream = state.copy_stream;
+        }
         launch_boundary_checksum(device_source, words,
                                  state.slots[selected].checksum_device,
                                  stream);
@@ -249,7 +312,7 @@ std::shared_ptr<const BoundaryLease> CudaBoundaryRing::copy_from_device(
               "cudaMemcpyAsync(boundary checksum)");
         check(cudaEventRecord(state.slots[selected].checksum_ready, stream),
               "cudaEventRecord(boundary checksum)");
-        check(cudaMemcpyAsync(state.slots[selected].host, device_source,
+        if (!state.options.device_only) check(cudaMemcpyAsync(state.slots[selected].host, device_source,
                               words * sizeof(std::uint16_t),
                               cudaMemcpyDeviceToHost, stream),
               "cudaMemcpyAsync(boundary D2H)");
@@ -281,13 +344,15 @@ CudaBoundaryRingStats CudaBoundaryRing::stats() const {
 std::uint64_t CudaBoundaryRing::pinned_bytes() const {
     const auto& state = *impl_->state;
     return static_cast<std::uint64_t>(state.slots.size()) *
-           (state.capacity_words * sizeof(std::uint16_t) +
+           ((state.options.device_only ? 0 : state.capacity_words * sizeof(std::uint16_t)) +
             sizeof(unsigned long long));
 }
 
 std::uint64_t CudaBoundaryRing::device_bytes() const {
     return static_cast<std::uint64_t>(impl_->state->slots.size()) *
-           sizeof(unsigned long long);
+           (sizeof(unsigned long long) +
+            (impl_->state->options.asynchronous_copy || impl_->state->options.device_only
+                 ? impl_->state->capacity_words * sizeof(std::uint16_t) : 0));
 }
 
 void cuda_copy_boundary_to_device(const BoundaryBuffer& boundary,
@@ -300,6 +365,15 @@ void cuda_copy_boundary_to_device(const BoundaryBuffer& boundary,
     if (boundary.frame.payload_checksum != boundary.payload_checksum())
         throw std::runtime_error("CUDA boundary frame checksum mismatch");
     check(cudaSetDevice(consumer_device), "cudaSetDevice(boundary consumer)");
+    if (boundary.lease) {
+        if (const auto* source = boundary.lease->device_data(consumer_device)) {
+            check(cudaMemcpyAsync(device_destination, source,
+                boundary.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice,
+                reinterpret_cast<cudaStream_t>(consumer_stream)), "device boundary D2D");
+            boundary.lease->record_device_consumer(consumer_device, consumer_stream);
+            return;
+        }
+    }
     check(cudaMemcpyAsync(device_destination, boundary.data(),
                           boundary.size() * sizeof(std::uint16_t),
                           cudaMemcpyHostToDevice,

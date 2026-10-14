@@ -33,6 +33,11 @@ enum class ExecutorRpcOpcodeV1 : std::uint32_t {
     // Read-only, opt-in snapshot of the last committed target logits.
     // argument0=0 returns metadata; argument0=1 includes exact BF16 LE hex.
     kLogits = 10,
+    // Writer: request token payload contains bounded proposed draft tokens.
+    kVerifyCandidates = 11,
+    // Writer: [expected stop, replacement], argument0=canonical, argument1=epoch.
+    // Only an unprocessed terminal in a greedy session can be replaced.
+    kReplacePendingTerminal = 12,
 };
 
 enum class ExecutorRpcStatusV1 : std::uint32_t {

@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <type_traits>
 
 #ifndef Q38_QSA_MAX_SCORE_CTAS
 #define Q38_QSA_MAX_SCORE_CTAS 1024
@@ -19,6 +20,10 @@
 namespace q38 {
 
 namespace {
+thread_local const std::uint32_t* qsa_capture_position = nullptr;
+thread_local unsigned qsa_capture_tokens = 0;
+thread_local CudaQsaHeadLayout qsa_head_layout{};
+
 
 void check(cudaError_t status, const char* operation) {
     if (status != cudaSuccess)
@@ -109,14 +114,15 @@ __device__ float rope_value(const float* values, std::uint32_t element,
 __global__ void qsa_prepare_query_kernel(
     const std::uint16_t* projected, const std::uint16_t* norm_weight,
     std::uint16_t* query, std::uint16_t* gate,
-    std::uint32_t first_position) {
-    const auto head = blockIdx.x;
+    std::uint32_t first_position, const std::uint32_t* graph_position = nullptr, CudaQsaHeadLayout layout = {}) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto head = blockIdx.x + layout.head_begin;
     const auto token = blockIdx.y;
     const auto element = threadIdx.x;
     const auto projected_base =
         static_cast<std::uint64_t>(token) *
-            kQ38QsaHeads * 2 * kQ38QsaHeadWidth +
-        head * (2 * kQ38QsaHeadWidth);
+            layout.projected_head_count * 2 * kQ38QsaHeadWidth +
+        (head - layout.projected_head_begin) * (2 * kQ38QsaHeadWidth);
     const float raw = bf16_load(projected, projected_base + element);
     const float norm = block_sum<256>(raw * raw);
     __shared__ float normalized[kQ38QsaHeadWidth];
@@ -138,7 +144,8 @@ __global__ void qsa_prepare_query_kernel(
 __global__ void qsa_prepare_kv_kernel(
     const std::uint16_t* projected_k, const std::uint16_t* projected_v,
     const std::uint16_t* norm_weight, std::uint16_t* cache_k,
-    std::uint16_t* cache_v, std::uint32_t first_position) {
+    std::uint16_t* cache_v, std::uint32_t first_position, const std::uint32_t* graph_position = nullptr) {
+    first_position = graph_position ? *graph_position : first_position;
     const auto head = blockIdx.x;
     const auto token = blockIdx.y;
     const auto element = threadIdx.x;
@@ -164,7 +171,8 @@ __global__ void qsa_prepare_kv_kernel(
 
 __global__ void qsa_prepare_index_query_kernel(
     const std::uint16_t* projected, const std::uint16_t* norm_weight,
-    std::uint16_t* query, std::uint32_t first_position) {
+    std::uint16_t* query, std::uint32_t first_position, const std::uint32_t* graph_position = nullptr) {
+    first_position = graph_position ? *graph_position : first_position;
     const auto head = blockIdx.x;
     const auto token = blockIdx.y;
     const auto element = threadIdx.x;
@@ -188,7 +196,8 @@ __global__ void qsa_prepare_index_query_kernel(
 
 __global__ void qsa_store_raw_index_key_kernel(
     const std::uint16_t* projected, std::uint16_t* raw_cache,
-    std::uint32_t first_position) {
+    std::uint32_t first_position, const std::uint32_t* graph_position = nullptr) {
+    first_position = graph_position ? *graph_position : first_position;
     const auto token = blockIdx.x;
     const auto element = threadIdx.x;
     const auto position = first_position + token;
@@ -204,7 +213,12 @@ __global__ void qsa_store_raw_index_key_kernel(
 
 __global__ void qsa_pool_index_key_kernel(
     const std::uint16_t* raw_cache, const std::uint16_t* norm_weight,
-    std::uint16_t* pooled_cache, std::uint32_t first_block) {
+    std::uint16_t* pooled_cache, std::uint32_t first_block, const std::uint32_t* graph_position = nullptr, unsigned graph_tokens = 0) {
+    if(graph_position) {
+        first_block = *graph_position / kQ38QsaBlockTokens;
+        if(first_block + blockIdx.x >= (*graph_position + graph_tokens) / kQ38QsaBlockTokens) return;
+    }
+
     const auto block = first_block + blockIdx.x;
     const auto element = threadIdx.x;
     const auto first_position = block * kQ38QsaBlockTokens;
@@ -231,8 +245,8 @@ __global__ void qsa_pool_index_key_kernel(
 __global__ void qsa_attention_scores_kernel(
     const std::uint16_t* query, const std::uint16_t* keys,
     const std::int32_t* selected, std::uint32_t selected_count,
-    float* scores) {
-    const auto head = blockIdx.x;
+    float* scores, CudaQsaHeadLayout layout = {}) {
+    const auto head = blockIdx.x + layout.head_begin;
     const auto tile = blockIdx.y;
     const auto warp = threadIdx.x >> 5;
     const auto lane = threadIdx.x & 31;
@@ -266,8 +280,8 @@ __global__ void qsa_attention_scores_kernel(
 }
 
 __global__ void qsa_attention_softmax_kernel(
-    std::uint32_t selected_count, float* scores) {
-    const auto head = blockIdx.x;
+    std::uint32_t selected_count, float* scores, CudaQsaHeadLayout layout = {}) {
+    const auto head = blockIdx.x + layout.head_begin;
     const auto score_base = static_cast<std::uint64_t>(head) * selected_count;
     float local_max = -3.402823466e+38F;
     for (std::uint32_t index = threadIdx.x; index < selected_count;
@@ -292,8 +306,8 @@ __global__ void qsa_attention_softmax_kernel(
 __global__ void qsa_attention_output_kernel(
     const std::uint16_t* values, const std::int32_t* selected,
     std::uint32_t selected_count, const float* scores,
-    std::uint16_t* output) {
-    const auto head = blockIdx.x;
+    std::uint16_t* output, CudaQsaHeadLayout layout = {}) {
+    const auto head = blockIdx.x + layout.head_begin;
     const auto element = blockIdx.y * blockDim.x + threadIdx.x;
     if (element >= kQ38QsaHeadWidth) return;
     const auto kv_head = head / (kQ38QsaHeads / kQ38QsaKvHeads);
@@ -317,7 +331,8 @@ __global__ void qsa_attention_output_kernel(
 __global__ void qsa_index_scores_prefill_kernel(
     const std::uint16_t* query, const std::uint16_t* pooled_keys,
     std::uint32_t first_position, float* scores,
-    std::uint32_t score_stride) {
+    std::uint32_t score_stride, const std::uint32_t* graph_position = nullptr) {
+    first_position = graph_position ? *graph_position : first_position;
     const auto token = blockIdx.x;
     const auto position = first_position + token;
     const auto complete_blocks = (position + 1) / kQ38QsaBlockTokens;
@@ -540,7 +555,8 @@ __global__ void qsa_radix8_gather_decode_kernel(
 }
 
 __global__ void qsa_radix8_init_prefill_kernel(
-    std::uint32_t first_position, std::int32_t* selected) {
+    std::uint32_t first_position, std::int32_t* selected, const std::uint32_t* graph_position = nullptr) {
+    first_position = graph_position ? *graph_position : first_position;
     const auto token = blockIdx.x;
     const auto position = first_position + token;
     const auto complete_blocks = (position + 1) / kQ38QsaBlockTokens;
@@ -563,7 +579,8 @@ __global__ void qsa_radix8_init_prefill_kernel(
 // occupied without the 32 complete-history passes used by the v1 selector.
 __global__ void qsa_radix8_histogram_prefill_kernel(
     const float* scores, std::uint32_t score_stride,
-    std::uint32_t first_position, int shift, std::int32_t* selected) {
+    std::uint32_t first_position, int shift, std::int32_t* selected, const std::uint32_t* graph_position = nullptr) {
+    first_position = graph_position ? *graph_position : first_position;
     const auto token = blockIdx.y;
     const auto position = first_position + token;
     const auto complete_blocks = (position + 1) / kQ38QsaBlockTokens;
@@ -591,7 +608,8 @@ __global__ void qsa_radix8_histogram_prefill_kernel(
 }
 
 __global__ void qsa_radix8_choose_prefill_kernel(
-    std::uint32_t first_position, int shift, std::int32_t* selected) {
+    std::uint32_t first_position, int shift, std::int32_t* selected, const std::uint32_t* graph_position = nullptr) {
+    first_position = graph_position ? *graph_position : first_position;
     const auto token = blockIdx.x;
     const auto position = first_position + token;
     const auto complete_blocks = (position + 1) / kQ38QsaBlockTokens;
@@ -622,7 +640,8 @@ __global__ void qsa_radix8_choose_prefill_kernel(
 
 __global__ void qsa_radix8_gather_prefill_kernel(
     const float* scores, std::uint32_t score_stride,
-    std::uint32_t first_position, std::int32_t* selected) {
+    std::uint32_t first_position, std::int32_t* selected, const std::uint32_t* graph_position = nullptr) {
+    first_position = graph_position ? *graph_position : first_position;
     const auto token = blockIdx.x;
     const auto position = first_position + token;
     const auto complete_blocks = (position + 1) / kQ38QsaBlockTokens;
@@ -703,8 +722,9 @@ __global__ void qsa_radix8_gather_prefill_kernel(
 __global__ void qsa_attention_scores_prefill_kernel(
     const std::uint16_t* query, const std::uint16_t* keys,
     const std::int32_t* selected, std::uint32_t first_position,
-    float* scores) {
-    const auto head = blockIdx.x;
+    float* scores, const std::uint32_t* graph_position = nullptr, CudaQsaHeadLayout layout = {}) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto head = blockIdx.x + layout.head_begin;
     const auto token = blockIdx.y;
     const auto warp = threadIdx.x >> 5;
     const auto lane = threadIdx.x & 31;
@@ -725,9 +745,9 @@ __global__ void qsa_attention_scores_prefill_kernel(
     const auto score_base =
         (static_cast<std::uint64_t>(token) * kQ38QsaHeads + head) *
         kQ38QsaMaximumSelected;
-    for (std::uint32_t selected_index = warp;
+    for (std::uint32_t selected_index = warp + blockIdx.z * kWarpsPerBlock;
          selected_index < selected_count;
-         selected_index += kWarpsPerBlock) {
+         selected_index += kWarpsPerBlock * gridDim.z) {
         const auto source_position = token_selected[selected_index];
         const auto key_base =
             (static_cast<std::uint64_t>(source_position) * kQ38QsaKvHeads +
@@ -748,8 +768,9 @@ __global__ void qsa_attention_scores_prefill_kernel(
 __global__ void qsa_attention_output_prefill_kernel(
     const std::uint16_t* values, const std::int32_t* selected,
     std::uint32_t first_position, float* scores,
-    std::uint16_t* output) {
-    const auto head = blockIdx.x;
+    std::uint16_t* output, const std::uint32_t* graph_position = nullptr, CudaQsaHeadLayout layout = {}) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto head = blockIdx.x + layout.head_begin;
     const auto token = blockIdx.y;
     const auto element = threadIdx.x;
     const auto position = first_position + token;
@@ -798,6 +819,112 @@ __global__ void qsa_attention_output_prefill_kernel(
                value);
 }
 
+template<unsigned Unroll>
+__global__ void qsa_attention_output_staged_kernel(
+    const std::uint16_t* values, const std::int32_t* selected,
+    std::uint32_t first_position, float* scores,
+    std::uint16_t* output, const std::uint32_t* graph_position = nullptr, CudaQsaHeadLayout layout = {}) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto head = blockIdx.x + layout.head_begin;
+    const auto token = blockIdx.y;
+    const auto element = threadIdx.x;
+    const auto position = first_position + token;
+    const auto complete_blocks = (position + 1) / kQ38QsaBlockTokens;
+    const auto selected_count =
+        min(complete_blocks, static_cast<std::uint32_t>(kQ38QsaBlockBudget)) *
+            kQ38QsaBlockTokens +
+        (position + 1) % kQ38QsaBlockTokens;
+    const auto kv_head = head / (kQ38QsaHeads / kQ38QsaKvHeads);
+    const auto* token_selected =
+        selected + static_cast<std::uint64_t>(token) *
+                       kQ38QsaMaximumSelected;
+    const auto score_base =
+        (static_cast<std::uint64_t>(token) * kQ38QsaHeads + head) *
+        kQ38QsaMaximumSelected;
+    float local_max = -3.402823466e+38F;
+    for (std::uint32_t index = threadIdx.x; index < selected_count;
+         index += blockDim.x)
+        local_max = fmaxf(local_max, scores[score_base + index]);
+    const float maximum = block_max<256>(local_max);
+    float local_sum = 0.0f;
+    for (std::uint32_t index = threadIdx.x; index < selected_count;
+         index += blockDim.x)
+        local_sum += expf(scores[score_base + index] - maximum);
+    const float denominator = block_sum<256>(local_sum);
+    __shared__ float probabilities[kQ38QsaMaximumSelected];
+    __shared__ std::int32_t positions[kQ38QsaMaximumSelected];
+    for (std::uint32_t index = threadIdx.x; index < selected_count;
+         index += blockDim.x) {
+        const float probability=expf(scores[score_base + index] - maximum) / denominator;
+        scores[score_base + index]=probability;
+        probabilities[index]=probability;
+        positions[index]=token_selected[index];
+    }
+    __syncthreads();
+    float value = 0.0f;
+    #pragma unroll Unroll
+    for (std::uint32_t index = 0; index < selected_count; ++index) {
+        const auto source_position = positions[index];
+        value += probabilities[index] *
+                 bf16_load(values,
+                           (static_cast<std::uint64_t>(source_position) *
+                                kQ38QsaKvHeads +
+                            kv_head) *
+                                   kQ38QsaHeadWidth +
+                               element);
+    }
+    bf16_store(output,
+               (static_cast<std::uint64_t>(token) * kQ38QsaHeads + head) *
+                       kQ38QsaHeadWidth +
+                   element,
+               value);
+}
+
+// Keep the original 256-thread softmax arithmetic; value CTAs only change
+// ownership of output coordinates, never the ordered FP32 value accumulation.
+__global__ void qsa_probabilities_prefill_kernel(
+    std::uint32_t first_position, float* scores,
+    const std::uint32_t* graph_position, CudaQsaHeadLayout layout) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto head = blockIdx.x + layout.head_begin;
+    const auto token = blockIdx.y;
+    const auto visible = first_position + token + 1;
+    const auto count = min(visible / kQ38QsaBlockTokens,
+        static_cast<std::uint32_t>(kQ38QsaBlockBudget)) * kQ38QsaBlockTokens
+        + visible % kQ38QsaBlockTokens;
+    const auto base = (static_cast<std::uint64_t>(token) * kQ38QsaHeads + head) * kQ38QsaMaximumSelected;
+    float maximum = -3.402823466e+38F;
+    for (unsigned i=threadIdx.x;i<count;i+=256) maximum=fmaxf(maximum,scores[base+i]);
+    maximum=block_max<256>(maximum);
+    float sum=0.0f;
+    for (unsigned i=threadIdx.x;i<count;i+=256) sum+=expf(scores[base+i]-maximum);
+    const float denominator=block_sum<256>(sum);
+    for (unsigned i=threadIdx.x;i<count;i+=256) scores[base+i]=expf(scores[base+i]-maximum)/denominator;
+}
+__global__ void qsa_values_tiled_prefill_kernel(
+    const std::uint16_t* values, const std::int32_t* selected,
+    std::uint32_t first_position, const float* scores, std::uint16_t* output,
+    const std::uint32_t* graph_position, CudaQsaHeadLayout layout) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto head = blockIdx.x + layout.head_begin;
+    const auto token = blockIdx.y;
+    const auto element = blockIdx.z * blockDim.x + threadIdx.x;
+    const auto visible = first_position + token + 1;
+    const auto count = min(visible / kQ38QsaBlockTokens,
+        static_cast<std::uint32_t>(kQ38QsaBlockBudget)) * kQ38QsaBlockTokens
+        + visible % kQ38QsaBlockTokens;
+    const auto kv_head = head / (kQ38QsaHeads / kQ38QsaKvHeads);
+    const auto* indices = selected + static_cast<std::uint64_t>(token) * kQ38QsaMaximumSelected;
+    const auto base = (static_cast<std::uint64_t>(token) * kQ38QsaHeads + head) * kQ38QsaMaximumSelected;
+    float value=0.0f;
+    for(unsigned i=0;i<count;++i) {
+        const auto source_position=indices[i];
+        value += scores[base+i] * bf16_load(values,
+            (static_cast<std::uint64_t>(source_position)*kQ38QsaKvHeads+kv_head)*kQ38QsaHeadWidth+element);
+    }
+    bf16_store(output,(static_cast<std::uint64_t>(token)*kQ38QsaHeads+head)*kQ38QsaHeadWidth+element,value);
+}
+
 constexpr std::uint32_t kQsaQueriesPerKv =
     kQ38QsaHeads / kQ38QsaKvHeads;
 constexpr std::uint32_t kQsaGroupedKeyTile = 32;
@@ -809,8 +936,9 @@ constexpr std::uint32_t kQsaGroupedValueTile = 64;
 __global__ void qsa_attention_scores_grouped_prefill_kernel(
     const std::uint16_t* query, const std::uint16_t* keys,
     const std::int32_t* selected, std::uint32_t first_position,
-    float* scores) {
-    const auto kv_head = blockIdx.x;
+    float* scores, const std::uint32_t* graph_position = nullptr, CudaQsaHeadLayout layout = {}) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto kv_head = blockIdx.x + layout.head_begin / kQsaQueriesPerKv;
     const auto token = blockIdx.y;
     const auto warp = threadIdx.x >> 5;
     const auto lane = threadIdx.x & 31;
@@ -896,8 +1024,9 @@ __global__ void qsa_attention_scores_grouped_prefill_kernel(
 }
 
 __global__ void qsa_attention_softmax_prefill_kernel(
-    std::uint32_t first_position, float* scores) {
-    const auto head = blockIdx.x;
+    std::uint32_t first_position, float* scores, const std::uint32_t* graph_position = nullptr, CudaQsaHeadLayout layout = {}) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto head = blockIdx.x + layout.head_begin;
     const auto token = blockIdx.y;
     const auto position = first_position + token;
     const auto complete_blocks = (position + 1) / kQ38QsaBlockTokens;
@@ -930,8 +1059,9 @@ __global__ void qsa_attention_softmax_prefill_kernel(
 __global__ void qsa_attention_value_grouped_prefill_kernel(
     const std::uint16_t* values, const std::int32_t* selected,
     std::uint32_t first_position, const float* scores,
-    std::uint16_t* output) {
-    const auto kv_head = blockIdx.x;
+    std::uint16_t* output, const std::uint32_t* graph_position = nullptr, CudaQsaHeadLayout layout = {}) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto kv_head = blockIdx.x + layout.head_begin / kQsaQueriesPerKv;
     const auto token = blockIdx.y;
     const auto element = threadIdx.x;
     const auto position = first_position + token;
@@ -1005,8 +1135,9 @@ __global__ void qsa_attention_value_grouped_prefill_kernel(
 // the normalized rows while loading each V element only once.
 __global__ void qsa_attention_softmax_value_grouped_prefill_kernel(
     const std::uint16_t* values, const std::int32_t* selected,
-    std::uint32_t first_position, float* scores, std::uint16_t* output) {
-    const auto kv_head = blockIdx.x;
+    std::uint32_t first_position, float* scores, std::uint16_t* output, const std::uint32_t* graph_position = nullptr, CudaQsaHeadLayout layout = {}) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto kv_head = blockIdx.x + layout.head_begin / kQsaQueriesPerKv;
     const auto token = blockIdx.y;
     const auto element = threadIdx.x;
     const auto position = first_position + token;
@@ -1082,8 +1213,9 @@ __global__ void qsa_attention_softmax_value_grouped_prefill_kernel(
 __global__ void qsa_attention_fused_grouped_prefill_kernel(
     const std::uint16_t* query, const std::uint16_t* keys,
     const std::uint16_t* values, const std::int32_t* selected,
-    std::uint32_t first_position, float* scores, std::uint16_t* output) {
-    const auto kv_head = blockIdx.x;
+    std::uint32_t first_position, float* scores, std::uint16_t* output, const std::uint32_t* graph_position = nullptr, CudaQsaHeadLayout layout = {}) {
+    first_position = graph_position ? *graph_position : first_position;
+    const auto kv_head = blockIdx.x + layout.head_begin / kQsaQueriesPerKv;
     const auto token = blockIdx.y;
     const auto warp = threadIdx.x >> 5;
     const auto lane = threadIdx.x & 31;
@@ -1363,13 +1495,13 @@ void cuda_qsa_prepare_main_decode_bf16(
         position >= kQ38ContextLimit)
         throw std::invalid_argument("invalid QSA main preparation buffers");
     select_device(device);
-    qsa_prepare_query_kernel<<<kQ38QsaHeads, kQ38QsaHeadWidth, 0,
+    qsa_prepare_query_kernel<<<qsa_head_layout.head_count, kQ38QsaHeadWidth, 0,
                                reinterpret_cast<cudaStream_t>(stream)>>>(
-        projected_q_gate, q_norm_weight, query, gate, position);
+        projected_q_gate, q_norm_weight, query, gate, position, qsa_capture_position, qsa_head_layout);
     qsa_prepare_kv_kernel<<<kQ38QsaKvHeads, kQ38QsaHeadWidth, 0,
                             reinterpret_cast<cudaStream_t>(stream)>>>(
         projected_k, projected_v, k_norm_weight, cache.main_keys,
-        cache.main_values, position);
+        cache.main_values, position, qsa_capture_position);
     check(cudaPeekAtLastError(), "QSA main preparation");
 }
 
@@ -1387,15 +1519,15 @@ void cuda_qsa_prepare_index_decode_bf16(
     qsa_prepare_index_query_kernel<<<kQ38QsaIndexerHeads,
                                      kQ38QsaIndexerWidth, 0,
                                      reinterpret_cast<cudaStream_t>(stream)>>>(
-        projected_index_qk, q_norm_weight, index_query, position);
+        projected_index_qk, q_norm_weight, index_query, position, qsa_capture_position);
     qsa_store_raw_index_key_kernel<<<1, kQ38QsaIndexerWidth, 0,
                                      reinterpret_cast<cudaStream_t>(stream)>>>(
-        projected_index_qk, cache.raw_index_keys, position);
+        projected_index_qk, cache.raw_index_keys, position, qsa_capture_position);
     if ((position + 1) % kQ38QsaBlockTokens == 0) {
         qsa_pool_index_key_kernel<<<1, kQ38QsaIndexerWidth, 0,
                                     reinterpret_cast<cudaStream_t>(stream)>>>(
             cache.raw_index_keys, k_norm_weight, cache.pooled_index_keys,
-            position / kQ38QsaBlockTokens);
+            position / kQ38QsaBlockTokens, qsa_capture_position, qsa_capture_tokens);
     }
     check(cudaPeekAtLastError(), "QSA index preparation");
 }
@@ -1469,16 +1601,16 @@ void cuda_qsa_attention_decode_bf16(
     select_device(device);
     constexpr std::uint32_t kAttentionTiles = 4;
     const auto stream_value = reinterpret_cast<cudaStream_t>(stream);
-    qsa_attention_scores_kernel<<<dim3(kQ38QsaHeads, kAttentionTiles), 256, 0,
+    qsa_attention_scores_kernel<<<dim3(qsa_head_layout.head_count, kAttentionTiles), 256, 0,
                                   stream_value>>>(
         query, cache.main_keys, selected_indices, selected_count,
-        scratch_attention_scores);
-    qsa_attention_softmax_kernel<<<kQ38QsaHeads, 256, 0, stream_value>>>(
-        selected_count, scratch_attention_scores);
-    qsa_attention_output_kernel<<<dim3(kQ38QsaHeads, kAttentionTiles), 64, 0,
+        scratch_attention_scores, qsa_head_layout);
+    qsa_attention_softmax_kernel<<<qsa_head_layout.head_count, 256, 0, stream_value>>>(
+        selected_count, scratch_attention_scores, qsa_head_layout);
+    qsa_attention_output_kernel<<<dim3(qsa_head_layout.head_count, kAttentionTiles), 64, 0,
                                   stream_value>>>(
         cache.main_values, selected_indices, selected_count,
-        scratch_attention_scores, output);
+        scratch_attention_scores, output, qsa_head_layout);
     check(cudaPeekAtLastError(), "QSA sparse attention");
 }
 
@@ -1508,32 +1640,32 @@ void cuda_qsa_prepare_prefill_bf16(
         tokens > kQ38ContextLimit - first_position)
         throw std::invalid_argument("invalid QSA prefill preparation buffers");
     select_device(device);
-    qsa_prepare_query_kernel<<<dim3(kQ38QsaHeads, tokens),
+    qsa_prepare_query_kernel<<<dim3(qsa_head_layout.head_count, tokens),
                                kQ38QsaHeadWidth, 0,
                                reinterpret_cast<cudaStream_t>(stream)>>>(
-        projected_q_gate, q_norm_weight, query, gate, first_position);
+        projected_q_gate, q_norm_weight, query, gate, first_position, qsa_capture_position, qsa_head_layout);
     qsa_prepare_kv_kernel<<<dim3(kQ38QsaKvHeads, tokens),
                             kQ38QsaHeadWidth, 0,
                             reinterpret_cast<cudaStream_t>(stream)>>>(
         projected_k, projected_v, k_norm_weight, cache.main_keys,
-        cache.main_values, first_position);
+        cache.main_values, first_position, qsa_capture_position);
     qsa_prepare_index_query_kernel<<<
         dim3(kQ38QsaIndexerHeads, tokens), kQ38QsaIndexerWidth, 0,
         reinterpret_cast<cudaStream_t>(stream)>>>(
         projected_index_qk, index_q_norm_weight, index_query,
-        first_position);
+        first_position, qsa_capture_position);
     qsa_store_raw_index_key_kernel<<<tokens, kQ38QsaIndexerWidth, 0,
                                      reinterpret_cast<cudaStream_t>(stream)>>>(
-        projected_index_qk, cache.raw_index_keys, first_position);
+        projected_index_qk, cache.raw_index_keys, first_position, qsa_capture_position);
     const auto completed_before = first_position / kQ38QsaBlockTokens;
     const auto completed_after =
         (first_position + tokens) / kQ38QsaBlockTokens;
-    if (completed_after > completed_before) {
-        qsa_pool_index_key_kernel<<<completed_after - completed_before,
+    if (qsa_capture_position || completed_after > completed_before) {
+        qsa_pool_index_key_kernel<<<qsa_capture_position ? (tokens+3)/4 : completed_after - completed_before,
                                     kQ38QsaIndexerWidth, 0,
                                     reinterpret_cast<cudaStream_t>(stream)>>>(
             cache.raw_index_keys, index_k_norm_weight,
-            cache.pooled_index_keys, completed_before);
+            cache.pooled_index_keys, completed_before, qsa_capture_position, qsa_capture_tokens);
     }
     check(cudaPeekAtLastError(), "QSA prefill preparation");
 }
@@ -1587,25 +1719,25 @@ void cuda_qsa_select_prefill(
     if (maximum_complete_blocks > kQ38QsaBlockBudget) {
         qsa_index_scores_prefill_kernel<<<tokens, 256, 0, stream_value>>>(
             index_query, cache.pooled_index_keys, first_position,
-            scratch_block_scores, block_score_stride);
+            scratch_block_scores, block_score_stride, qsa_capture_position);
         qsa_radix8_init_prefill_kernel<<<tokens, 256, 0, stream_value>>>(
-            first_position, selected_indices);
+            first_position, selected_indices, qsa_capture_position);
         constexpr std::uint32_t kMaximumRadixCtasPerToken = 8;
         const auto radix_ctas_per_token = std::min<std::uint32_t>(
-            (maximum_complete_blocks + 255) / 256,
+            qsa_capture_position ? kMaximumRadixCtasPerToken : (maximum_complete_blocks + 255) / 256,
             kMaximumRadixCtasPerToken);
         for (int shift = 24; shift >= 0; shift -= 8) {
             qsa_radix8_histogram_prefill_kernel<<<
                 dim3(radix_ctas_per_token, tokens), 256, 0, stream_value>>>(
                 scratch_block_scores, block_score_stride, first_position,
-                shift, selected_indices);
+                shift, selected_indices, qsa_capture_position);
             qsa_radix8_choose_prefill_kernel<<<tokens, 256, 0, stream_value>>>(
-                first_position, shift, selected_indices);
+                first_position, shift, selected_indices, qsa_capture_position);
         }
     }
     qsa_radix8_gather_prefill_kernel<<<tokens, 256, 0, stream_value>>>(
         scratch_block_scores, block_score_stride, first_position,
-        selected_indices);
+        selected_indices, qsa_capture_position);
     check(cudaPeekAtLastError(), "QSA prefill sparse selector");
 }
 
@@ -1643,10 +1775,22 @@ void cuda_qsa_score_prefill_bf16(
         throw std::invalid_argument("invalid QSA prefill score buffers");
     select_device(device);
     const auto stream_value = reinterpret_cast<cudaStream_t>(stream);
-    qsa_attention_scores_prefill_kernel<<<dim3(kQ38QsaHeads, tokens), 256, 0,
+    const auto* tile_setting=std::getenv("Q38_CUDA_QSA_SCORE_TILES");
+    const auto* sparse_setting=std::getenv("Q38_CUDA_QSA_SPARSE_SCORE_TILES");
+    // Each warp computes a complete, independent Q.K dot product. Splitting
+    // selected rows across CTAs preserves its FP32 reduction order. Whole
+    // graphs already distinguish dense/sparse QSA and capture sparse at 4096;
+    // the grid remains valid as the device-side position advances on replay.
+    const bool sparse_small = tokens <= 7 &&
+        first_position + tokens > kQ38QsaTokenBudget;
+    const unsigned tiles=sparse_small && sparse_setting
+        ? unsigned(std::atoi(sparse_setting))
+        : tokens<=7 && tile_setting ? unsigned(std::atoi(tile_setting)) : 1u;
+    if(tiles!=1 && tiles!=2 && tiles!=4 && tiles!=8) throw std::invalid_argument("QSA score tiles must be 1/2/4/8");
+    qsa_attention_scores_prefill_kernel<<<dim3(qsa_head_layout.head_count, tokens,tiles), 256, 0,
                                           stream_value>>>(
         query, cache.main_keys, selected_indices, first_position,
-        scratch_attention_scores);
+        scratch_attention_scores, qsa_capture_position, qsa_head_layout);
     check(cudaPeekAtLastError(), "QSA prefill sparse scores");
 }
 
@@ -1666,11 +1810,33 @@ void cuda_qsa_output_prefill_bf16(
         throw std::invalid_argument("invalid QSA prefill output buffers");
     select_device(device);
     const auto stream_value = reinterpret_cast<cudaStream_t>(stream);
+    const auto* stage_setting=std::getenv("Q38_CUDA_QSA_VALUE_STAGING");
+    const unsigned unroll=tokens<=7 && stage_setting ? unsigned(std::atoi(stage_setting)) : 0u;
+    if(unroll!=0 && unroll!=1 && unroll!=4 && unroll!=8 && unroll!=16)throw std::invalid_argument("QSA staging unroll must be 0/1/4/8/16");
+    if(unroll) {
+        auto launch=[&](auto tag){constexpr unsigned U=decltype(tag)::value;
+            qsa_attention_output_staged_kernel<U><<<dim3(qsa_head_layout.head_count,tokens),256,0,stream_value>>>(cache.main_values,selected_indices,first_position,scratch_attention_scores,output,qsa_capture_position,qsa_head_layout);};
+        if(unroll==1)launch(std::integral_constant<unsigned,1>{});
+        else if(unroll==4)launch(std::integral_constant<unsigned,4>{});
+        else if(unroll==8)launch(std::integral_constant<unsigned,8>{});
+        else launch(std::integral_constant<unsigned,16>{});
+        check(cudaPeekAtLastError(),"QSA staged values");return;
+    }
+    const auto* tile_setting=std::getenv("Q38_CUDA_QSA_VALUE_TILES");
+    const unsigned tiles=tokens<=7 && tile_setting ? unsigned(std::atoi(tile_setting)) : 1u;
+    if(tiles!=1 && tiles!=2 && tiles!=4) throw std::invalid_argument("QSA value tiles must be 1/2/4");
+    if(tiles>1) {
+        qsa_probabilities_prefill_kernel<<<dim3(qsa_head_layout.head_count,tokens),256,0,stream_value>>>(first_position,scratch_attention_scores,qsa_capture_position,qsa_head_layout);
+        check(cudaPeekAtLastError(),"QSA prefill probabilities");
+        qsa_values_tiled_prefill_kernel<<<dim3(qsa_head_layout.head_count,tokens,tiles),kQ38QsaHeadWidth/tiles,0,stream_value>>>(cache.main_values,selected_indices,first_position,scratch_attention_scores,output,qsa_capture_position,qsa_head_layout);
+        check(cudaPeekAtLastError(),"QSA prefill tiled values");
+        return;
+    }
     qsa_attention_output_prefill_kernel<<<
-        dim3(kQ38QsaHeads, tokens), kQ38QsaHeadWidth, 0,
+        dim3(qsa_head_layout.head_count, tokens), kQ38QsaHeadWidth, 0,
         stream_value>>>(
         cache.main_values, selected_indices, first_position,
-        scratch_attention_scores, output);
+        scratch_attention_scores, output, qsa_capture_position, qsa_head_layout);
     check(cudaPeekAtLastError(), "QSA prefill sparse output");
 }
 
@@ -1714,21 +1880,21 @@ void cuda_qsa_apply_grouped_fused_prefill_bf16(
     if (persistent && std::strcmp(persistent, "0") != 0 &&
         std::strcmp(persistent, "false") != 0) {
         qsa_attention_fused_grouped_prefill_kernel<<<
-            dim3(kQ38QsaKvHeads, tokens), 256, 0, stream_value>>>(
+            dim3(qsa_head_layout.head_count / kQsaQueriesPerKv, tokens), 256, 0, stream_value>>>(
             query, cache.main_keys, cache.main_values, selected_indices,
-            first_position, scratch_attention_scores, output);
+            first_position, scratch_attention_scores, output, qsa_capture_position, qsa_head_layout);
         check(cudaPeekAtLastError(),
               "persistent fused grouped QSA prefill attention");
         return;
     }
     qsa_attention_scores_grouped_prefill_kernel<<<
-        dim3(kQ38QsaKvHeads, tokens), 256, 0,
+        dim3(qsa_head_layout.head_count / kQsaQueriesPerKv, tokens), 256, 0,
         stream_value>>>(query, cache.main_keys, selected_indices,
-                        first_position, scratch_attention_scores);
+                        first_position, scratch_attention_scores, qsa_capture_position, qsa_head_layout);
     qsa_attention_softmax_value_grouped_prefill_kernel<<<
-        dim3(kQ38QsaKvHeads, tokens), 256, 0, stream_value>>>(
+        dim3(qsa_head_layout.head_count / kQsaQueriesPerKv, tokens), 256, 0, stream_value>>>(
         cache.main_values, selected_indices, first_position,
-        scratch_attention_scores, output);
+        scratch_attention_scores, output, qsa_capture_position, qsa_head_layout);
     check(cudaPeekAtLastError(), "fused grouped QSA prefill attention");
 }
 
@@ -1749,9 +1915,9 @@ void cuda_qsa_score_grouped_prefill_bf16(
     select_device(device);
     const auto stream_value = reinterpret_cast<cudaStream_t>(stream);
     qsa_attention_scores_grouped_prefill_kernel<<<
-        dim3(kQ38QsaKvHeads, tokens), 256, 0, stream_value>>>(
+        dim3(qsa_head_layout.head_count / kQsaQueriesPerKv, tokens), 256, 0, stream_value>>>(
         query, cache.main_keys, selected_indices, first_position,
-        scratch_attention_scores);
+        scratch_attention_scores, qsa_capture_position, qsa_head_layout);
     check(cudaPeekAtLastError(), "grouped QSA prefill scores");
 }
 
@@ -1772,13 +1938,32 @@ void cuda_qsa_output_grouped_prefill_bf16(
     select_device(device);
     const auto stream_value = reinterpret_cast<cudaStream_t>(stream);
     qsa_attention_softmax_prefill_kernel<<<
-        dim3(kQ38QsaHeads, tokens), 256, 0, stream_value>>>(
-        first_position, scratch_attention_scores);
+        dim3(qsa_head_layout.head_count, tokens), 256, 0, stream_value>>>(
+        first_position, scratch_attention_scores, qsa_capture_position, qsa_head_layout);
     qsa_attention_value_grouped_prefill_kernel<<<
-        dim3(kQ38QsaKvHeads, tokens), kQ38QsaHeadWidth, 0, stream_value>>>(
+        dim3(qsa_head_layout.head_count / kQsaQueriesPerKv, tokens), kQ38QsaHeadWidth, 0, stream_value>>>(
         cache.main_values, selected_indices, first_position,
-        scratch_attention_scores, output);
+        scratch_attention_scores, output, qsa_capture_position, qsa_head_layout);
     check(cudaPeekAtLastError(), "grouped QSA prefill attention");
+}
+
+CudaQsaHeadLayout cuda_qsa_set_head_layout(CudaQsaHeadLayout layout) {
+    if ((layout.head_count != 12 && layout.head_count != 24) ||
+        layout.head_begin % 12 || layout.head_begin + layout.head_count > 24 ||
+        (layout.projected_head_count != 12 && layout.projected_head_count != 24) ||
+        layout.projected_head_begin % 12 ||
+        layout.projected_head_begin + layout.projected_head_count > 24 ||
+        layout.head_begin < layout.projected_head_begin ||
+        layout.head_begin + layout.head_count > layout.projected_head_begin + layout.projected_head_count)
+        throw std::invalid_argument("invalid QSA canonical/projected head layout");
+    const auto old = qsa_head_layout;
+    qsa_head_layout = layout;
+    return old;
+}
+
+void cuda_qsa_set_graph_position(const std::uint32_t* position, unsigned tokens) {
+    if(position && (tokens<1 || tokens>7)) throw std::invalid_argument("invalid QSA graph shape");
+    qsa_capture_position=position;qsa_capture_tokens=position?tokens:0;
 }
 
 bool cuda_q38_qsa_compiled() { return true; }

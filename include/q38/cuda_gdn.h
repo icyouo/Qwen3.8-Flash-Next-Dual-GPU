@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "q38/cuda_prefix_snapshot.h"
 #include <memory>
 
 namespace q38 {
@@ -91,7 +92,7 @@ void cuda_gdn_conv_prefill_bf16(const std::uint16_t* projected_qkv,
                                 std::uint16_t* activated_qkv,
                                 std::uint32_t tokens,
                                 void* stream,
-                                int device);
+                                int device, CudaPrefixSnapshotView snapshots = {});
 
 void cuda_gdn_recurrent_prefill_bf16(
     const std::uint16_t* activated_qkv,
@@ -130,7 +131,7 @@ void cuda_gdn_recurrent_prefill_precomputed_bf16(
     std::uint16_t* core_output,
     std::uint32_t tokens,
     void* stream,
-    int device);
+    int device, CudaPrefixSnapshotView snapshots = {});
 
 void cuda_gdn_output_norm_prefill_bf16(
     const std::uint16_t* core_output,
@@ -141,6 +142,33 @@ void cuda_gdn_output_norm_prefill_bf16(
     float epsilon,
     void* stream,
     int device);
+
+// Projection addressing is explicit: packed QKV/Z may share a row stride,
+// while B/A can retain full 48-head projections. State remains canonical.
+struct CudaGdnHeadLocalProjectionLayout {
+    bool full_qkv = false;
+    unsigned qkv_stride = 5120;
+    unsigned control_heads = 24;
+    unsigned control_stride = 24;
+    unsigned z_heads = 24;
+    unsigned z_head_begin = 0;
+    unsigned z_stride = 3072;
+};
+
+// Prefix writes touch only owned cells, preserving transactional bank indexing.
+// The explicit normalized-Q/K prefill flag requires a separate FP32 buffer with
+// 2 * tokens * kQ38GdnKeyHeads * kQ38GdnHeadWidth elements. Legacy callers
+// retain the parameter_scratch size contract and the flag-off path.
+void cuda_gdn_head_local_bf16(
+    const std::uint16_t* projected_qkv, const std::uint16_t* projected_b,
+    const std::uint16_t* projected_a, const std::uint16_t* gate_z,
+    const std::uint16_t* conv_weight, const std::uint16_t* a_log,
+    const std::uint16_t* dt_bias, const std::uint16_t* norm_weight,
+    CudaGdnLayerStateView state, std::uint16_t* activated,
+    std::uint16_t* core, std::uint16_t* output, float* parameter_scratch,
+    unsigned tokens, unsigned rank, bool decode, void* stream, int device,
+    CudaPrefixSnapshotView conv_snapshots = {}, CudaPrefixSnapshotView recurrent_snapshots = {}, CudaGdnHeadLocalProjectionLayout layout = {},
+    float* normalized_qk = nullptr);
 
 bool cuda_q38_gdn_compiled();
 

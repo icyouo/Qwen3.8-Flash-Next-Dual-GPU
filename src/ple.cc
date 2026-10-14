@@ -1,4 +1,5 @@
 #include "q38/ple.h"
+#include "q38/metrics.h"
 
 #include <algorithm>
 #include <atomic>
@@ -11,6 +12,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <list>
 #include <mutex>
@@ -242,6 +244,24 @@ PleHashState::PleHashState(const PleHashConfigV1& config) : config_(config) {
 void PleHashState::reset() {
     previous_[0] = config_.eos_token_id;
     previous_[1] = config_.eos_token_id;
+}
+
+void PleHashState::append_rows(std::int32_t token, std::vector<std::uint64_t>& output) {
+    if (token < 0 || static_cast<std::uint32_t>(token) >= config_.unigram_vocab_size)
+        throw std::runtime_error("PLE hash token is outside vocabulary");
+    const auto offset = output.size();
+    output.resize(offset + kPleHeads);
+    const auto current = static_cast<std::uint64_t>(token);
+    const auto previous1 = static_cast<std::uint64_t>(previous_[1]);
+    const auto previous2 = static_cast<std::uint64_t>(
+        previous_[1] == config_.eos_token_id ? config_.eos_token_id : previous_[0]);
+    const auto bigram = current * config_.multipliers[0] ^ previous1 * config_.multipliers[1];
+    const auto trigram = bigram ^ previous2 * config_.multipliers[2];
+    for (std::uint32_t head = 0; head < kPleHeads; ++head)
+        output[offset + head] = (head < kPleHeadsPerNgram ? bigram : trigram) %
+            config_.head_vocab_sizes[head] + config_.head_offsets[head];
+    previous_[0] = previous_[1];
+    previous_[1] = token;
 }
 
 std::vector<std::uint64_t> PleHashState::rows(
@@ -626,6 +646,12 @@ private:
 #endif
 };
 
+struct PleStore::RamTable {
+    std::vector<std::unique_ptr<std::uint8_t[]>> parts;
+    mutable std::mutex mutex;
+    PleCacheStatsV1 stats;
+};
+
 PleStore::PleStore(PleLayoutV1 layout, std::uint64_t cache_bytes,
                    std::uint32_t cache_page_bytes)
     : PleStore(std::move(layout),
@@ -636,11 +662,35 @@ PleStore::PleStore(PleLayoutV1 layout, PleStoreOptionsV1 options)
     : layout_(std::move(layout)) {
     if (options.io_mode != PleIoModeV1::kAuto &&
         options.io_mode != PleIoModeV1::kBuffered &&
-        options.io_mode != PleIoModeV1::kIoUringDirect)
+        options.io_mode != PleIoModeV1::kIoUringDirect &&
+        options.io_mode != PleIoModeV1::kRam)
         throw std::invalid_argument("PLE I/O mode is invalid");
     if (options.queue_depth == 0 || options.queue_depth > 4096)
         throw std::invalid_argument("PLE I/O queue depth is invalid");
-    if (options.cache_bytes) {
+    if (options.io_mode == PleIoModeV1::kRam) {
+        validate_layout(&layout_, true);
+        std::uint64_t required = 0;
+        for (const auto& part : layout_.parts) {
+            for (const auto size : {part.payload_bytes, part.scale_bytes}) {
+                if (size > options.ram_budget_bytes ||
+                    required > options.ram_budget_bytes - size)
+                    throw std::runtime_error("PLE RAM table exceeds --ple-ram-budget-gib; use SSD or increase the budget");
+                required += size;
+            }
+            if (part.payload_bytes > std::numeric_limits<std::size_t>::max())
+                throw std::overflow_error("PLE RAM part exceeds address space");
+        }
+        const auto available = collect_host_metrics().system_mem_available_bytes;
+        const auto reserve = std::min<std::uint64_t>(8ull << 30u, required);
+        if (available && (required > available || available - required < reserve))
+            throw std::runtime_error("PLE RAM preload needs its full table plus host-memory headroom (up to 8 GiB); use SSD mode");
+        ram_ = std::make_unique<RamTable>();
+        ram_->parts.resize(layout_.parts.size());
+        ram_->stats.ram_enabled = 1;
+        std::clog << "PLE RAM: loading " << required
+                  << " bytes (payload and scales), budget=" << options.ram_budget_bytes << '\n';
+    }
+    if (options.cache_bytes && !ram_) {
         if (options.cache_page_bytes == 0 ||
             (options.cache_page_bytes & (options.cache_page_bytes - 1u)) != 0 ||
             options.cache_bytes < options.cache_page_bytes)
@@ -679,8 +729,40 @@ PleStore::PleStore(PleLayoutV1 layout, PleStoreOptionsV1 options)
                             "PLE row-scale read failed: " +
                             std::string(std::strerror(errno)));
                     done += static_cast<std::size_t>(count);
+                    if (ram_) {
+                        ram_->stats.physical_read_bytes += static_cast<std::uint64_t>(count);
+                        ++ram_->stats.read_operations;
+                    }
                 }
             }
+        }
+
+        if (ram_) {
+            // Load only PLE extents, not unrelated tensors in the same shard.
+            // Anonymous owned storage makes later lookups independent of files
+            // and avoids treating a warmed, evictable mmap as the RAM backend.
+            for (const auto& part : layout_.parts) {
+                auto& data = ram_->parts.at(part.logical_part);
+                data.reset(new std::uint8_t[static_cast<std::size_t>(part.payload_bytes)]);
+                std::uint64_t done = 0;
+                while (done < part.payload_bytes) {
+                    const auto chunk = static_cast<std::size_t>(std::min<std::uint64_t>(
+                        part.payload_bytes - done, 8ull << 20u));
+                    const auto count = pread(file_descriptor(part.file_index), data.get() + done,
+                                              chunk, static_cast<off_t>(part.file_offset + done));
+                    if (count < 0 && errno == EINTR) continue;
+                    if (count <= 0) throw std::runtime_error("PLE RAM preload failed or source was truncated");
+                    done += static_cast<std::uint64_t>(count);
+                    ram_->stats.physical_read_bytes += static_cast<std::uint64_t>(count);
+                    ++ram_->stats.read_operations;
+                }
+                ram_->stats.ram_resident_bytes += part.payload_bytes;
+            }
+            // No filesystem fallback is possible after a successful preload.
+            for (auto& file : files_) { close(file.fd); file.fd = -1; }
+            std::clog << "PLE RAM: ready, payload=" << ram_->stats.ram_resident_bytes
+                      << " scale=" << scale_resident_bytes_ << " bytes\n";
+            return;
         }
 
         const bool direct_candidate =
@@ -964,6 +1046,7 @@ void PleStore::read_extents(const std::vector<PleReadExtentV1>& extents,
 }
 
 std::vector<std::uint8_t> PleStore::read_row(std::uint64_t global_row) const {
+    if (ram_) return read_rows({global_row});
     const auto& part = find_part(global_row);
     const auto local_row = global_row - part.global_row_start;
     const auto offset = part.file_offset +
@@ -974,6 +1057,12 @@ std::vector<std::uint8_t> PleStore::read_row(std::uint64_t global_row) const {
 }
 
 PleCacheStatsV1 PleStore::cache_stats() const {
+    if (ram_) {
+        std::lock_guard<std::mutex> lock(ram_->mutex);
+        auto stats = ram_->stats;
+        stats.scale_resident_bytes = scale_resident_bytes_;
+        return stats;
+    }
     if (!cache_) {
         PleCacheStatsV1 stats;
         stats.scale_resident_bytes = scale_resident_bytes_;
@@ -1018,6 +1107,21 @@ void PleStore::read_rows_into(
     const auto expected = global_rows.size() * layout_.row_stride_bytes;
     if ((expected != 0 && !output) || output_bytes != expected)
         throw std::invalid_argument("PLE output extent differs from row batch");
+    if (ram_) {
+        // Validate the complete request before writing any caller output.
+        for (const auto row : global_rows) (void)find_part(row);
+        for (std::size_t index = 0; index < global_rows.size(); ++index) {
+            const auto& part = find_part(global_rows[index]);
+            const auto offset = (global_rows[index] - part.global_row_start) * layout_.row_stride_bytes;
+            std::memcpy(output + index * layout_.row_stride_bytes,
+                        ram_->parts.at(part.logical_part).get() + offset,
+                        layout_.row_stride_bytes);
+        }
+        std::lock_guard<std::mutex> lock(ram_->mutex);
+        ram_->stats.requested_rows += global_rows.size();
+        ram_->stats.useful_bytes += expected;
+        return;
+    }
     std::vector<PleReadExtentV1> extents;
     extents.reserve(global_rows.size());
     for (std::size_t index = 0; index < global_rows.size(); ++index) {

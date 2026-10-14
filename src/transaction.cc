@@ -61,6 +61,14 @@ bool SessionTxnEngine::seed_decode_pending(std::string* error) {
     return add_checked(&frontiers_.canonical, 1, error);
 }
 
+bool SessionTxnEngine::advance_pending_epoch(std::string* error) {
+    if (active_) return fail(error, "cannot replace pending token during a transaction");
+    if (!validate_frontiers(frontiers_, error)) return false;
+    if (frontiers_.canonical - frontiers_.target != 1)
+        return fail(error, "pending replacement requires exactly one unevaluated token");
+    return add_checked(&frontiers_.epoch, 1, error);
+}
+
 bool SessionTxnEngine::prepare(TxnKind kind, std::uint32_t evaluated_count,
                                std::string* error) {
     if (active_) return fail(error, "transaction already active");

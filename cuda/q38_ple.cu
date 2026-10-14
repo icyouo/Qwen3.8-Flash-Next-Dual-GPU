@@ -107,10 +107,11 @@ __global__ void ple_gate_kernel(const std::uint16_t* key,
               gate * load(value, value_base + index));
 }
 
+template <bool WithResidual>
 __global__ void ple_conv_decode_kernel(
     const std::uint16_t* gated, const std::uint16_t* normalized,
     const std::uint16_t* weight, std::uint16_t* state,
-    std::uint16_t* output) {
+    std::uint16_t* output, const std::uint16_t* residual) {
     const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x +
                          threadIdx.x;
     if (channel >= kQ38HyperWidth) return;
@@ -129,13 +130,21 @@ __global__ void ple_conv_decode_kernel(
     store(state, state_base + kQ38PleConvState - 1,
           load(normalized, channel));
     const float silu = convolved / (1.0f + expf(-convolved));
-    store(output, channel, load(gated, channel) + silu);
+    const float value = load(gated, channel) + silu;
+    if constexpr (WithResidual) {
+        const float rounded = __bfloat162float(__float2bfloat16_rn(value));
+        store(output, channel, load(residual, channel) + rounded);
+    } else {
+        store(output, channel, value);
+    }
 }
 
+template <bool WithResidual, bool Snapshot = false>
 __global__ void ple_conv_prefill_kernel(
     const std::uint16_t* gated, const std::uint16_t* normalized,
     const std::uint16_t* weight, std::uint16_t* state,
-    std::uint16_t* output, std::uint32_t tokens) {
+    std::uint16_t* output, std::uint32_t tokens,
+    const std::uint16_t* residual, CudaPrefixSnapshotView snapshots = {}) {
     const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x +
                          threadIdx.x;
     if (channel >= kQ38HyperWidth) return;
@@ -157,8 +166,22 @@ __global__ void ple_conv_prefill_kernel(
                   load(state, state_base + index + 1));
         store(state, state_base + kQ38PleConvState - 1,
               load(normalized, offset));
+        if constexpr (Snapshot) {
+            if (token < snapshots.count) {
+                auto* target = reinterpret_cast<std::uint16_t*>(
+                    static_cast<std::uint8_t*>(snapshots.data) + token * snapshots.stride_bytes);
+                for (std::uint32_t i = 0; i < kQ38PleConvState; ++i)
+                    target[state_base + i] = state[state_base + i];
+            }
+        }
         const float silu = convolved / (1.0f + expf(-convolved));
-        store(output, offset, load(gated, offset) + silu);
+        const float value = load(gated, offset) + silu;
+        if constexpr (WithResidual) {
+            const float rounded = __bfloat162float(__float2bfloat16_rn(value));
+            store(output, offset, load(residual, offset) + rounded);
+        } else {
+            store(output, offset, value);
+        }
     }
 }
 
@@ -338,9 +361,9 @@ void cuda_ple_conv_decode_bf16(
         !conv_state || !output || !stream)
         throw std::invalid_argument("invalid PLE convolution buffers");
     select_device(device);
-    ple_conv_decode_kernel<<<(kQ38HyperWidth + 255) / 256, 256, 0,
+    ple_conv_decode_kernel<false><<<(kQ38HyperWidth + 255) / 256, 256, 0,
                               reinterpret_cast<cudaStream_t>(stream)>>>(
-        gated_value, normalized_gated_value, conv_weight, conv_state, output);
+        gated_value, normalized_gated_value, conv_weight, conv_state, output, nullptr);
     check(cudaPeekAtLastError(), "ple_conv_decode_kernel");
 }
 
@@ -372,16 +395,74 @@ void cuda_ple_conv_prefill_bf16(
     std::uint16_t* output,
     std::uint32_t tokens,
     void* stream,
-    int device) {
+    int device, CudaPrefixSnapshotView snapshots) {
     if (!gated_value || !normalized_gated_value || !conv_weight ||
         !conv_state || !output || !stream || tokens == 0)
         throw std::invalid_argument("invalid PLE prefill convolution buffers");
+    validate_prefix_snapshot(snapshots, tokens,
+        std::uint64_t(kQ38HyperWidth) * kQ38PleConvState * 2, 2);
     select_device(device);
-    ple_conv_prefill_kernel<<<(kQ38HyperWidth + 255) / 256, 256, 0,
+    if (snapshots.data) {
+    ple_conv_prefill_kernel<false, true><<<(kQ38HyperWidth + 255) / 256, 256, 0,
                                reinterpret_cast<cudaStream_t>(stream)>>>(
         gated_value, normalized_gated_value, conv_weight, conv_state, output,
-        tokens);
+        tokens, nullptr, snapshots);
+    } else {
+    ple_conv_prefill_kernel<false><<<(kQ38HyperWidth + 255) / 256, 256, 0,
+                               reinterpret_cast<cudaStream_t>(stream)>>>(
+        gated_value, normalized_gated_value, conv_weight, conv_state, output,
+        tokens, nullptr);
+    }
     check(cudaPeekAtLastError(), "PLE prefill convolution");
+}
+
+void cuda_ple_conv_residual_bf16(
+    const std::uint16_t* gated_value,
+    const std::uint16_t* normalized_gated_value,
+    const std::uint16_t* conv_weight, std::uint16_t* conv_state,
+    const std::uint16_t* residual, std::uint16_t* output,
+    std::uint32_t tokens, void* stream, int device, CudaPrefixSnapshotView snapshots) {
+    if (!gated_value || !normalized_gated_value || !conv_weight || !conv_state ||
+        !residual || !output || !stream || tokens == 0 || tokens > 512)
+        throw std::invalid_argument("invalid PLE convolution/residual buffers");
+    const auto words = static_cast<std::uint64_t>(tokens) * kQ38HyperWidth;
+    const auto overlap = [](const std::uint16_t* a, std::uint64_t a_words,
+                            const std::uint16_t* b, std::uint64_t b_words) {
+        const auto x = reinterpret_cast<std::uintptr_t>(a);
+        const auto y = reinterpret_cast<std::uintptr_t>(b);
+        return x <= y ? y - x < a_words * 2 : x - y < b_words * 2;
+    };
+    const auto state_words = static_cast<std::uint64_t>(kQ38HyperWidth) * kQ38PleConvState;
+    if (overlap(output, words, gated_value, words) ||
+        overlap(output, words, normalized_gated_value, words) ||
+        overlap(output, words, conv_weight, kQ38HyperWidth * 4u) ||
+        overlap(output, words, conv_state, state_words) ||
+        (output != residual && overlap(output, words, residual, words)) ||
+        overlap(conv_state, state_words, gated_value, words) ||
+        overlap(conv_state, state_words, normalized_gated_value, words) ||
+        overlap(conv_state, state_words, residual, words) ||
+        overlap(conv_state, state_words, conv_weight, kQ38HyperWidth * 4u))
+        throw std::invalid_argument("overlapping PLE convolution/residual buffers");
+    validate_prefix_snapshot(snapshots, tokens,
+        std::uint64_t(kQ38HyperWidth) * kQ38PleConvState * 2, 2);
+    select_device(device);
+    if (snapshots.data) {
+        ple_conv_prefill_kernel<true, true><<<(kQ38HyperWidth + 255) / 256, 256, 0,
+                                              reinterpret_cast<cudaStream_t>(stream)>>>(
+            gated_value, normalized_gated_value, conv_weight, conv_state,
+            output, tokens, residual, snapshots);
+    } else if (tokens == 1) {
+        ple_conv_decode_kernel<true><<<(kQ38HyperWidth + 255) / 256, 256, 0,
+                                       reinterpret_cast<cudaStream_t>(stream)>>>(
+            gated_value, normalized_gated_value, conv_weight, conv_state,
+            output, residual);
+    } else {
+        ple_conv_prefill_kernel<true><<<(kQ38HyperWidth + 255) / 256, 256, 0,
+                                        reinterpret_cast<cudaStream_t>(stream)>>>(
+            gated_value, normalized_gated_value, conv_weight, conv_state,
+            output, tokens, residual);
+    }
+    check(cudaPeekAtLastError(), "PLE convolution/residual");
 }
 
 }  // namespace q38

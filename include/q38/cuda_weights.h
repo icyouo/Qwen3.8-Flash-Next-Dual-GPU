@@ -26,6 +26,7 @@ enum class CudaWeightLayoutV1 : std::uint32_t {
     // row_in_tile, packed_k_pair].  This keeps every 16x16 Tensor-Core B tile
     // in one contiguous 128-byte span without changing its storage size.
     kMoeW4Tile16x16 = 1,
+    kMarlinG128 = 2,
 };
 
 struct CudaTensorViewV1 {

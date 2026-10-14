@@ -28,10 +28,22 @@ struct ExecutorOptions {
     // or device-state errors. CPU fixtures keep this false so rollback and
     // retry behavior can still be exercised independently.
     bool backend_failure_is_fatal = false;
+    // TP aborts its collective generation on cooperative cancellation. Keep
+    // the cancellation response typed, but forbid reuse of that executor.
+    // PP backends with recoverable cancellation leave this disabled.
+    bool backend_cancellation_is_fatal = false;
+    // A cooperative cancellation still blocks generation until explicit reset.
+    // Enabled only for backends that can drain and rebuild their bridge state.
+    bool backend_cancellation_resettable = false;
     // Diagnostic-only: retain the raw BF16 logits from the most recently
     // committed non-speculative target transaction. Disabled by default so
     // ordinary greedy execution does not add a device-to-host logits copy.
     bool retain_last_logits_for_diagnostics = false;
+    bool enable_adaptive_mtp = false;
+    // Draft into an ephemeral backend branch, roll it back, then verify all
+    // candidates in one target batch. Accepted MTP state is rebuilt at commit.
+    bool enable_batched_mtp = false;
+    bool enable_compact_sampling = false;
     SamplingConfigV1 sampling{};
     // Stop tokens are part of the parser/sampling identity.  Speculative
     // commits are truncated before the first accepted stop token so no token
@@ -74,7 +86,19 @@ public:
     DecodeResult speculative_step(
         std::uint32_t max_draft,
         std::shared_ptr<CancellationToken> cancellation = {});
+    // Verify supplied candidates in one bounded target transaction. Used by
+    // batched drafting and correctness fixtures independently of draft source.
+    // Sampled sessions retain ordinary target sampling until rejection
+    // sampling with draft probabilities is implemented.
+    DecodeResult verify_candidates(
+        const std::vector<std::int32_t>& candidates,
+        std::shared_ptr<CancellationToken> cancellation = {});
     void reset_session();
+    void replace_pending_terminal(std::uint32_t expected_canonical,
+                                  std::uint32_t expected_epoch,
+                                  std::int32_t expected_token,
+                                  std::int32_t replacement,
+                                  std::shared_ptr<CancellationToken> cancellation = {});
 
     const SessionFrontiersV1& frontiers() const;
     const std::vector<std::int32_t>& canonical_tokens() const;
@@ -86,6 +110,7 @@ public:
     std::optional<LogitSnapshotV1> diagnostic_logit_snapshot() const;
     void fail_closed();
     bool poisoned() const;
+    bool cancellation_resettable() const;
 
 private:
     struct Impl;

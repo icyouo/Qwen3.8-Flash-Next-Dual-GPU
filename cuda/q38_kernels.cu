@@ -3,12 +3,14 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace q38 {
 
@@ -132,6 +134,123 @@ __global__ void gemv_bf16_kernel(
     }
 }
 
+__device__ float hc_epilogue(float sum, int activation,
+                              float divisor, float output_scale) {
+    const float projected = 0.0f + 1.0f * sum;
+    if (activation == static_cast<int>(CudaHcActivation::kNone))
+        return projected;
+    // The unfused path writes a BF16 tensor before elementwise_kernel loads
+    // it. Preserve that rounding boundary explicitly inside the fused kernel.
+    const float value = __bfloat162float(__float2bfloat16_rn(projected)) / divisor;
+    const float sigmoid = 1.0f / (1.0f + expf(-value));
+    return (activation == static_cast<int>(CudaHcActivation::kSilu)
+                ? value * sigmoid : sigmoid) * output_scale;
+}
+
+#include "q38_hc_mma.cuh"
+
+__global__ void hc_inject_batch_kernel(const std::uint16_t* weights,const std::uint16_t* input,
+    std::uint16_t* output,unsigned rows,unsigned columns,int activation,float divisor,float scale){
+    const unsigned row=blockIdx.x,token=blockIdx.y;
+    float sum=0.f;
+    for(unsigned col=threadIdx.x;col<columns;col+=blockDim.x)
+        sum+=bf16_load(input,static_cast<std::uint64_t>(token)*columns+col)*bf16_load(weights,static_cast<std::uint64_t>(row)*columns+col);
+    sum=block_sum(sum);
+    if(!threadIdx.x)bf16_store(output,token*rows+row,hc_epilogue(sum,activation,divisor,scale));
+}
+
+// Independently derived from gemv_bf16_kernel above. Each row retains exactly
+// the same column ownership, accumulation expression and two-level reduction.
+// Pairing rows reuses the activation load without a new weight representation.
+__device__ void hc_pair_gemv_bf16_impl(
+    const std::uint16_t* weights, std::uint32_t rows, std::uint32_t columns,
+    const std::uint16_t* input, std::uint16_t* output,
+    int activation, float divisor, float output_scale, std::uint32_t first) {
+    const bool second_valid = first + 1u < rows;
+    float sum0 = 0.0f, sum1 = 0.0f;
+    for (std::uint32_t column = threadIdx.x; column < columns;
+         column += kThreads) {
+        const float x = bf16_load(input, column);
+        sum0 += x * bf16_load(weights,
+            static_cast<std::uint64_t>(first) * columns + column);
+        if (second_valid)
+            sum1 += x * bf16_load(weights,
+                static_cast<std::uint64_t>(first + 1u) * columns + column);
+    }
+    __shared__ float partial[2][kThreads / kWarpSize];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    sum0 = warp_sum(sum0);
+    sum1 = warp_sum(sum1);
+    if (lane == 0) {
+        partial[0][warp] = sum0;
+        partial[1][warp] = sum1;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        sum0 = lane < kThreads / kWarpSize ? partial[0][lane] : 0.0f;
+        sum1 = lane < kThreads / kWarpSize ? partial[1][lane] : 0.0f;
+        sum0 = warp_sum(sum0);
+        sum1 = warp_sum(sum1);
+        if (lane == 0) {
+            // Keep the reference's previous + alpha * sum, including signed
+            // zero behavior (this API has alpha=1 and accumulate=false).
+            bf16_store(output, first, hc_epilogue(sum0, activation, divisor, output_scale));
+            if (second_valid)
+                bf16_store(output, first + 1u, hc_epilogue(sum1, activation, divisor, output_scale));
+        }
+    }
+}
+
+template<unsigned Batch>
+__global__ void hc_scalar_batch_kernel(const std::uint16_t* weights,unsigned rows,unsigned columns,
+    const std::uint16_t* input,std::uint16_t* output,int activation,float divisor,float scale){
+    const unsigned first=blockIdx.x*2,lane=threadIdx.x&31,warp=threadIdx.x/32;
+    const bool second=first+1<rows;
+    float s0[Batch]={},s1[Batch]={};
+    for(unsigned column=threadIdx.x;column<columns;column+=256){
+        const float w0=bf16_load(weights,static_cast<std::uint64_t>(first)*columns+column);
+        const float w1=second?bf16_load(weights,static_cast<std::uint64_t>(first+1)*columns+column):0.f;
+        #pragma unroll
+        for(unsigned t=0;t<Batch;++t){const float x=bf16_load(input,static_cast<std::uint64_t>(t)*columns+column);s0[t]+=x*w0;if(second)s1[t]+=x*w1;}
+    }
+    __shared__ float partial[Batch][2][8];
+    #pragma unroll
+    for(unsigned t=0;t<Batch;++t){s0[t]=warp_sum(s0[t]);s1[t]=warp_sum(s1[t]);if(lane==0){partial[t][0][warp]=s0[t];partial[t][1][warp]=s1[t];}}
+    __syncthreads();
+    if(warp==0){
+        #pragma unroll
+        for(unsigned t=0;t<Batch;++t){
+            const float a=warp_sum(lane<8?partial[t][0][lane]:0.f);
+            const float b=warp_sum(lane<8?partial[t][1][lane]:0.f);
+            if(lane==0){bf16_store(output,static_cast<std::uint64_t>(t)*rows+first,hc_epilogue(a,activation,divisor,scale));if(second)bf16_store(output,static_cast<std::uint64_t>(t)*rows+first+1,hc_epilogue(b,activation,divisor,scale));}
+        }
+    }
+}
+
+__global__ void hc_pair_gemv_bf16_kernel(
+    const std::uint16_t* weights, std::uint32_t rows, std::uint32_t columns,
+    const std::uint16_t* input, std::uint16_t* output,
+    int activation, float divisor, float output_scale) {
+    hc_pair_gemv_bf16_impl(weights, rows, columns, input, output,
+        activation, divisor, output_scale, blockIdx.x * 2u);
+}
+
+__global__ void hc_grouped_bf16_kernel(
+    CudaHcProjectionV1 first, CudaHcProjectionV1 second,
+    const std::uint16_t* input, std::uint32_t first_blocks) {
+    // A compact concatenated grid avoids padding the four-row inject matrix
+    // to the much larger mix_down grid. Selection is uniform within a block.
+    const bool use_first = blockIdx.x < first_blocks;
+    const auto projection = use_first ? first : second;
+    const auto block = use_first ? blockIdx.x : blockIdx.x - first_blocks;
+    hc_pair_gemv_bf16_impl(
+        static_cast<const std::uint16_t*>(projection.matrix.data),
+        projection.matrix.rows, projection.matrix.columns, input,
+        projection.output, static_cast<int>(projection.activation),
+        projection.divisor, projection.output_scale, block * 2u);
+}
+
 __device__ __forceinline__ int sign_extend_int4(unsigned value) {
     return static_cast<int>(value) - ((value & 0x8u) ? 16 : 0);
 }
@@ -143,11 +262,10 @@ __device__ __forceinline__ int sign_extend_int4(unsigned value) {
 // lane.  It uses the production artifact layout directly; no repack or second
 // weight ABI is required.
 template <int WeightBits>
-__global__ void decode_gemv_group128_kernel(
+__device__ void decode_gemv_group128_impl(
     const void* data, const std::uint16_t* scales, std::uint32_t rows,
     std::uint32_t columns, const std::uint16_t* input,
-    std::uint16_t* output, float alpha, bool accumulate) {
-    extern __shared__ std::uint16_t cached_input[];
+    std::uint16_t* output, float alpha, bool accumulate, std::uint16_t* cached_input) {
     for (std::uint32_t column = threadIdx.x; column < columns;
          column += blockDim.x)
         cached_input[column] = input[column];
@@ -204,6 +322,47 @@ __global__ void decode_gemv_group128_kernel(
     if (lane == 0) {
         const float previous = accumulate ? bf16_load(output, row) : 0.0f;
         bf16_store(output, row, previous + alpha * sum);
+    }
+}
+
+template <int WeightBits>
+__global__ void decode_gemv_group128_kernel(
+    const void* data, const std::uint16_t* scales, std::uint32_t rows,
+    std::uint32_t columns, const std::uint16_t* input,
+    std::uint16_t* output, float alpha, bool accumulate) {
+    extern __shared__ std::uint16_t cached_input[];
+    decode_gemv_group128_impl<WeightBits>(data, scales, rows, columns,
+        input, output, alpha, accumulate, cached_input);
+}
+
+#include "q38_gemv_batch.cuh"
+
+__global__ void multi_projection_decode_kernel(
+    CudaProjectionPackV1 pack, const std::uint16_t* input) {
+    const auto matrix = pack.matrices[blockIdx.y];
+    auto* output = pack.outputs[blockIdx.y];
+    extern __shared__ std::uint16_t cached_input[];
+    if (matrix.format == DeviceWeightFormatV1::kW4A16SymG128) {
+        decode_gemv_group128_impl<4>(matrix.data,
+            static_cast<const std::uint16_t*>(matrix.scales), matrix.rows,
+            matrix.columns, input, output, 1.0f, false, cached_input);
+    } else if (matrix.format == DeviceWeightFormatV1::kW8A16SymG128) {
+        decode_gemv_group128_impl<8>(matrix.data,
+            static_cast<const std::uint16_t*>(matrix.scales), matrix.rows,
+            matrix.columns, input, output, 1.0f, false, cached_input);
+    } else {
+        // Preserve the scalar reference reduction for BF16/FP32 projections.
+        const auto row = blockIdx.x;
+        if (row >= matrix.rows) return;
+        float sum = 0.0f;
+        for (std::uint32_t column = threadIdx.x; column < matrix.columns;
+             column += blockDim.x)
+            sum += bf16_load(input, column) * matrix_weight(
+                static_cast<int>(matrix.format), matrix.data, matrix.scales,
+                matrix.preserved_f32, matrix.columns, matrix.group_size,
+                row, column);
+        sum = block_sum(sum);
+        if (threadIdx.x == 0) bf16_store(output, row, sum);
     }
 }
 
@@ -355,6 +514,27 @@ __global__ void argmax_bf16_kernel(const std::uint16_t* logits,
     if (threadIdx.x == 0) output[0] = indices[0];
 }
 
+__device__ void stable_max(float& value,int& id,float other,int other_id){
+    if(other>value||(other==value&&other_id>=0&&(id<0||other_id<id))){value=other;id=other_id;}
+}
+__global__ void argmax_partials_kernel(const std::uint16_t* logits,unsigned count,unsigned rows,
+    float* partial_values,int* partial_ids){
+    __shared__ float values[256];__shared__ int ids[256];
+    float best=-3.402823466e+38F;int id=-1;
+    const unsigned row=blockIdx.y;
+    for(unsigned i=blockIdx.x*blockDim.x+threadIdx.x;i<count;i+=gridDim.x*blockDim.x)
+        stable_max(best,id,bf16_load(logits,static_cast<std::uint64_t>(row)*count+i),int(i));
+    values[threadIdx.x]=best;ids[threadIdx.x]=id;__syncthreads();
+    for(unsigned step=128;step;step/=2){if(threadIdx.x<step)
+        stable_max(values[threadIdx.x],ids[threadIdx.x],values[threadIdx.x+step],ids[threadIdx.x+step]);__syncthreads();}
+    if(!threadIdx.x){partial_values[row*128+blockIdx.x]=values[0];partial_ids[row*128+blockIdx.x]=ids[0];}
+}
+__global__ void argmax_finalize_kernel(const float* input,const int* indices,int* output){
+    __shared__ float values[256];__shared__ int ids[256];const unsigned row=blockIdx.x,t=threadIdx.x;
+    values[t]=t<128?input[row*128+t]:-3.402823466e+38F;ids[t]=t<128?indices[row*128+t]:-1;__syncthreads();
+    for(unsigned step=128;step;step/=2){if(t<step)stable_max(values[t],ids[t],values[t+step],ids[t+step]);__syncthreads();}
+    if(!t)output[row]=ids[0];
+}
 __global__ void topk_router_bf16_kernel(
     const std::uint16_t* logits, std::int32_t* expert_ids,
     float* expert_weights, std::uint32_t experts, std::uint32_t top_k,
@@ -402,6 +582,8 @@ __global__ void topk_router_bf16_kernel(
         expert_weights[output] = selected_values[rank] / denominator;
     }
 }
+
+#include "q38_topk_warp.cuh"
 
 // Qwen3.8 decode routes one token over exactly 512 experts.  The reference
 // kernel above intentionally handles arbitrary shapes, but only thread 0 does
@@ -494,6 +676,32 @@ void validate_matrix(const CudaMatrixViewV1& matrix) {
 
 }  // namespace
 
+bool cuda_small_batch_gemv_bf16(const CudaMatrixViewV1& matrix,
+    const std::uint16_t* input, std::uint16_t* output, std::uint32_t batch,
+    void* stream, int device) {
+    if (matrix.group_size != 128 || (batch != 2 && batch != 3 && batch != 5 && batch != 7) ||
+        static_cast<std::size_t>(matrix.columns)*batch*2 > 48*1024 ||
+        (matrix.format != DeviceWeightFormatV1::kW4A16SymG128 && matrix.format != DeviceWeightFormatV1::kW8A16SymG128)) return false;
+    validate_matrix(matrix);validate_stream(stream,device);
+    if (!input || !output) throw std::invalid_argument("invalid small batch buffers");
+    if(try_head_pipelined_gemv(matrix,input,output,batch,stream))return true;
+    auto launch=[&](auto bits_tag,auto batch_tag){
+        constexpr int Bits=decltype(bits_tag)::value;constexpr unsigned Batch=decltype(batch_tag)::value;
+        small_batch_gemv_group128_kernel<Bits,Batch><<<(matrix.rows+7)/8,256,
+            static_cast<std::size_t>(matrix.columns)*Batch*2,reinterpret_cast<cudaStream_t>(stream)>>>(
+            matrix.data,static_cast<const std::uint16_t*>(matrix.scales),matrix.rows,matrix.columns,input,output);
+    };
+    auto shape=[&](auto bits){
+        if(batch==2)launch(bits,std::integral_constant<unsigned,2>{});
+        else if(batch==3)launch(bits,std::integral_constant<unsigned,3>{});
+        else if(batch==5)launch(bits,std::integral_constant<unsigned,5>{});
+        else launch(bits,std::integral_constant<unsigned,7>{});
+    };
+    if(matrix.format==DeviceWeightFormatV1::kW8A16SymG128)shape(std::integral_constant<int,8>{});
+    else shape(std::integral_constant<int,4>{});
+    check(cudaPeekAtLastError(),"small batch compact GEMV");return true;
+}
+
 void cuda_gemv_bf16(const CudaMatrixViewV1& matrix,
                     const std::uint16_t* input, std::uint16_t* output,
                     std::uint32_t batch, void* stream, int device, float alpha,
@@ -502,6 +710,8 @@ void cuda_gemv_bf16(const CudaMatrixViewV1& matrix,
     validate_stream(stream, device);
     if (!input || !output || batch == 0)
         throw std::invalid_argument("invalid BF16 GEMV buffers");
+    if (batch==1 && alpha==1.f && !accumulate &&
+        try_head_pipelined_gemv(matrix,input,output,batch,stream))return;
     if (batch == 1 && optimized_decode_gemv_enabled() &&
         matrix.group_size == kQuantGroupSize &&
         matrix.columns <= kMaximumDecodeSharedColumns &&
@@ -538,6 +748,171 @@ void cuda_gemv_bf16(const CudaMatrixViewV1& matrix,
         matrix.preserved_f32, matrix.rows, matrix.columns, matrix.group_size,
         input, output, alpha, accumulate);
     check(cudaPeekAtLastError(), "gemv_bf16_kernel");
+}
+
+bool cuda_try_hc_inject_batch_bf16(const CudaMatrixViewV1& matrix,
+    const std::uint16_t* input,std::uint16_t* output,unsigned tokens,void* stream,int device,
+    CudaHcActivation activation,float divisor,float scale){
+    if(matrix.format!=DeviceWeightFormatV1::kPreserve || matrix.preserved_f32 ||
+       matrix.rows!=4 || matrix.columns!=10240 || tokens<2 || tokens>7 || !matrix.data || !input || !output || !stream)return false;
+    check(cudaSetDevice(device),"select HC inject device");
+    hc_inject_batch_kernel<<<dim3(matrix.rows,tokens),256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+        static_cast<const std::uint16_t*>(matrix.data),input,output,matrix.rows,matrix.columns,int(activation),divisor,scale);
+    check(cudaPeekAtLastError(),"HC inject batch");return true;
+}
+
+bool cuda_try_hc_mix_tensor_bf16(const CudaMatrixViewV1& matrix,
+    const std::uint16_t* low,const std::uint16_t* normalized,std::uint16_t* mixed,
+    unsigned tokens,void* stream,int device){
+    if(matrix.format!=DeviceWeightFormatV1::kPreserve || matrix.preserved_f32 || matrix.rows!=10240 || matrix.columns!=320 || tokens<2 || tokens>7 || !stream || !matrix.data || !low || !normalized || !mixed)return false;
+    check(cudaSetDevice(device),"select HC mixed tensor device");
+    hc_mma_mix_kernel<<<320,128,0,reinterpret_cast<cudaStream_t>(stream)>>>(static_cast<const std::uint16_t*>(matrix.data),low,normalized,mixed,tokens);
+    check(cudaPeekAtLastError(),"HC fused tensor mixture");return true;
+}
+bool cuda_try_hc_tensor_bf16(const CudaMatrixViewV1& matrix,
+    const std::uint16_t* input, std::uint16_t* output, float* scratch,
+    unsigned tokens, void* stream, int device, CudaHcActivation activation,
+    float divisor, float scale) {
+    if(matrix.format!=DeviceWeightFormatV1::kPreserve || matrix.preserved_f32 ||
+        !matrix.data || matrix.rows%32 || matrix.columns%16 || tokens<2 || tokens>7 ||
+        !input || !output || !scratch || !stream) return false;
+    check(cudaSetDevice(device),"set HC tensor device");
+    const unsigned splits=matrix.columns>=10240?16:1;
+    auto st=reinterpret_cast<cudaStream_t>(stream);
+    if(splits==1)
+        hc_mma_projection_kernel<false><<<dim3(matrix.rows/32,1),128,0,st>>>(
+            static_cast<const std::uint16_t*>(matrix.data),input,output,scratch,matrix.rows,matrix.columns,tokens,splits,int(activation),divisor,scale);
+    else {
+        hc_mma_projection_kernel<true><<<dim3(matrix.rows/32,splits),128,0,st>>>(
+            static_cast<const std::uint16_t*>(matrix.data),input,output,scratch,matrix.rows,matrix.columns,tokens,splits,int(activation),divisor,scale);
+        hc_mma_reduce_kernel<<<(matrix.rows*tokens+255)/256,256,0,st>>>(scratch,output,matrix.rows,tokens,splits,int(activation),divisor,scale);
+    }
+    check(cudaPeekAtLastError(),"HC tensor core projection");
+    return true;
+}
+
+bool cuda_try_hc_gemv_bf16(const CudaMatrixViewV1& matrix,
+                           const std::uint16_t* input,
+                           std::uint16_t* output,
+                           void* stream, int device,
+                           CudaHcActivation activation, float divisor,
+                           float output_scale) {
+    if (matrix.format != DeviceWeightFormatV1::kPreserve ||
+        matrix.preserved_f32 ||
+        (matrix.columns != 320 && matrix.columns != 10240))
+        return false;
+    validate_matrix(matrix);
+    validate_stream(stream, device);
+    if (!input || !output || !(divisor > 0.0f) || !std::isfinite(divisor) ||
+        !std::isfinite(output_scale) ||
+        (activation != CudaHcActivation::kNone &&
+         activation != CudaHcActivation::kSilu &&
+         activation != CudaHcActivation::kSigmoid))
+        throw std::invalid_argument("invalid HC GEMV buffers/epilogue");
+    hc_pair_gemv_bf16_kernel<<<(matrix.rows + 1u) / 2u, kThreads, 0,
+                               reinterpret_cast<cudaStream_t>(stream)>>>(
+        static_cast<const std::uint16_t*>(matrix.data), matrix.rows,
+        matrix.columns, input, output, static_cast<int>(activation),
+        divisor, output_scale);
+    check(cudaPeekAtLastError(), "hc_pair_gemv_bf16_kernel");
+    return true;
+}
+
+bool cuda_try_hc_scalar_batch_bf16(const CudaMatrixViewV1& matrix,
+    const std::uint16_t* input,std::uint16_t* output,unsigned tokens,void* stream,int device,
+    CudaHcActivation activation,float divisor,float scale) {
+    if(matrix.format!=DeviceWeightFormatV1::kPreserve || matrix.preserved_f32 ||
+       (matrix.columns!=320 && matrix.columns!=10240) ||
+       (tokens!=2 && tokens!=3 && tokens!=5 && tokens!=7))return false;
+    validate_matrix(matrix);validate_stream(stream,device);
+    if(!input || !output || !(divisor>0.f) || !std::isfinite(divisor) || !std::isfinite(scale))throw std::invalid_argument("invalid scalar HC batch");
+    auto launch=[&](auto tag){constexpr unsigned Batch=decltype(tag)::value;
+        hc_scalar_batch_kernel<Batch><<<(matrix.rows+1)/2,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+            static_cast<const std::uint16_t*>(matrix.data),matrix.rows,matrix.columns,input,output,int(activation),divisor,scale);};
+    if(tokens==2)launch(std::integral_constant<unsigned,2>{});
+    else if(tokens==3)launch(std::integral_constant<unsigned,3>{});
+    else if(tokens==5)launch(std::integral_constant<unsigned,5>{});
+    else launch(std::integral_constant<unsigned,7>{});
+    check(cudaPeekAtLastError(),"scalar HC batch");return true;
+}
+
+bool cuda_try_hc_grouped_bf16(const CudaHcProjectionV1& first,
+                               const CudaHcProjectionV1& second,
+                               const std::uint16_t* input,
+                               void* stream, int device) {
+    if (first.matrix.columns != second.matrix.columns) return false;
+    for (const auto* projection : {&first, &second}) {
+        const auto& matrix = projection->matrix;
+        if (matrix.format != DeviceWeightFormatV1::kPreserve ||
+            matrix.preserved_f32 ||
+            (matrix.columns != 320 && matrix.columns != 10240))
+            return false;
+    }
+    for (const auto* projection : {&first, &second}) {
+        validate_matrix(projection->matrix);
+        const auto activation = projection->activation;
+        if (!projection->output || !(projection->divisor > 0.0f) ||
+            !std::isfinite(projection->divisor) ||
+            !std::isfinite(projection->output_scale) ||
+            (activation != CudaHcActivation::kNone &&
+             activation != CudaHcActivation::kSilu &&
+             activation != CudaHcActivation::kSigmoid))
+            throw std::invalid_argument("invalid grouped HC output/epilogue");
+    }
+    const auto overlaps = [](const std::uint16_t* a, std::uint32_t count_a,
+                             const std::uint16_t* b, std::uint32_t count_b) {
+        const auto begin_a = reinterpret_cast<std::uintptr_t>(a);
+        const auto begin_b = reinterpret_cast<std::uintptr_t>(b);
+        return begin_a <= begin_b
+            ? begin_b - begin_a < static_cast<std::uint64_t>(count_a) * 2
+            : begin_a - begin_b < static_cast<std::uint64_t>(count_b) * 2;
+    };
+    if (!input || overlaps(first.output, first.matrix.rows,
+                            second.output, second.matrix.rows) ||
+        overlaps(input, first.matrix.columns, first.output, first.matrix.rows) ||
+        overlaps(input, first.matrix.columns, second.output, second.matrix.rows))
+        throw std::invalid_argument("invalid grouped HC input/alias");
+    validate_stream(stream, device);
+    const auto first_blocks = (static_cast<std::uint64_t>(first.matrix.rows) + 1) / 2;
+    const auto total_blocks = first_blocks +
+        (static_cast<std::uint64_t>(second.matrix.rows) + 1) / 2;
+    if (total_blocks > 2147483647u)
+        throw std::overflow_error("grouped HC grid exceeds CUDA limit");
+    hc_grouped_bf16_kernel<<<static_cast<unsigned>(total_blocks), kThreads, 0,
+                              reinterpret_cast<cudaStream_t>(stream)>>>(
+        first, second, input, static_cast<std::uint32_t>(first_blocks));
+    check(cudaPeekAtLastError(), "hc_grouped_bf16_kernel");
+    return true;
+}
+
+void cuda_multi_projection_decode_bf16(
+    const CudaProjectionPackV1& pack, const std::uint16_t* input,
+    void* stream, int device) {
+    if (pack.count == 0 || pack.count > 4 || !input)
+        throw std::invalid_argument("invalid projection pack");
+    validate_stream(stream, device);
+    std::uint32_t blocks = 0;
+    const auto columns = pack.matrices[0].columns;
+    for (std::uint32_t i = 0; i < pack.count; ++i) {
+        const auto& m = pack.matrices[i];
+        validate_matrix(m);
+        if (m.columns != columns || !pack.outputs[i] || columns > 16384 ||
+            (m.format != DeviceWeightFormatV1::kPreserve && m.group_size != 128))
+            throw std::invalid_argument("incompatible projection pack");
+        const auto rows = m.format == DeviceWeightFormatV1::kPreserve
+                              ? m.rows : (m.rows + 7u) / 8u;
+        blocks = std::max(blocks, rows);
+    }
+    if (!optimized_decode_gemv_enabled()) {
+        for (std::uint32_t i = 0; i < pack.count; ++i)
+            cuda_gemv_bf16(pack.matrices[i], input, pack.outputs[i], 1,
+                           stream, device);
+        return;
+    }
+    multi_projection_decode_kernel<<<dim3(blocks, pack.count), 256,
+        columns * sizeof(std::uint16_t),
+        reinterpret_cast<cudaStream_t>(stream)>>>(pack, input);
+    check(cudaPeekAtLastError(), "multi_projection_decode_kernel");
 }
 
 void cuda_dequantize_matrix_bf16(const CudaMatrixViewV1& matrix,
@@ -653,6 +1028,17 @@ void cuda_add_bf16(const std::uint16_t* left, const std::uint16_t* right,
     check(cudaPeekAtLastError(), "add_bf16_kernel");
 }
 
+void cuda_argmax_bf16_batch(const std::uint16_t* logits,unsigned count,unsigned rows,
+    float* partial_values,int* partial_ids,int* output,void* stream,int device){
+    validate_stream(stream,device);
+    if(!logits||!partial_values||!partial_ids||!output||!count||!rows||rows>7)
+        throw std::invalid_argument("invalid batched argmax buffers");
+    auto st=reinterpret_cast<cudaStream_t>(stream);
+    argmax_partials_kernel<<<dim3(128,rows),256,0,st>>>(logits,count,rows,partial_values,partial_ids);
+    check(cudaPeekAtLastError(),"argmax partials");
+    argmax_finalize_kernel<<<rows,256,0,st>>>(partial_values,partial_ids,output);
+    check(cudaPeekAtLastError(),"argmax finalization");
+}
 void cuda_argmax_bf16(const std::uint16_t* logits, std::uint32_t count,
                       std::int32_t* output, void* stream, int device) {
     validate_stream(stream, device);
@@ -672,7 +1058,11 @@ void cuda_topk_router_bf16(
     if (!logits || !expert_ids || !expert_weights || tokens == 0 ||
         experts == 0 || top_k == 0 || top_k > experts || top_k > 32)
         throw std::invalid_argument("invalid top-k router buffers");
-    if (experts == 512 && normalize_top_k && optimized_decode_topk_enabled()) {
+    const auto* warp = std::getenv("Q38_CUDA_TOPK_WARP");
+    if (experts == 512 && normalize_top_k && warp && std::strcmp(warp,"1")==0) {
+        topk_router_512_warp_kernel<<<tokens,32,0,reinterpret_cast<cudaStream_t>(stream)>>>(logits,expert_ids,expert_weights,top_k);
+        check(cudaPeekAtLastError(),"topk_router_512_warp_kernel");
+    } else if (experts == 512 && normalize_top_k && optimized_decode_topk_enabled()) {
         topk_router_512_decode_kernel<<<
             tokens, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
             logits, expert_ids, expert_weights, top_k);

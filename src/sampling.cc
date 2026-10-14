@@ -59,29 +59,55 @@ TransactionalSampler::TransactionalSampler(std::uint32_t vocabulary,
 SamplerDecisionV1 TransactionalSampler::prepare(
     const std::vector<std::uint16_t>& logits_bf16,
     const std::vector<std::int32_t>& additional_penalty_tokens) const {
+    return prepare_impl(logits_bf16, additional_penalty_tokens, nullptr);
+}
+
+SamplerDecisionV1 TransactionalSampler::prepare_compact(
+    const std::vector<std::uint16_t>& logits_bf16,
+    const std::vector<std::int32_t>& token_ids) const {
+    if (!can_sample_compact() || logits_bf16.size() != token_ids.size() ||
+        token_ids.size() != std::min(config_.top_k, vocabulary_))
+        throw std::invalid_argument("invalid compact sampling candidates");
+    auto unique = token_ids;
+    std::sort(unique.begin(), unique.end());
+    if (unique.empty() || unique.front() < 0 ||
+        static_cast<std::uint32_t>(unique.back()) >= vocabulary_ ||
+        std::adjacent_find(unique.begin(), unique.end()) != unique.end())
+        throw std::invalid_argument("invalid compact sampling token IDs");
+    return prepare_impl(logits_bf16, {}, &token_ids);
+}
+
+SamplerDecisionV1 TransactionalSampler::prepare_impl(
+    const std::vector<std::uint16_t>& logits_bf16,
+    const std::vector<std::int32_t>& additional_penalty_tokens,
+    const std::vector<std::int32_t>* token_ids) const {
     if (!sampled())
         throw std::logic_error("greedy sampler does not consume RNG");
-    if (logits_bf16.size() != vocabulary_)
+    if (!token_ids && logits_bf16.size() != vocabulary_)
         throw std::invalid_argument("sampler logits size differs from vocabulary");
 
     std::unordered_map<std::int32_t, std::uint32_t> additional;
+    const bool penalties = config_.repetition_penalty != 1.0f ||
+                           config_.frequency_penalty != 0.0f ||
+                           config_.presence_penalty != 0.0f;
     for (const auto token : additional_penalty_tokens) {
         if (token < 0 || static_cast<std::uint32_t>(token) >= vocabulary_)
             throw std::invalid_argument("penalty token is outside vocabulary");
-        ++additional[token];
+        if (penalties) ++additional[token];
     }
 
     std::vector<std::pair<float, std::int32_t>> candidates;
-    candidates.reserve(vocabulary_);
-    for (std::uint32_t token = 0; token < vocabulary_; ++token) {
-        auto logit = bf16_to_float(logits_bf16[token]);
+    candidates.reserve(logits_bf16.size());
+    for (std::uint32_t i = 0; i < logits_bf16.size(); ++i) {
+        const auto token = token_ids ? static_cast<std::uint32_t>((*token_ids)[i]) : i;
+        auto logit = bf16_to_float(logits_bf16[i]);
         if (!std::isfinite(logit))
             logit = -std::numeric_limits<float>::infinity();
         const auto extra = additional.find(static_cast<std::int32_t>(token));
         const std::uint64_t count =
             counts_[token] +
             (extra == additional.end() ? 0u : extra->second);
-        if (count != 0) {
+        if (penalties && count != 0) {
             if (config_.repetition_penalty != 1.0f)
                 logit = logit > 0.0f
                             ? logit / config_.repetition_penalty
@@ -93,7 +119,8 @@ SamplerDecisionV1 TransactionalSampler::prepare(
                                 static_cast<std::int32_t>(token));
     }
     const auto descending = [](const auto& left, const auto& right) {
-        return left.first > right.first;
+        return left.first > right.first ||
+               (left.first == right.first && left.second < right.second);
     };
     if (config_.top_k != 0 && config_.top_k < candidates.size()) {
         std::nth_element(candidates.begin(),
@@ -169,6 +196,19 @@ void TransactionalSampler::commit_token(std::int32_t token) {
         splitmix64(static_cast<std::uint32_t>(token) ^
                    (state_.canonical_tokens *
                     UINT64_C(0x9e3779b97f4a7c15)));
+}
+
+void TransactionalSampler::replace_last_token(std::int32_t expected,
+                                               std::int32_t replacement) {
+    if (sampled() || !state_.canonical_tokens || expected < 0 || replacement < 0 ||
+        static_cast<std::uint32_t>(expected) >= vocabulary_ ||
+        static_cast<std::uint32_t>(replacement) >= vocabulary_ || !counts_[expected])
+        throw std::invalid_argument("invalid pending token replacement");
+    --counts_[expected];
+    ++counts_[replacement];
+    const auto position = state_.canonical_tokens * UINT64_C(0x9e3779b97f4a7c15);
+    state_.penalty_checksum ^= splitmix64(static_cast<std::uint32_t>(expected) ^ position);
+    state_.penalty_checksum ^= splitmix64(static_cast<std::uint32_t>(replacement) ^ position);
 }
 
 void TransactionalSampler::reset() {

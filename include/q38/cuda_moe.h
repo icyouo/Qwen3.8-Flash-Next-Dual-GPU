@@ -26,7 +26,8 @@ void cuda_moe_routed_bf16(const CudaTensorViewV1& gate_up_experts,
                           float* accumulation_scratch,
                           std::uint16_t* routed_output,
                           void* stream,
-                          int device);
+                          int device,
+                          float* partial_output_f32 = nullptr);
 
 void cuda_moe_combine_shared_bf16(const std::uint16_t* routed_output,
                                   const std::uint16_t* shared_output,

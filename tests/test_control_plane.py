@@ -4,6 +4,8 @@ import json
 import sys
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 TOOLS = Path(__file__).parents[1] / "tools"
@@ -11,7 +13,10 @@ sys.path.insert(0, str(TOOLS))
 
 from q38_control_plane import (  # noqa: E402
     ControlPlaneError,
+    HuggingFaceCodec,
     Q38ControlPlane,
+    SessionRecord,
+    StreamingTextDecoder,
     block_hashes,
 )
 from q38_rpc_client import OPCODES, Response  # noqa: E402
@@ -57,7 +62,7 @@ class FakeTransport:
         argument1: int = 0,
         timeout_ms: int = 0,
     ) -> Response:
-        del argument0, timeout_ms
+        del timeout_ms
         self.calls.append(opcode)
         if opcode == OPCODES["append"]:
             values = list(tokens or ())
@@ -80,6 +85,13 @@ class FakeTransport:
             self.epoch += 1
             return self.response(opcode, values)
         if opcode == OPCODES["state"]:
+            return self.response(opcode)
+        if opcode == OPCODES['replace_pending_terminal']:
+            expected, replacement = tokens
+            assert len(self.tokens) == argument0 and self.epoch == argument1
+            assert self.target == len(self.tokens) - 1 and self.tokens[-1] == expected
+            self.tokens[-1] = replacement
+            self.epoch += 1
             return self.response(opcode)
         if opcode == OPCODES["reset"]:
             self.tokens.clear()
@@ -109,6 +121,29 @@ class ControlPlaneTest(unittest.TestCase):
         values = list(range(2050))
         self.assertEqual(block_hashes(values), block_hashes(tuple(values)))
         self.assertEqual(len(block_hashes(values)), 3)
+
+    def test_incremental_hashes_cross_blocks_and_reset_to_longer_prefix(self):
+        record = SessionRecord("hash", 262144, "q38")
+        values = list(range(4099))
+        for end in (1, 1023, 1024, 1025, 2049, 4099):
+            record.canonical_tokens.extend(values[len(record.canonical_tokens):end])
+            record.refresh_hashes()
+            self.assertEqual(record.hashes, block_hashes(record.canonical_tokens))
+        record.canonical_tokens.clear()
+        record.refresh_hashes(rebuild=True)
+        record.canonical_tokens.extend([17] * 5000)
+        record.refresh_hashes()
+        self.assertEqual(record.hashes, block_hashes(record.canonical_tokens))
+
+    def test_interposed_writer_divergence_never_publishes(self):
+        transport, control, session = self.make()
+        control.append_tokens(session, [1, 2])
+        stream = control.generate(session, 8, mode="mtp", mtp_width=4)
+        self.assertEqual(next(stream).token_ids, (100,))
+        transport.call(OPCODES["append"], tokens=[999])
+        with self.assertRaises(ControlPlaneError) as caught:
+            next(stream)
+        self.assertEqual(caught.exception.code, "frontier_divergence")
 
     def test_append_and_plain_generation_publish_only_commits(self) -> None:
         transport, control, session = self.make()
@@ -261,6 +296,159 @@ class ControlPlaneTest(unittest.TestCase):
             control.cancel()
         self.assertEqual(caught.exception.code, "no_active_writer")
         self.assertEqual(control.session(session)["committed_tokens"], 0)
+
+
+class TerminalPrefixTests(unittest.TestCase):
+    def make(self, enabled=True):
+        transport = FakeTransport()
+        control = Q38ControlPlane(transport, context_limit=100, vocabulary=1000,
+                                 stop_token_ids=[100], reuse_terminal_prefix=enabled)
+        control.create_session('chat')
+        list(control.complete_full_history('chat', [1, 2], 4))
+        self.assertEqual(control._session.canonical_tokens, [1, 2, 100])
+        return transport, control
+
+    def test_unprocessed_terminal_reuses_only_the_evaluated_prefix(self):
+        transport, control = self.make()
+        count = transport.calls.count(OPCODES['reset'])
+        _state, timing = control.append_full_history('chat', [1, 2, 3, 4])
+        self.assertEqual(transport.calls.count(OPCODES['reset']), count)
+        self.assertEqual(transport.calls.count(OPCODES['replace_pending_terminal']), 1)
+        self.assertEqual(timing['prefix_tokens'], 2)
+        self.assertEqual(timing['suffix_tokens'], 2)
+        self.assertTrue(timing['terminal_prefix_reused'])
+        self.assertEqual(control._session.canonical_tokens, [1, 2, 3, 4])
+        self.assertEqual(control._session.hashes, block_hashes([1, 2, 3, 4]))
+        self.assertEqual(control.metrics()['session_cache']['terminal_prefix_hits'], 1)
+
+    def test_disabled_divergent_or_evaluated_terminal_keeps_cold_rebuild(self):
+        for mode in ('disabled', 'divergent', 'evaluated', 'nonterminal'):
+            transport, control = self.make(mode != 'disabled')
+            if mode == 'evaluated':
+                transport.target = len(transport.tokens)
+            elif mode == 'nonterminal':
+                transport.tokens[-1] = control._session.canonical_tokens[-1] = 101
+            values = [1, 2, 3, 4] if mode != 'divergent' else [8, 2, 3, 4]
+            before = transport.calls.count(OPCODES['reset'])
+            _state, timing = control.append_full_history('chat', values)
+            self.assertTrue(timing['cold_rebuild'])
+            self.assertFalse(timing['terminal_prefix_reused'])
+            self.assertEqual(transport.calls.count(OPCODES['reset']), before + 1)
+            self.assertNotIn(OPCODES['replace_pending_terminal'], transport.calls)
+
+    def test_declined_operation_falls_back_only_with_unchanged_frontiers(self):
+        transport, control = self.make()
+        original = transport.call
+        def call(opcode, **kwargs):
+            if opcode == OPCODES['replace_pending_terminal']:
+                state = transport.response(opcode)
+                return Response(**{**state.__dict__, 'status': 1})
+            return original(opcode, **kwargs)
+        transport.call = call
+        _, timing = control.append_full_history('chat', [1, 2, 3, 4])
+        self.assertTrue(timing['cold_rebuild'])
+        self.assertFalse(timing['terminal_prefix_reused'])
+        self.assertEqual(transport.tokens, [1, 2, 3, 4])
+
+    def test_cancel_after_replacement_preserves_committed_bookkeeping(self):
+        transport, control = self.make()
+        stop = threading.Event()
+        original = transport.call
+        def call(opcode, **kwargs):
+            if opcode == OPCODES['append'] and stop.is_set():
+                raise ControlPlaneError(499, 'stream_cancelled', 'stream was cancelled')
+            response = original(opcode, **kwargs)
+            if opcode == OPCODES['replace_pending_terminal']:
+                stop.set()
+            return response
+        transport.call = call
+        with self.assertRaises(ControlPlaneError):
+            list(control.complete_full_history('chat', [1, 2, 3, 4], 2, stop_event=stop))
+        self.assertEqual(control._session.canonical_tokens, [1, 2, 3])
+        self.assertEqual(transport.tokens, [1, 2, 3])
+        stop.clear()
+        _, timing = control.append_full_history('chat', [1, 2, 3, 4])
+        self.assertFalse(timing['cold_rebuild'])
+        self.assertEqual(transport.tokens, [1, 2, 3, 4])
+
+
+class CodecTerminationTests(unittest.TestCase):
+    def test_terminal_tokens_hide_suffix_without_losing_parser_tags(self):
+        pieces = {1: "<think>", 2: "reason", 3: "</think>",
+                  4: '<tool_call>{"name":"x"}</tool_call>',
+                  5: "<|im_end|>", 6: "\n", 7: "<|endoftext|>"}
+        def decode(tokens, **options):
+            self.assertFalse(options["skip_special_tokens"])
+            return "".join(pieces[t] for t in tokens)
+        tokenizer = SimpleNamespace(eos_token_id=7,
+            get_vocab=lambda: {v: k for k, v in pieces.items()}, decode=decode)
+        module = SimpleNamespace(AutoTokenizer=SimpleNamespace(
+            from_pretrained=lambda *args, **kwargs: tokenizer))
+        with patch.dict(sys.modules, {"transformers": module}):
+            codec = HuggingFaceCodec("unused")
+        prefix = [1, 2, 3, 4]
+        expected = "".join(pieces[t] for t in prefix)
+        for end in (5, 7):
+            sequence = prefix + [end, 6, 7]
+            self.assertEqual(codec.decode(sequence), expected)
+            chunks, previous = [], ""
+            for length in range(1, len(sequence) + 1):
+                current = codec.decode(sequence[:length])
+                self.assertTrue(current.startswith(previous))
+                chunks.append(current[len(previous):])
+                previous = current
+            self.assertEqual("".join(chunks), expected)
+        self.assertEqual(codec.stop_token_ids, (7,))
+
+
+class StreamingCodecTests(unittest.TestCase):
+    def test_split_unicode_and_truncated_bytes_match_final_decode(self):
+        class Codec:
+            output_end_token_ids = {999}
+            def decode(self, tokens):
+                return bytes(tokens).decode('utf-8', errors='replace')
+        for text in ('中文🙂 café\n', 'x\ufffdy', '日本語 👩🏽\u200d💻'):
+            values = list(text.encode())
+            for width in (1, 2, 5):
+                decoder = StreamingTextDecoder(Codec())
+                chunks = [decoder.push(values[i:i + width]) for i in range(0, len(values), width)]
+                chunks.append(decoder.push([999, 65], final=True))
+                self.assertEqual(''.join(chunks), text)
+            decoder = StreamingTextDecoder(Codec())
+            values = list('中文🙂'.encode())[:-1]
+            pieces = [decoder.push([v]) for v in values]
+            pieces.append(decoder.push([], final=True))
+            self.assertEqual(''.join(pieces), Codec().decode(values))
+            self.assertNotIn('\ufffd', ''.join(pieces[:-1]))
+            with self.assertRaises(RuntimeError):
+                decoder.push([])
+
+    def test_native_bytelevel_stream_uses_one_final_batch_decode(self):
+        try:
+            from tokenizers import Tokenizer, decoders, models
+        except ImportError:
+            self.skipTest('tokenizers optional; exercised on the deployment venv')
+        byte_chars = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+        table = {b: chr(b) for b in byte_chars}
+        for extra, value in enumerate(b for b in range(256) if b not in table):
+            table[value] = chr(256 + extra)
+        backend = Tokenizer(models.BPE({table[b]: b for b in range(256)}, []))
+        backend.decoder = decoders.ByteLevel()
+        class Codec:
+            output_end_token_ids = {999}
+            tokenizer = SimpleNamespace(backend_tokenizer=backend)
+            calls = 0
+            def decode(self, tokens):
+                self.calls += 1
+                return backend.decode(tokens, skip_special_tokens=False)
+        for raw in ('中文🙂 café\n'.encode(), 'x\ufffdy'.encode(), '👩🏽\u200d💻'.encode(), '中文🙂'.encode()[:-1]):
+            codec = Codec()
+            decoder = StreamingTextDecoder(codec)
+            self.assertIsNotNone(decoder.stream)
+            chunks = [decoder.push([b]) for b in raw]
+            chunks.append(decoder.push([999, 65], final=True))
+            self.assertEqual(''.join(chunks), backend.decode(list(raw), skip_special_tokens=False))
+            self.assertEqual(codec.calls, 1)
 
 
 if __name__ == "__main__":

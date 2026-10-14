@@ -14,6 +14,8 @@ struct CudaBoundaryRingOptions {
     std::uint32_t slots = 3;
     std::uint32_t max_tokens = 4096;
     std::uint32_t hidden_width = 4 * 2560;
+    bool asynchronous_copy = false;
+    bool device_only = false;
 };
 
 struct CudaBoundaryRingStats {

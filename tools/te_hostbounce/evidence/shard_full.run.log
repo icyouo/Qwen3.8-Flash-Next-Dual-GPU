@@ -1,0 +1,4 @@
+=== rank0 stage0 ===
+  rank0 stage0 seg0 model-00001-of-00131.q38w: 36.1 MB (src 72.1 MB) tensors=13
+  rank0 stage0 seg1 model-00002-of-00131.q38w: 852.0 MB (src 1703.9 MB) tensors=1
+  rank0 stage0 seg2 model-00003-of-00131.q38w: 474.7 MB (src 944.9 MB) tensors=23

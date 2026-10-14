@@ -60,11 +60,11 @@ __global__ void repeat_embedding_kernel(const std::uint16_t* embedding,
                               index % kQ38HiddenWidth));
 }
 
-__global__ void group_rmsnorm_kernel(const std::uint16_t* hyper,
+__device__ void group_rmsnorm_impl(const std::uint16_t* hyper,
                                       const std::uint16_t* weight,
-                                      std::uint16_t* output) {
-    const auto stream = blockIdx.x;
-    const auto token = blockIdx.y;
+                                      std::uint16_t* output,
+                                      std::uint32_t stream,
+                                      std::uint32_t token) {
     const auto base = static_cast<std::uint64_t>(token) * kQ38HyperWidth +
                       stream * kQ38HiddenWidth;
     float squares = 0.0f;
@@ -80,6 +80,19 @@ __global__ void group_rmsnorm_kernel(const std::uint16_t* hyper,
         store(output, base + index,
               load(hyper, base + index) * inverse *
                   (1.0f + load(weight, stream * kQ38HiddenWidth + index)));
+}
+
+__global__ void group_rmsnorm_kernel(const std::uint16_t* hyper,
+                                      const std::uint16_t* weight,
+                                      std::uint16_t* output) {
+    group_rmsnorm_impl(hyper, weight, output, blockIdx.x, blockIdx.y);
+}
+
+__global__ void pair_group_rmsnorm_kernel(CudaHyperNormV1 first,
+                                           CudaHyperNormV1 second) {
+    const auto norm = blockIdx.z == 0 ? first : second;
+    group_rmsnorm_impl(norm.input, norm.weight, norm.output,
+                       blockIdx.x, blockIdx.y);
 }
 
 __global__ void elementwise_kernel(const std::uint16_t* input,
@@ -111,6 +124,7 @@ __global__ void mix_kernel(const std::uint16_t* normalized,
           value / kQ38HyperCount);
 }
 
+template<bool FromProjection = false>
 __global__ void inject_kernel(const std::uint16_t* original,
                               const std::uint16_t* block_output,
                               const std::uint16_t* injection,
@@ -118,18 +132,55 @@ __global__ void inject_kernel(const std::uint16_t* original,
     const auto token = blockIdx.y;
     const auto index = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x +
                        threadIdx.x;
+    __shared__ float activated_gate;
+    if constexpr(FromProjection) {
+        if(threadIdx.x==0){
+            const auto gate_index=static_cast<std::uint64_t>(token)*kQ38HyperCount+index/kQ38HiddenWidth;
+            const float x=load(injection,gate_index)/float(kQ38HyperCount);
+            const float sigmoid=1.f/(1.f+expf(-x));
+            activated_gate=__bfloat162float(__float2bfloat16_rn(sigmoid*2.f));
+        }
+        __syncthreads();
+    }
     if (index >= kQ38HyperWidth) return;
     const auto stream = index / kQ38HiddenWidth;
     const auto hidden = index % kQ38HiddenWidth;
     const auto hyper_offset =
         static_cast<std::uint64_t>(token) * kQ38HyperWidth + index;
+    const float gate=FromProjection?activated_gate:load(injection,
+                       static_cast<std::uint64_t>(token) * kQ38HyperCount+stream);
     store(output, hyper_offset,
           load(original, hyper_offset) +
               load(block_output,
                    static_cast<std::uint64_t>(token) * kQ38HiddenWidth + hidden) *
-                  load(injection,
-                       static_cast<std::uint64_t>(token) * kQ38HyperCount +
-                           stream));
+                  gate);
+}
+
+__global__ void add_embedding_kernel(const std::uint16_t* hyper,
+    const std::uint16_t* embedding, std::uint16_t* output) {
+    const unsigned token=blockIdx.y,index=blockIdx.x*blockDim.x+threadIdx.x;
+    const unsigned h=token*kQ38HyperWidth+index,e=token*kQ38HiddenWidth+index%kQ38HiddenWidth;
+    store(output,h,load(hyper,h)+load(embedding,e));
+}
+__global__ void moe_inject_kernel(const std::uint16_t* original,
+    const std::uint16_t* routed, const std::uint16_t* shared,
+    const std::uint16_t* shared_gate, const std::uint16_t* injection,
+    std::uint16_t* output) {
+    const unsigned token = blockIdx.y;
+    const unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float expert_gate, hc_gate;
+    if (threadIdx.x == 0) {
+        expert_gate = 1.f / (1.f + expf(-load(shared_gate, token)));
+        const float x = load(injection, token * kQ38HyperCount + index / kQ38HiddenWidth) / float(kQ38HyperCount);
+        const float sigmoid = 1.f / (1.f + expf(-x));
+        hc_gate = __bfloat162float(__float2bfloat16_rn(sigmoid * 2.f));
+    }
+    __syncthreads();
+    const unsigned hidden_index = token * kQ38HiddenWidth + index % kQ38HiddenWidth;
+    const float combined = __bfloat162float(__float2bfloat16_rn(
+        load(routed, hidden_index) + load(shared, hidden_index) * expert_gate));
+    const unsigned hyper_index = token * kQ38HyperWidth + index;
+    store(output, hyper_index, load(original, hyper_index) + combined * hc_gate);
 }
 
 void launch_elementwise(const std::uint16_t* input, std::uint16_t* output,
@@ -178,6 +229,34 @@ void cuda_hyper_group_rmsnorm_bf16(
     check(cudaPeekAtLastError(), "group_rmsnorm_kernel");
 }
 
+void cuda_hyper_pair_group_rmsnorm_bf16(
+    const CudaHyperNormV1& first, const CudaHyperNormV1& second,
+    std::uint32_t tokens, void* stream, int device) {
+    if (!first.input || !first.weight || !first.output || !second.input ||
+        !second.weight || !second.output || !stream || tokens == 0 || tokens > 65535)
+        throw std::invalid_argument("invalid paired hyper norm buffers/extent");
+    const auto words = static_cast<std::uint64_t>(tokens) * kQ38HyperWidth;
+    const auto overlap = [](const std::uint16_t* a, std::uint64_t a_words,
+                            const std::uint16_t* b, std::uint64_t b_words) {
+        const auto x = reinterpret_cast<std::uintptr_t>(a);
+        const auto y = reinterpret_cast<std::uintptr_t>(b);
+        return x <= y ? y - x < a_words * 2 : x - y < b_words * 2;
+    };
+    for (const auto* norm : {&first, &second}) {
+        if (overlap(norm->output, words, first.input, words) ||
+            overlap(norm->output, words, second.input, words) ||
+            overlap(norm->output, words, first.weight, kQ38HyperWidth) ||
+            overlap(norm->output, words, second.weight, kQ38HyperWidth))
+            throw std::invalid_argument("paired hyper norm output overlaps read data");
+    }
+    if (overlap(first.output, words, second.output, words))
+        throw std::invalid_argument("paired hyper norm outputs overlap");
+    select_device(device);
+    pair_group_rmsnorm_kernel<<<dim3(kQ38HyperCount, tokens, 2), 256, 0,
+                                reinterpret_cast<cudaStream_t>(stream)>>>(first, second);
+    check(cudaPeekAtLastError(), "pair_group_rmsnorm_kernel");
+}
+
 void cuda_hyper_silu_scaled_bf16(
     const std::uint16_t* input, std::uint16_t* output, std::uint32_t tokens,
     std::uint32_t width, float divisor, void* stream, int device) {
@@ -216,12 +295,45 @@ void cuda_hyper_inject_bf16(
         !output_hyper || !stream || tokens == 0)
         throw std::invalid_argument("invalid hyper injection buffers");
     select_device(device);
-    inject_kernel<<<dim3((kQ38HyperWidth + 255) / 256, tokens), 256, 0,
+    inject_kernel<false><<<dim3((kQ38HyperWidth + 255) / 256, tokens), 256, 0,
                         reinterpret_cast<cudaStream_t>(stream)>>>(
         original_hyper, block_output, injection_weights, output_hyper);
     check(cudaPeekAtLastError(), "hyper injection kernel");
 }
 
+void cuda_hyper_inject_from_projection_bf16(
+    const std::uint16_t* original,const std::uint16_t* block,
+    const std::uint16_t* projection,std::uint16_t* output,unsigned tokens,void* stream,int device) {
+    if(!original||!block||!projection||!output||!tokens||!stream)
+        throw std::invalid_argument("invalid fused hyper injection buffers");
+    select_device(device);
+    // Every 256-element CTA lies wholly within one 2560-element HC stream.
+    inject_kernel<true><<<dim3(kQ38HyperWidth/256,tokens),256,0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(original,block,projection,output);
+    check(cudaPeekAtLastError(),"fused hyper injection kernel");
+}
+
 bool cuda_q38_hyper_compiled() { return true; }
+void cuda_hyper_add_embedding_bf16(const std::uint16_t* hyper,
+    const std::uint16_t* embedding, std::uint16_t* output,
+    unsigned tokens, void* stream, int device) {
+    if(!hyper||!embedding||!output||!tokens||!stream)
+        throw std::invalid_argument("invalid HC broadcast addition");
+    select_device(device);
+    add_embedding_kernel<<<dim3(kQ38HyperWidth/256,tokens),256,0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(hyper,embedding,output);
+    check(cudaPeekAtLastError(),"HC broadcast addition");
+}
+void cuda_hyper_moe_inject_bf16(const std::uint16_t* original,
+    const std::uint16_t* routed, const std::uint16_t* shared,
+    const std::uint16_t* shared_gate, const std::uint16_t* injection,
+    std::uint16_t* output, unsigned tokens, void* stream, int device) {
+    if (!original || !routed || !shared || !shared_gate || !injection || !output || !tokens || !stream)
+        throw std::invalid_argument("invalid fused MoE HC residual buffers");
+    select_device(device);
+    moe_inject_kernel<<<dim3(kQ38HyperWidth/256,tokens),256,0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(original,routed,shared,shared_gate,injection,output);
+    check(cudaPeekAtLastError(),"fused MoE HC residual");
+}
 
 }  // namespace q38

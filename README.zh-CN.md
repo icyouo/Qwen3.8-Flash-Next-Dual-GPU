@@ -2,6 +2,40 @@
 
 # Qwen3.8-Flash-Next-Dual-GPU
 
+> **2026-10-12 GDN 缓存更新：** 已安装显式 `mtp4-native-bf16-gdn-qk-candidate`，保持原 BF16 数值与递推累加顺序，将规范化 Q/K 提前存为 FP32 缓存，增加约 16 MiB/GPU。两轮反向 A/B、每版本六次真实 4K 请求为 **TTFT 3.071→3.035 秒（−1.19%）**，完整 409-token 回答一致；安装后独立三次对照仍快 **1.62%**。相对上一轮 vLLM 2.771 秒参考仍差约 **9.53%**，本轮未重测 vLLM。见[实现、验证、数值限制与启动回退](docs/gdn-normalized-prefill-20261012.md)。原 BF16/FP24 和旧 profiles 保留，27B、挖矿维持停止，测试后恢复了两个 ComfyUI。
+
+> **2026-10-12 Prefill 复测：** 停止后台 GPU 负载后，各六次冷前缀 4K 请求测得已安装 BF16 **3.071 秒**、vLLM **2.771 秒**，TTFT 仍慢 **300 ms / 10.84%**。两种共享专家重叠方案无稳定收益；实际 1024-token 分块虽通过完整 BF16 一致性验证，反向 A/B 仍慢 **2.83%**，均未安装。当前保留 512-token BF16 版本。见[实验、耗时窗口与原始证据](docs/prefill-optimization-20261012.md)。
+
+> **2026-10-12 BF16 更新：** 已安装显式 `mtp4-native-bf16-candidate`，MoE 的 prefill/decode/MTP/Graph 通信统一为 **16 位 BF16**。两轮反向 A/B、各六次 4K 请求的中位数为 **TTFT 3.420→3.067 秒（−10.32%）**、输入/TTFT **1198→1335 tok/s（+11.50%）**；相对保留的 vLLM 2.777 秒参考仍差 **10.46%**。新精度的回答变为 409 token，质量/恢复及重复全 logits 一致性通过；已有 MTP/逐 token logits 差异仍在。见[完整实测、数值限制及启动回退](docs/bf16-transport-20261012.md)。FP24 保留，未启动常驻服务，27B 和挖矿均已停止。
+
+> **2026-10-11 MoE 测试故障：** 后续隔离 MoE prefill 测试期间 Z4 整机重启；该 MoE 候选未完成验收、未安装，原 FP24 二进制保持原样。见[故障证据](docs/moe-prefill-incident-20261011.md)。
+
+> **2026-10-11 精确传输更新：** 显式候选 `mtp4-native-prefill-fp24-candidate` 采用有界 24-bit 传输及完整 FP32 回读，保持精确求和/舍入结果。两轮顺序相反的 A/B、每版本六次请求为 **TTFT 3.506→3.346 秒**、**Prefill 1168→1224 tok/s（+4.77%）**；完整 457-token 回答、logits、质量和恢复门禁通过。对照同日保留的 vLLM **2.777 秒**，TTFT 仍差 **20.51%**。见[测量、验收和启动说明](docs/prefill-exact-transport-20261011.md)。
+
+> **2026-10-11 RSAG 更新：** 显式候选 `mtp4-native-prefill-rsag-candidate` 保留 FP32 求和与 BF16 舍入，将 MoE 双卡传输量减少 25%。同轮本机 HTTP 三次中位数为 TTFT **3.95→3.45 秒**、输入/TTFT **1037→1188 tok/s（+14.57%）**；457-token 完整回答、BF16、质量和恢复检查均与合格基线一致。vLLM 同轮 **2.78 秒**，仍在前面。见[耗时分布、证据与启动说明](docs/prefill-distribution-20261011.md)。NAS 已规范到 `/mnt/nas` 并保留兼容路径，27B 保持停止。
+
+> **2026-10-11 Prefill 更新：** 新增可选 `mtp4-native-prefill-candidate`，大块 eager 归约改用 P2P 批量复制。冻结 4K 请求各三轮的中位数为 Prefill **864.58→990.04 tok/s（+14.51%）**、TTFT **4.75→4.14 秒**；Decode 约 **85 tok/s**，457 输出 token 和完整回答一致。整模型 BF16/token、质量及恢复检查通过；仍未追平 vLLM 历史 1485.51 tok/s。见[实测、证据与启动说明](docs/native-vllm-parity-20261011.md)。
+
+> **2026-10-04 长输入更新：** `mtp4-native-longinput` 的冻结 4K 请求配对 decode 为 **73.73→83.14 tok/s（+12.76%）**，最终安装版本独立确认 **83.59 tok/s**，457 输出 token 和最终文本一致。已加入增量 tokenizer decode、有界 SSE producer 和请求归属取消。短网页约 **177–179 tok/s**；4K 首字等待仍约 **4.7 秒**。前缀替换候选未通过完整重算 BF16 门禁，保持关闭。见[完整实测、验证和启动说明](docs/native-longinput-optimization-20261004.md)。
+
+> **2026-10-04 llm_speedtest 复查：** 随机英文写作负载的有效 Decode 为 128 输入 **96.00–98.31 tok/s**、4K 输入 **80.09 tok/s**。两次整机重启中断测试，三轮矩阵未完成；此前网页/代码成绩不能当作通用吞吐。已修复流式 API 的真实 usage 返回。见[实测数据与故障证据](docs/llm-speedtest-20261004.md)。
+
+
+> **2026-10-04 固定 MTP4 原生快速配置：** `mtp4-native-fast` 在 Z4 双 170HX、每卡 200W、现有 W4/W8 和 RAM PLE 下，正式入口网页/代码三轮 decode 均值 **172.81 / 174.70 tok/s**。六项逐项优化后保留 P2P/shared expert 重叠、BF16 直接归约、MoE/HC finish 融合及 MTP 输入缓存；新增约 1.18 GiB 显存/卡。完整模型一致性、质量及取消恢复检查通过。见[逐项测量、配置和回退](docs/native-followup-optimization-20261004.md)，以及[上一阶段 162 tok/s 报告](docs/native-fast-optimization-20261004.md)。
+
+> **2026-10-04 固定 MTP4 寄存器优化：** `mtp4-register-candidate` 网页/代码实测 81.15/81.74 tok/s，算子与整模型一致性检查通过。此寄存器候选未达到 160 tok/s；上方快速配置是后续版本。见[测量与验证](docs/native-register-optimization-20261004.md)。
+
+> **2026-10-04 固定 MTP4 路由优化：** `--execution-profile mtp4-route-candidate` 启用精确并行路由规划并省略运行时未使用的计划诊断哈希。网页/代码实测 74.34/74.50 tok/s，8K 输入 47.70 tok/s，相对现有集成配置提升 2.6–3.3%。详见[验证、实测与启动命令](docs/native-route-optimization-20261004.md)。
+
+> **2026-09-21 原生 TP 优化方案：** 分阶段处理测量、常驻 rank worker、异步 P2P、多行 MoE/目标验证、TP Graph、精确投机状态与矩阵形状专项内核。详见[完整方案与实施状态](docs/native-tp-optimization-plan-20260921.md)。路线中的待实现能力不会因为选择 TP 而自动启用。
+
+> **2026-09-20 Z4 TP2 更新：** 双 CMP 170HX 已跑通独立的 eager TP2/EP HTTP/SSE 服务，修复了流同步、规约、多 token 切片和 rank 协调问题。原生服务固定 256 步实测 **32.43 tok/s**，尚未超过此前 PP 基线；PP 保持默认。详见[实现、验证和启动说明](docs/tp2-host-bounce-20260920.md)。
+
+> **P2P 与 PLE 双模式更新：** TP 入口新增 `--tp-transport host|p2p`；PP/TP 入口均支持 `--ple-storage ssd|ram`。RAM 模式完整预加载一份保持原始精度的 PLE，两个 TP rank 共享。详见[实测与运行命令](docs/p2p-ram-20260920.md)和[参考仓库复查](docs/reference-sm80-170hx-20260920.md)。
+
+> **2026-09-06 本地更新：** 新一批 prefill/decode 优化已实现，尚待真机验证。下方历史性能数据不代表当前源码。详见[实现清单与验证计划](docs/optimization-20260906.md)。
+
+
 一个为双 Ampere GPU 定制、完全独立的 **Qwen3.8-Flash-Next** 长上下文推理运行时。
 当前验证硬件为 2 × 64 GiB CMP 170HX（SM80）；不要求 CUDA P2P，即使每张卡只有
 PCIe 2.0 x4 也可以运行。
@@ -111,9 +145,9 @@ Prefill/Decode 联合表为准。
 
 #### 实验性 Piecewise CUDA Graph decode
 
-`--enable-piecewise-decode-graph` 只加速普通的单 token decode。每个 stage 会把固定形状的
-embedding/GDN/MoE/PLE-GPU/head 工作捕获为 7 段静态 graph，6 个依赖当前位置的
-exact-QSA 层仍在各段之间 eager 执行。PLE 读取与 H2D staging、跨卡传输、sampling、
+`--enable-piecewise-decode-graph` 支持普通单 token decode 和逐 token speculative target 验证。每个 stage 会把固定形状的
+层内工作捕获为 7 段静态 graph，6 个依赖当前位置的
+exact-QSA 层仍在各段之间 eager 执行。动态输入/输出端点、PLE 读取与 H2D staging、跨卡传输、sampling、
 cancel，以及 transaction commit/rollback 都不会进入 graph。
 
 CUDA graph node 会保留原始 state pointer，而 GDN/PLE transaction 会在两个 working bank
@@ -298,10 +332,15 @@ context target  262,144 tokens
 | GDN recurrent/accumulator state | FP32 | 避免长序列循环误差累积 |
 | Vision tensors | 跳过 | 当前 runtime 仅支持文本 |
 
-只有 PLE table 常驻 SSD。默认 host PLE cache 是 8 GiB，且有硬上限；完整 PLE 不会复制
-进内存或显存。读取路径是 `io_uring READ_FIXED + O_DIRECT → registered pinned host
+默认 `--ple-storage ssd` 将 PLE table 保留在 SSD。host PLE cache 每份 store 上限为 8 GiB
+（TP 每个 rank 一份）。读取路径是 `io_uring READ_FIXED + O_DIRECT → registered pinned host
 buffer → async H2D`，当前实现**没有使用 GPUDirect Storage**。各 stage 的权重与活跃模型
 状态常驻对应 GPU。
+
+`--ple-storage ram --ple-ram-budget-gib 64` 将完整 PLE payload 和 BF16 row scales 加载到
+自有主机内存，本 artifact 共约 48.28 GiB。两个 TP rank 共享只读表，各自维护事务状态。
+预算包含 payload 与 scales；预算或可用内存不足时明确报错，不静默切回 SSD。预加载完成后
+不再读取 PLE 源文件，也不分配 SSD 页缓存。整表不做 pinned/mlock，仍可能受操作系统 swap 影响。
 
 [tools/q38_quant_policy.py](tools/q38_quant_policy.py) 中的规则是量化策略唯一真源。策略
 digest、source commit、tensor hashes、stage cut、runtime hash 和 state layout 都属于
@@ -391,8 +430,9 @@ python3 tools/q38_hf_fetch.py \
 ```
 
 启动器会在执行 CUDA 前检查 source commit、quantization policy、全部 artifact segments、
-runtime identity、stage plan、state layout 与 context/sampling contracts。生产 PLE 必须成功
-建立 `io_uring + O_DIRECT` lane，不会静默回退到 buffered I/O。
+runtime identity、stage plan、state layout 与 context/sampling contracts。默认 SSD PLE 必须成功
+建立 `io_uring + O_DIRECT` lane，不会静默回退到 buffered I/O；显式 RAM 模式使用有预算限制的
+完整预加载，不要求该 I/O lane。
 
 Benchmark 或客户端能够重放完整 canonical token history 时，可以只关闭 crash recovery：
 

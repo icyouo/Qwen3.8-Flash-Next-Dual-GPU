@@ -4,6 +4,8 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdlib>
+#include <type_traits>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -78,12 +80,20 @@ __global__ void gdn_conv_decode_kernel(
     bf16_store(activated, channel, silu);
 }
 
+__device__ unsigned gdn_canonical_channel(unsigned local, unsigned rank) {
+    if (local < 1024) return rank * 1024 + local;
+    if (local < 2048) return 2048 + rank * 1024 + local - 1024;
+    return 4096 + rank * 3072 + local - 2048;
+}
+
+template <bool Snapshot>
 __global__ void gdn_conv_prefill_kernel(
     const std::uint16_t* projected, const std::uint16_t* weight,
-    std::uint16_t* state, std::uint16_t* activated, std::uint32_t tokens) {
-    const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x +
-                         threadIdx.x;
-    if (channel >= kQ38GdnQkvWidth) return;
+    std::uint16_t* state, std::uint16_t* activated, std::uint32_t tokens, CudaPrefixSnapshotView snapshots = {}, int local_rank = -1, bool full_projection = false, unsigned projection_stride = 0) {
+    const auto local_channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned width = local_rank < 0 ? kQ38GdnQkvWidth : kQ38GdnQkvWidth / 2;
+    if (local_channel >= width) return;
+    const auto channel = local_rank < 0 ? local_channel : gdn_canonical_channel(local_channel, local_rank);
     const auto state_base =
         static_cast<std::uint64_t>(channel) * kQ38GdnConvWidth;
     const auto weight_base = state_base;
@@ -96,8 +106,16 @@ __global__ void gdn_conv_prefill_kernel(
         }
         const auto token_offset =
             static_cast<std::uint64_t>(token) * kQ38GdnQkvWidth + channel;
-        const float newest = bf16_load(projected, token_offset);
+        const float newest = bf16_load(projected, static_cast<std::uint64_t>(token) * (projection_stride?projection_stride:(full_projection?kQ38GdnQkvWidth:width)) + (full_projection?channel:local_channel));
         bf16_store(state, state_base + kQ38GdnConvWidth - 1, newest);
+        if constexpr (Snapshot) {
+            if (token < snapshots.count) {
+                auto* target = reinterpret_cast<std::uint16_t*>(
+                    static_cast<std::uint8_t*>(snapshots.data) + token * snapshots.stride_bytes);
+                for (std::uint32_t i = 0; i < kQ38GdnConvWidth; ++i)
+                    target[state_base + i] = state[state_base + i];
+            }
+        }
         convolved += newest *
                      bf16_load(weight, weight_base + kQ38GdnConvWidth - 1);
         bf16_store(activated, token_offset,
@@ -108,8 +126,8 @@ __global__ void gdn_conv_prefill_kernel(
 __global__ void gdn_recurrent_decode_kernel(
     const std::uint16_t* qkv, const std::uint16_t* projected_b,
     const std::uint16_t* projected_a, const std::uint16_t* a_log,
-    const std::uint16_t* dt_bias, float* state, std::uint16_t* output) {
-    const auto value_head = blockIdx.x;
+    const std::uint16_t* dt_bias, float* state, std::uint16_t* output, unsigned head_begin = 0, unsigned heads = kQ38GdnValueHeads, unsigned control_heads = 0) {
+    const auto value_head = blockIdx.x + head_begin;
     const auto element = threadIdx.x;
     const auto key_head = value_head / (kQ38GdnValueHeads / kQ38GdnKeyHeads);
     const auto query_base = key_head * kQ38GdnHeadWidth;
@@ -128,8 +146,8 @@ __global__ void gdn_recurrent_decode_kernel(
         query_scale = rsqrtf(query_norm + 1.0e-6f) *
                       rsqrtf(static_cast<float>(kQ38GdnHeadWidth));
         key_scale = rsqrtf(key_norm + 1.0e-6f);
-        const float a = bf16_load(projected_a, value_head);
-        const float b = bf16_load(projected_b, value_head);
+        const float a = bf16_load(projected_a, control_heads==kQ38GdnValueHeads ? value_head : blockIdx.x);
+        const float b = bf16_load(projected_b, control_heads==kQ38GdnValueHeads ? value_head : blockIdx.x);
         const float shifted_a = a + bf16_load(dt_bias, value_head);
         const float softplus = shifted_a > 20.0f
                                    ? shifted_a
@@ -168,7 +186,7 @@ __global__ void gdn_recurrent_decode_kernel(
             bf16_load(qkv, query_base + key_element) * query_scale;
         core += updated * query_element;
     }
-    bf16_store(output, value_head * kQ38GdnHeadWidth + element, core);
+    bf16_store(output, blockIdx.x * kQ38GdnHeadWidth + element, core);
 }
 
 __global__ void gdn_recurrent_prefill_kernel(
@@ -405,12 +423,15 @@ __global__ void gdn_recurrent_prefill_partitioned_kernel(
     }
 }
 
+template <bool NormalizeQk = false>
 __global__ void gdn_prepare_prefill_parameters_kernel(
     const std::uint16_t* qkv, const std::uint16_t* projected_b,
     const std::uint16_t* projected_a, const std::uint16_t* a_log,
     const std::uint16_t* dt_bias, float* query_scales, float* key_scales,
-    float* decays, float* betas) {
-    const auto key_head = blockIdx.x;
+    float* decays, float* betas, unsigned head_begin = 0, unsigned heads = kQ38GdnValueHeads, unsigned control_heads = 0, unsigned projection_stride = 0,
+    float* prepared_queries = nullptr, float* prepared_keys = nullptr) {
+    const unsigned stride=projection_stride?projection_stride:(control_heads?control_heads:heads);
+    const auto key_head = blockIdx.x + head_begin / 3;
     const auto token = blockIdx.y;
     const auto element = threadIdx.x;
     const auto token_base =
@@ -424,6 +445,7 @@ __global__ void gdn_prepare_prefill_parameters_kernel(
     const auto warp = threadIdx.x >> 5;
     __shared__ float query_partials[4];
     __shared__ float key_partials[4];
+    __shared__ float normalized_scales[2];
     const float query_partial = warp_sum(query_raw * query_raw);
     const float key_partial = warp_sum(key_raw * key_raw);
     if (lane == 0) {
@@ -431,7 +453,7 @@ __global__ void gdn_prepare_prefill_parameters_kernel(
         key_partials[warp] = key_partial;
     }
     __syncthreads();
-    if (threadIdx.x != 0) return;
+    if (threadIdx.x == 0) {
 
     float query_norm = 0.0f;
     float key_norm = 0.0f;
@@ -455,8 +477,8 @@ __global__ void gdn_prepare_prefill_parameters_kernel(
         const auto value_index =
             static_cast<std::uint64_t>(token) * kQ38GdnValueHeads +
             value_head;
-        const float a = bf16_load(projected_a, value_index);
-        const float b = bf16_load(projected_b, value_index);
+        const float a = bf16_load(projected_a, static_cast<std::uint64_t>(token) * stride + value_head - (control_heads==kQ38GdnValueHeads?0:head_begin));
+        const float b = bf16_load(projected_b, static_cast<std::uint64_t>(token) * stride + value_head - (control_heads==kQ38GdnValueHeads?0:head_begin));
         const float shifted_a = a + bf16_load(dt_bias, value_head);
         const float softplus = shifted_a > 20.0f
                                    ? shifted_a
@@ -465,17 +487,96 @@ __global__ void gdn_prepare_prefill_parameters_kernel(
             expf(-expf(bf16_load(a_log, value_head)) * softplus);
         betas[value_index] = 1.0f / (1.0f + expf(-b));
     }
+    if constexpr (NormalizeQk) {
+        normalized_scales[0] = query_scales[key_scale_index];
+        normalized_scales[1] = key_scales[key_scale_index];
+    }
+    }
+    if constexpr (NormalizeQk) {
+        __syncthreads();
+        const auto index = (static_cast<std::uint64_t>(token) *
+                            kQ38GdnKeyHeads + key_head) * kQ38GdnHeadWidth + element;
+        prepared_queries[index] = query_raw * normalized_scales[0];
+        prepared_keys[index] = key_raw * normalized_scales[1];
+    }
 }
 
+
+// Small target slabs: one CTA owns Q/K and their three value heads. Keep
+// convolution BF16 boundaries and the original four-warp norm sum order.
+template<bool Snapshot>
+__global__ void gdn_conv_prepare_kernel(const std::uint16_t* projected,
+    const std::uint16_t* weight, std::uint16_t* state, std::uint16_t* activated,
+    const std::uint16_t* projected_b, const std::uint16_t* projected_a,
+    const std::uint16_t* a_log, const std::uint16_t* dt_bias,
+    float* query_scales, float* key_scales, float* decays, float* betas,
+    unsigned tokens, unsigned rank, unsigned projection_stride,
+    unsigned control_heads, unsigned control_stride, CudaPrefixSnapshotView snapshots) {
+    const unsigned plane = threadIdx.x / 128, element = threadIdx.x % 128;
+    const unsigned local_head = blockIdx.x;
+    const unsigned key_head = rank * 8 + local_head;
+    const unsigned local_channel = plane < 2 ? plane * 1024 + local_head * 128 + element
+        : 2048 + (local_head * 3 + plane - 2) * 128 + element;
+    const unsigned channel = gdn_canonical_channel(local_channel, rank);
+    const unsigned state_base = channel * kQ38GdnConvWidth;
+    __shared__ float qk[2][128], qp[4], kp[4];
+    for (unsigned token = 0; token < tokens; ++token) {
+        float convolved = 0.f;
+        for (unsigned i = 0; i + 1 < kQ38GdnConvWidth; ++i) {
+            const float shifted = bf16_load(state,state_base+i+1);
+            bf16_store(state,state_base+i,shifted);
+            convolved += shifted * bf16_load(weight,state_base+i);
+        }
+        const float newest = bf16_load(projected,token * projection_stride + local_channel);
+        bf16_store(state,state_base+kQ38GdnConvWidth-1,newest);
+        if constexpr(Snapshot) if(token<snapshots.count) {
+            auto* target=reinterpret_cast<std::uint16_t*>(static_cast<std::uint8_t*>(snapshots.data)+token*snapshots.stride_bytes);
+            for(unsigned i=0;i<kQ38GdnConvWidth;++i)target[state_base+i]=state[state_base+i];
+        }
+        convolved += newest * bf16_load(weight,state_base+kQ38GdnConvWidth-1);
+        const float value=__bfloat162float(__float2bfloat16_rn(convolved/(1.f+expf(-convolved))));
+        bf16_store(activated,std::uint64_t(token)*kQ38GdnQkvWidth+channel,value);
+        if(plane<2)qk[plane][element]=value;
+        __syncthreads();
+        if(plane==0){
+            const float q=warp_sum(qk[0][element]*qk[0][element]);
+            const float k=warp_sum(qk[1][element]*qk[1][element]);
+            if((element&31)==0){qp[element/32]=q;kp[element/32]=k;}
+        }
+        __syncthreads();
+        if(threadIdx.x==0){
+            float qn=0.f,kn=0.f;
+#pragma unroll
+            for(unsigned i=0;i<4;++i){qn+=qp[i];kn+=kp[i];}
+            query_scales[token*kQ38GdnKeyHeads+key_head]=rsqrtf(qn+1e-6f)*rsqrtf(float(kQ38GdnHeadWidth));
+            key_scales[token*kQ38GdnKeyHeads+key_head]=rsqrtf(kn+1e-6f);
+#pragma unroll
+            for(unsigned local=0;local<3;++local){
+                const unsigned h=key_head*3+local;
+                const unsigned c=token*control_stride+h-(control_heads==48?0:rank*24);
+                const float a=bf16_load(projected_a,c),b=bf16_load(projected_b,c);
+                const float shifted_a=a+bf16_load(dt_bias,h);
+                const float softplus=shifted_a>20.f?shifted_a:log1pf(expf(shifted_a));
+                decays[token*kQ38GdnValueHeads+h]=expf(-expf(bf16_load(a_log,h))*softplus);
+                betas[token*kQ38GdnValueHeads+h]=1.f/(1.f+expf(-b));
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <bool Snapshot, unsigned PartitionColumns = kGdnPartitionColumns,
+          bool NormalizeQk = false>
 __global__ void gdn_recurrent_prefill_precomputed_kernel(
     const std::uint16_t* qkv, const float* query_scales,
     const float* key_scales, const float* decays, const float* betas,
-    float* state, std::uint16_t* output, std::uint32_t tokens) {
-    const auto value_head = blockIdx.x;
+    float* state, std::uint16_t* output, std::uint32_t tokens, CudaPrefixSnapshotView snapshots = {}, unsigned head_begin = 0, unsigned heads = kQ38GdnValueHeads,
+    const float* prepared_queries = nullptr, const float* prepared_keys = nullptr) {
+    const auto value_head = blockIdx.x + head_begin;
     const auto partition = blockIdx.y;
-    const auto lane = threadIdx.x & 31;
-    const auto key_lane = threadIdx.x >> 5;
-    const auto output_element = partition * kGdnPartitionColumns + lane;
+    const auto lane = threadIdx.x % PartitionColumns;
+    const auto key_lane = threadIdx.x / PartitionColumns;
+    const auto output_element = partition * PartitionColumns + lane;
     const auto key_head =
         value_head / (kQ38GdnValueHeads / kQ38GdnKeyHeads);
     const auto query_local = key_head * kQ38GdnHeadWidth;
@@ -484,8 +585,8 @@ __global__ void gdn_recurrent_prefill_precomputed_kernel(
                              value_head * kQ38GdnHeadWidth;
     const auto state_base = static_cast<std::uint64_t>(value_head) *
                             kQ38GdnHeadWidth * kQ38GdnHeadWidth;
-    __shared__ float partial[kQ38GdnHeadWidth * kGdnPartitionColumns];
-    __shared__ float deltas[kGdnPartitionColumns];
+    __shared__ float partial[32 * PartitionColumns];
+    __shared__ float deltas[PartitionColumns];
 
     // One 1024-thread CTA owns a complete 128x32 state-column tile.  Each
     // thread is therefore responsible for exactly four key rows.  Keep those
@@ -522,18 +623,21 @@ __global__ void gdn_recurrent_prefill_precomputed_kernel(
             const auto key_element = key_lane + item * 32;
             const float decayed = resident_state[item] * decay;
             resident_state[item] = decayed;
-            normalized_keys[item] =
-                bf16_load(qkv, token_base + key_local + key_element) *
-                key_scale;
+            if constexpr (NormalizeQk)
+                normalized_keys[item] = prepared_keys[
+                    key_scale_index * kQ38GdnHeadWidth + key_element];
+            else
+                normalized_keys[item] =
+                    bf16_load(qkv, token_base + key_local + key_element) * key_scale;
             memory_partial += decayed * normalized_keys[item];
         }
-        partial[key_lane * kGdnPartitionColumns + lane] = memory_partial;
+        partial[key_lane * PartitionColumns + lane] = memory_partial;
         __syncthreads();
         if (key_lane == 0) {
             float memory = 0.0f;
 #pragma unroll
             for (std::uint32_t row = 0; row < 32; ++row)
-                memory += partial[row * kGdnPartitionColumns + lane];
+                memory += partial[row * PartitionColumns + lane];
             const float value =
                 bf16_load(qkv, token_base + value_local + output_element);
             deltas[lane] = (value - memory) * beta;
@@ -548,22 +652,30 @@ __global__ void gdn_recurrent_prefill_precomputed_kernel(
             const float updated =
                 resident_state[item] + normalized_keys[item] * delta;
             resident_state[item] = updated;
-            const float query =
-                bf16_load(qkv, token_base + query_local + key_element) *
-                query_scale;
+            if constexpr (Snapshot) {
+                if (token < snapshots.count) {
+                    auto* target = reinterpret_cast<float*>(
+                        static_cast<std::uint8_t*>(snapshots.data) + token * snapshots.stride_bytes);
+                    target[state_base + static_cast<std::uint64_t>(key_element) *
+                        kQ38GdnHeadWidth + output_element] = updated;
+                }
+            }
+            const float query = NormalizeQk
+                ? prepared_queries[key_scale_index * kQ38GdnHeadWidth + key_element]
+                : bf16_load(qkv, token_base + query_local + key_element) * query_scale;
             core_partial += updated * query;
         }
-        partial[key_lane * kGdnPartitionColumns + lane] = core_partial;
+        partial[key_lane * PartitionColumns + lane] = core_partial;
         __syncthreads();
         if (key_lane == 0) {
             float core = 0.0f;
 #pragma unroll
             for (std::uint32_t row = 0; row < 32; ++row)
-                core += partial[row * kGdnPartitionColumns + lane];
+                core += partial[row * PartitionColumns + lane];
             bf16_store(output,
                        static_cast<std::uint64_t>(token) *
-                               kQ38GdnValueWidth +
-                           value_head * kQ38GdnHeadWidth + output_element,
+                               heads * kQ38GdnHeadWidth +
+                           blockIdx.x * kQ38GdnHeadWidth + output_element,
                        core);
         }
         __syncthreads();
@@ -582,11 +694,11 @@ __global__ void gdn_recurrent_prefill_precomputed_kernel(
 
 __global__ void gdn_output_norm_kernel(
     const std::uint16_t* core, const std::uint16_t* gate,
-    const std::uint16_t* weight, std::uint16_t* output, float epsilon) {
+    const std::uint16_t* weight, std::uint16_t* output, float epsilon, unsigned heads = kQ38GdnValueHeads, unsigned gate_heads = 0, unsigned gate_begin = 0, unsigned projection_stride = 0) {
     const auto head = blockIdx.x;
     const auto token = blockIdx.y;
     const auto element = threadIdx.x;
-    const auto index = static_cast<std::uint64_t>(token) * kQ38GdnValueWidth +
+    const auto index = static_cast<std::uint64_t>(token) * heads * kQ38GdnHeadWidth +
                        head * kQ38GdnHeadWidth + element;
     const float value = bf16_load(core, index);
     float squares = block_sum_128(value * value);
@@ -594,7 +706,7 @@ __global__ void gdn_output_norm_kernel(
     if (threadIdx.x == 0)
         inverse_rms = rsqrtf(squares / kQ38GdnHeadWidth + epsilon);
     __syncthreads();
-    const float gate_value = bf16_load(gate, index);
+    const float gate_value = bf16_load(gate, static_cast<std::uint64_t>(token)*(projection_stride?projection_stride:(gate_heads?gate_heads:heads)*kQ38GdnHeadWidth) + (head+gate_begin)*kQ38GdnHeadWidth+element);
     const float sigmoid = 1.0f / (1.0f + expf(-gate_value));
     bf16_store(output, index,
                value * inverse_rms * bf16_load(weight, element) * sigmoid);
@@ -821,14 +933,21 @@ void cuda_gdn_output_norm_bf16(
 void cuda_gdn_conv_prefill_bf16(
     const std::uint16_t* projected_qkv, const std::uint16_t* conv_weight,
     std::uint16_t* conv_state, std::uint16_t* activated_qkv,
-    std::uint32_t tokens, void* stream, int device) {
+    std::uint32_t tokens, void* stream, int device, CudaPrefixSnapshotView snapshots) {
     if (!projected_qkv || !conv_weight || !conv_state || !activated_qkv ||
         !stream || tokens == 0)
         throw std::invalid_argument("invalid GDN prefill convolution buffers");
+    validate_prefix_snapshot(snapshots, tokens, std::uint64_t(kQ38GdnQkvWidth) * kQ38GdnConvWidth * 2, 2);
     select_device(device);
-    gdn_conv_prefill_kernel<<<(kQ38GdnQkvWidth + 255) / 256, 256, 0,
+    if (snapshots.data) {
+    gdn_conv_prefill_kernel<true><<<(kQ38GdnQkvWidth + 255) / 256, 256, 0,
+                               reinterpret_cast<cudaStream_t>(stream)>>>(
+        projected_qkv, conv_weight, conv_state, activated_qkv, tokens, snapshots);
+    } else {
+    gdn_conv_prefill_kernel<false><<<(kQ38GdnQkvWidth + 255) / 256, 256, 0,
                                reinterpret_cast<cudaStream_t>(stream)>>>(
         projected_qkv, conv_weight, conv_state, activated_qkv, tokens);
+    }
     check(cudaPeekAtLastError(), "GDN prefill convolution");
 }
 
@@ -889,12 +1008,13 @@ void cuda_gdn_recurrent_prefill_precomputed_bf16(
     std::uint16_t* core_output,
     std::uint32_t tokens,
     void* stream,
-    int device) {
+    int device, CudaPrefixSnapshotView snapshots) {
     if (!activated_qkv || !projected_b || !projected_a || !a_log ||
         !dt_bias || !recurrent_state || !parameter_scratch || !core_output ||
         !stream || tokens == 0)
         throw std::invalid_argument(
             "invalid precomputed GDN prefill recurrent buffers");
+    validate_prefix_snapshot(snapshots, tokens, std::uint64_t(kQ38GdnValueHeads) * kQ38GdnHeadWidth * kQ38GdnHeadWidth * 4, 4);
     select_device(device);
     auto* query_scales = parameter_scratch;
     auto* key_scales = query_scales +
@@ -908,10 +1028,17 @@ void cuda_gdn_recurrent_prefill_precomputed_bf16(
         dim3(kQ38GdnKeyHeads, tokens), kQ38GdnHeadWidth, 0, stream_value>>>(
         activated_qkv, projected_b, projected_a, a_log, dt_bias,
         query_scales, key_scales, decays, betas);
-    gdn_recurrent_prefill_precomputed_kernel<<<
+    if (snapshots.data) {
+    gdn_recurrent_prefill_precomputed_kernel<true><<<
+        dim3(kQ38GdnValueHeads, kGdnPrefillPartitions), 1024, 0,
+        stream_value>>>(activated_qkv, query_scales, key_scales, decays,
+                        betas, recurrent_state, core_output, tokens, snapshots);
+    } else {
+    gdn_recurrent_prefill_precomputed_kernel<false><<<
         dim3(kQ38GdnValueHeads, kGdnPrefillPartitions), 1024, 0,
         stream_value>>>(activated_qkv, query_scales, key_scales, decays,
                         betas, recurrent_state, core_output, tokens);
+    }
     check(cudaPeekAtLastError(), "precomputed GDN prefill recurrent");
 }
 
@@ -933,6 +1060,97 @@ void cuda_gdn_output_norm_prefill_bf16(
                              reinterpret_cast<cudaStream_t>(stream)>>>(
         core_output, gate_z, norm_weight, output, epsilon);
     check(cudaPeekAtLastError(), "GDN prefill output norm");
+}
+
+void cuda_gdn_head_local_bf16(
+    const std::uint16_t* projected_qkv, const std::uint16_t* projected_b,
+    const std::uint16_t* projected_a, const std::uint16_t* gate_z,
+    const std::uint16_t* conv_weight, const std::uint16_t* a_log,
+    const std::uint16_t* dt_bias, const std::uint16_t* norm_weight,
+    CudaGdnLayerStateView state, std::uint16_t* activated,
+    std::uint16_t* core, std::uint16_t* output, float* parameter_scratch,
+    unsigned tokens, unsigned rank, bool decode, void* stream, int device,
+    CudaPrefixSnapshotView conv_snapshots, CudaPrefixSnapshotView recurrent_snapshots, CudaGdnHeadLocalProjectionLayout layout,
+    float* normalized_qk) {
+    if (rank > 1 || !tokens || (decode && tokens != 1) || !stream ||
+        !projected_qkv || !projected_b || !projected_a || !gate_z || !conv_weight ||
+        !a_log || !dt_bias || !norm_weight || !state.conv || !state.recurrent ||
+        !activated || !core || !output || !parameter_scratch ||
+        layout.qkv_stride < (layout.full_qkv ? 10240u : 5120u) ||
+        (layout.control_heads != 24 && layout.control_heads != 48) ||
+        layout.control_stride < layout.control_heads ||
+        (layout.z_heads != 24 && layout.z_heads != 48) ||
+        layout.z_head_begin != (layout.z_heads == 48 ? rank * 24 : 0) ||
+        layout.z_stride < layout.z_heads * 128)
+        throw std::invalid_argument("invalid head-local GDN inputs");
+    validate_prefix_snapshot(conv_snapshots, tokens, std::uint64_t(kQ38GdnQkvWidth) * kQ38GdnConvWidth * 2, 2);
+    validate_prefix_snapshot(recurrent_snapshots, tokens, std::uint64_t(kQ38GdnValueHeads) * kQ38GdnHeadWidth * kQ38GdnHeadWidth * 4, 4);
+    select_device(device);
+    auto st = reinterpret_cast<cudaStream_t>(stream);
+    constexpr unsigned heads = 24;
+    const unsigned begin = rank * heads;
+    const auto* normalized_setting = std::getenv("Q38_CUDA_GDN_PREFILL_NORMALIZED_QK");
+    const bool normalize_qk = !decode && tokens >= 8 && normalized_setting &&
+        std::string(normalized_setting) == "1";
+    if (normalize_qk && !normalized_qk)
+        throw std::invalid_argument("normalized GDN prefill requires a separate FP32 Q/K buffer");
+    auto* prepared_queries = normalized_qk;
+    auto* prepared_keys = normalize_qk ? normalized_qk +
+        static_cast<std::size_t>(tokens) * kQ38GdnKeyHeads * kQ38GdnHeadWidth : nullptr;
+    auto* qs=parameter_scratch;
+    auto* ks=qs+tokens*kQ38GdnKeyHeads;
+    auto* decays=ks+tokens*kQ38GdnKeyHeads;
+    auto* betas=decays+tokens*kQ38GdnValueHeads;
+    const auto* setting=std::getenv("Q38_CUDA_GDN_CONV_PREPARE_FUSED");
+    const bool fused=!decode && tokens<=7 && !layout.full_qkv && setting && std::string(setting)=="1";
+    if(fused){
+        if(conv_snapshots.data)
+            gdn_conv_prepare_kernel<true><<<8,640,0,st>>>(projected_qkv,conv_weight,state.conv,activated,
+                projected_b,projected_a,a_log,dt_bias,qs,ks,decays,betas,tokens,rank,layout.qkv_stride,
+                layout.control_heads,layout.control_stride,conv_snapshots);
+        else
+            gdn_conv_prepare_kernel<false><<<8,640,0,st>>>(projected_qkv,conv_weight,state.conv,activated,
+                projected_b,projected_a,a_log,dt_bias,qs,ks,decays,betas,tokens,rank,layout.qkv_stride,
+                layout.control_heads,layout.control_stride,{});
+    } else {
+    if (conv_snapshots.data)
+        gdn_conv_prefill_kernel<true><<<20,256,0,st>>>(projected_qkv,conv_weight,state.conv,activated,tokens,conv_snapshots,rank,layout.full_qkv,layout.qkv_stride);
+    else
+        gdn_conv_prefill_kernel<false><<<20,256,0,st>>>(projected_qkv,conv_weight,state.conv,activated,tokens,{},rank,layout.full_qkv,layout.qkv_stride);
+    }
+    if (decode) {
+        gdn_recurrent_decode_kernel<<<heads,128,0,st>>>(activated,projected_b,projected_a,a_log,dt_bias,state.recurrent,core,begin,heads,layout.control_heads);
+    } else {
+        if (!fused) {
+            if (normalize_qk)
+                gdn_prepare_prefill_parameters_kernel<true><<<dim3(8,tokens),128,0,st>>>(activated,projected_b,projected_a,a_log,dt_bias,qs,ks,decays,betas,begin,heads,layout.control_heads,layout.control_stride,prepared_queries,prepared_keys);
+            else
+                gdn_prepare_prefill_parameters_kernel<false><<<dim3(8,tokens),128,0,st>>>(activated,projected_b,projected_a,a_log,dt_bias,qs,ks,decays,betas,begin,heads,layout.control_heads,layout.control_stride);
+        }
+        const auto* partition_setting=std::getenv("Q38_CUDA_GDN_PARTITION_COLUMNS");
+        const auto* prefill_partition_setting=std::getenv("Q38_CUDA_GDN_PREFILL_PARTITION_COLUMNS");
+        const unsigned columns=tokens>=8 && prefill_partition_setting
+            ? unsigned(std::atoi(prefill_partition_setting))
+            : tokens<=7 && partition_setting ? unsigned(std::atoi(partition_setting)) : 32u;
+        if(columns!=8 && columns!=16 && columns!=32) throw std::invalid_argument("GDN partition columns must be 8/16/32");
+        auto launch_variant=[&](auto tag, auto normalized_tag){
+            constexpr unsigned Cols=decltype(tag)::value;
+            constexpr bool Prepared=decltype(normalized_tag)::value;
+            if(recurrent_snapshots.data)
+                gdn_recurrent_prefill_precomputed_kernel<true,Cols,Prepared><<<dim3(heads,128/Cols),32*Cols,0,st>>>(activated,qs,ks,decays,betas,state.recurrent,core,tokens,recurrent_snapshots,begin,heads,prepared_queries,prepared_keys);
+            else
+                gdn_recurrent_prefill_precomputed_kernel<false,Cols,Prepared><<<dim3(heads,128/Cols),32*Cols,0,st>>>(activated,qs,ks,decays,betas,state.recurrent,core,tokens,{},begin,heads,prepared_queries,prepared_keys);
+        };
+        auto launch=[&](auto tag){
+            if (normalize_qk) launch_variant(tag, std::true_type{});
+            else launch_variant(tag, std::false_type{});
+        };
+        if(columns==8)launch(std::integral_constant<unsigned,8>{});
+        else if(columns==16)launch(std::integral_constant<unsigned,16>{});
+        else launch(std::integral_constant<unsigned,32>{});
+    }
+    gdn_output_norm_kernel<<<dim3(heads,tokens),128,0,st>>>(core,gate_z,norm_weight,output,1.0e-6f,heads,layout.z_heads,layout.z_head_begin,layout.z_stride);
+    check(cudaPeekAtLastError(),"head-local GDN");
 }
 
 bool cuda_q38_gdn_compiled() { return true; }

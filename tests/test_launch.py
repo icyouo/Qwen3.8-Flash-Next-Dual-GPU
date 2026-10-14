@@ -126,6 +126,15 @@ class LaunchManifestTest(unittest.TestCase):
                 8,
             )
             self.assertIn("--identity", command)
+            self.assertEqual(command[command.index("--ple-io")+1], "direct")
+            self.assertNotIn('--ple-ram-budget-gib', command)
+            ram_command = runtime_command(validated,Path('/bin/true'),Path('/tmp/q38-ram.sock'),None,
+                                          512,8,ple_storage='ram',ple_ram_budget_gib=80)
+            self.assertEqual(ram_command[ram_command.index('--ple-io')+1], 'ram')
+            self.assertEqual(ram_command[ram_command.index('--ple-ram-budget-gib')+1], '80')
+            with self.assertRaises(ValueError):
+                runtime_command(validated,Path('/bin/true'),Path('/tmp/q38-ram.sock'),None,
+                                512,8,ple_storage='ram',ple_ram_budget_gib=0)
             self.assertIn("99", command)
             self.assertIn("--sampling", command)
             self.assertIn("--snapshot-journal", command)
@@ -172,6 +181,16 @@ class LaunchManifestTest(unittest.TestCase):
                 8,
                 enable_logit_diagnostics=True,
             )
+            optimized = runtime_command(
+                validated, Path("/bin/true"), Path("/tmp/q38.sock"), None,
+                512, 8, enable_mtp=True, enable_adaptive_mtp=True,
+                enable_compact_sampling=True,
+            )
+            self.assertIn("--enable-adaptive-mtp", optimized)
+            self.assertIn("--enable-compact-sampling", optimized)
+            with self.assertRaisesRegex(ValueError, "requires --enable-mtp"):
+                runtime_command(validated, Path("/bin/true"), Path("/tmp/q38.sock"),
+                                None, 512, 8, enable_adaptive_mtp=True)
             self.assertIn("--enable-logit-diagnostics", diagnostics_command)
             self.assertNotIn("--enable-piecewise-decode-graph", diagnostics_command)
 

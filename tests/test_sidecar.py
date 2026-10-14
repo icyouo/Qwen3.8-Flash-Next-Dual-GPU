@@ -23,11 +23,13 @@ from q38_sidecar import (  # noqa: E402
     _tool_choice,
     _validate_output_tools,
 )
-from q38_control_plane import ControlPlaneError  # noqa: E402
+from q38_control_plane import CommittedTokenEvent, ControlPlaneError  # noqa: E402
 
 
 class FakeControl:
     model = "Qwen3.8-Flash-Next-Dual-GPU"
+    mtp_enabled = False
+    mtp_max_draft = 4
 
 
 class ModelsEndpointTest(unittest.TestCase):
@@ -76,6 +78,84 @@ class ModelsEndpointTest(unittest.TestCase):
         status, body = self.get("/v1/models", authorized=False)
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["code"], "unauthorized")  # type: ignore[index]
+
+
+class StreamingUsageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        class Control(FakeControl):
+            context_limit = 100
+
+            def active_session(self):
+                return {"id": "test"}
+
+            def complete_full_history(self, *args, **kwargs):
+                return iter([
+                    (CommittedTokenEvent((4, 5), 1, 5, 95), {}),
+                    (CommittedTokenEvent((6,), 2, 6, 94, "stop"), {}),
+                ])
+
+        class Codec:
+            def encode_chat(self, *args, **kwargs):
+                return [1, 2, 3]
+
+            def decode(self, tokens):
+                return "".join({4: "hello", 5: " ", 6: "world"}[t] for t in tokens)
+
+        app = SidecarApplication(Control(), codec=Codec(), api_key=None)
+        self.server = Q38HttpServer(("127.0.0.1", 0), app)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        self.url = f"http://{host}:{port}/v1/chat/completions"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def request(self, **extra):
+        body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 4, **extra}
+        request = urllib.request.Request(self.url, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return response.read().decode()
+
+    def test_stream_counts_token_ids_and_preserves_content(self):
+        for tools in (None, [{"type": "function", "function": {"name": "test"}}]):
+            with self.subTest(tools=tools):
+                extra = {"tools": tools} if tools else {}
+                raw = self.request(stream=True, stream_options={"include_usage": True}, **extra)
+                chunks = [json.loads(line[6:]) for line in raw.splitlines()
+                          if line.startswith("data: ") and line != "data: [DONE]"]
+                self.assertTrue(raw.endswith("data: [DONE]\n\n"))
+                self.assertEqual(chunks[-1]["choices"], [])
+                self.assertEqual(chunks[-1]["usage"], {"prompt_tokens": 3, "completion_tokens": 3, "total_tokens": 6})
+                content = "".join(choice["delta"].get("content", "") or ""
+                                  for chunk in chunks for choice in chunk["choices"])
+                self.assertEqual(content, "hello world")
+                self.assertEqual(json.loads(self.request(stream=False, **extra))["usage"], chunks[-1]["usage"])
+
+    def test_usage_is_opt_in_and_invalid_options_are_rejected(self):
+        for options in (None, {}, {"include_usage": False}):
+            self.assertNotIn('"usage"', self.request(stream=True, stream_options=options))
+        for options in (True, [], {"include_usage": 1}, {"include_usage": "true"}):
+            with self.subTest(options=options), self.assertRaises(urllib.error.HTTPError) as caught:
+                self.request(stream=True, stream_options=options)
+            self.assertEqual(caught.exception.code, 400)
+
+    def test_midstream_failure_is_an_sse_error_without_a_second_http_header(self):
+        def fail(*args, **kwargs):
+            yield CommittedTokenEvent((4,), 1, 4, 96), {}
+            raise ControlPlaneError(499, 'stream_cancelled', 'cancelled')
+        self.server.app.control.complete_full_history = fail
+        raw = self.request(stream=True, stream_options={'include_usage': True})
+        self.assertNotIn('HTTP/1.1', raw)
+        self.assertNotIn('"usage"', raw)
+        chunks = [json.loads(line[6:]) for line in raw.splitlines()
+                  if line.startswith('data: {')]
+        self.assertEqual(chunks[0]['choices'][0]['delta']['content'], 'hello')
+        self.assertEqual(chunks[-1]['error']['code'], 'stream_cancelled')
+        self.assertTrue(raw.endswith('data: [DONE]\n\n'))
 
 
 class ToolProtocolTest(unittest.TestCase):
@@ -172,6 +252,19 @@ class ToolProtocolTest(unittest.TestCase):
 
 
 class OutputTokenLimitTest(unittest.TestCase):
+    def test_mtp4_default_requires_enabled_executor(self):
+        control = FakeControl()
+        with self.assertRaises(ValueError):
+            SidecarApplication(control, codec=None, api_key=None,
+                               default_mode='mtp', default_mtp_width=4)
+        control.mtp_enabled = True
+        app = SidecarApplication(control, codec=None, api_key=None,
+                                 default_mode='mtp', default_mtp_width=4)
+        self.assertEqual((app.default_mode, app.default_mtp_width), ('mtp', 4))
+        with self.assertRaises(ValueError):
+            SidecarApplication(control, codec=None, api_key=None,
+                               default_mode='mtp', default_mtp_width=6)
+
     def resolve(self, body: dict[str, object], available: int = 10_000) -> int:
         return _resolve_output_tokens(
             body,

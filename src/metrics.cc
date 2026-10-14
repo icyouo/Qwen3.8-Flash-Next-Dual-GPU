@@ -88,6 +88,8 @@ void append_stage(std::ostringstream& output, const char* name,
            << ",\"boundary_transfers\":" << value.boundary_transfers
            << ",\"boundary_bytes\":" << value.boundary_bytes
            << ",\"boundary_waits\":" << value.boundary_waits
+           << ",\"ple_ram_enabled\":" << value.ple_ram_enabled
+           << ",\"ple_ram_resident_bytes\":" << value.ple_ram_resident_bytes
            << ",\"ple_cache_hits\":" << value.ple_cache_hits
            << ",\"ple_cache_misses\":" << value.ple_cache_misses
            << ",\"ple_cache_evictions\":" << value.ple_cache_evictions

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -120,24 +121,53 @@ def parse_segment_records(index: Path) -> list[tuple[Path, int, str]]:
     return result
 
 
-def verify_segments(indexes: Sequence[Path], verify_hashes: bool) -> dict[str, int]:
-    seen: set[Path] = set()
-    total_bytes = 0
+def verify_segments(indexes: Sequence[Path], verify_hashes: bool,
+                    workers: int = 1) -> dict[str, int]:
+    """Verify every unique inode, with bounded readers and fail-closed results."""
+    if not 1 <= workers <= 16:
+        raise ValueError("segment hash workers must be in 1..16")
+    seen = {}
+    records = []
+    def fingerprint(stat):
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
     for index in indexes:
         for path, expected_bytes, expected_sha in parse_segment_records(index):
-            if path in seen:
-                continue
-            seen.add(path)
-            if not path.is_file() or path.stat().st_size != expected_bytes:
+            stat = path.stat()
+            if not path.is_file() or stat.st_size != expected_bytes:
                 raise ValueError(f"artifact segment size differs: {path}")
-            if verify_hashes and sha256_file(path) != expected_sha:
-                raise ValueError(f"artifact segment digest differs: {path}")
-            total_bytes += expected_bytes
-    return {"segments": len(seen), "segment_bytes": total_bytes}
+            key = (stat.st_dev, stat.st_ino)
+            if key in seen:
+                if seen[key] != (expected_bytes, expected_sha):
+                    raise ValueError(f"conflicting hard-link segment digests: {path}")
+                continue
+            seen[key] = (expected_bytes, expected_sha)
+            records.append((path, expected_sha, fingerprint(stat)))
+    def verify(record):
+        path, expected_sha, initial = record
+        if fingerprint(path.stat()) != initial:
+            raise ValueError(f"artifact segment changed before verification: {path}")
+        actual = sha256_file(path)
+        if fingerprint(path.stat()) != initial:
+            raise ValueError(f"artifact segment changed during verification: {path}")
+        if actual != expected_sha:
+            raise ValueError(f"artifact segment digest differs: {path}")
+    if verify_hashes:
+        if workers == 1:
+            for record in records:
+                verify(record)
+        elif records:
+            executor = ThreadPoolExecutor(max_workers=min(workers, len(records)))
+            try:
+                futures = [executor.submit(verify, record) for record in records]
+                for future in futures:
+                    future.result()
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
+    return {"segments": len(records), "segment_bytes": sum(size for size, _ in seen.values())}
 
 
 def validate_ready(
-    ready_path: Path, *, verify_segment_hashes: bool = True
+    ready_path: Path, *, verify_segment_hashes: bool = True, segment_hash_workers: int = 1
 ) -> dict[str, object]:
     ready_path = ready_path.resolve()
     ready = json.loads(ready_path.read_text())
@@ -219,7 +249,7 @@ def validate_ready(
         if identity[field] != digest:
             raise ValueError(f"session identity input differs: {field}")
     segment_census = verify_segments(
-        [paths["stage0_index"], paths["stage1_index"]], verify_segment_hashes
+        [paths["stage0_index"], paths["stage1_index"]], verify_segment_hashes, segment_hash_workers
     )
     return {
         "ready": ready,
@@ -270,7 +300,13 @@ def runtime_command(
     enable_mtp: bool = False,
     enable_piecewise_decode_graph: bool = False,
     enable_logit_diagnostics: bool = False,
+    enable_adaptive_mtp: bool = False,
+    enable_compact_sampling: bool = False,
+    ple_storage: str = "ssd",
+    ple_ram_budget_gib: int = 64,
 ) -> list[str]:
+    if ple_storage not in ("ssd", "ram") or not 1 <= ple_ram_budget_gib <= (2**64-1) >> 30:
+        raise ValueError("invalid PLE storage or RAM budget")
     paths = validated["paths"]
     ready = validated["ready"]
     assert isinstance(paths, dict) and isinstance(ready, dict)
@@ -293,14 +329,22 @@ def runtime_command(
         "--ple-cache-gib",
         str(ple_cache_gib),
         "--ple-io",
-        "direct",
+        "ram" if ple_storage == "ram" else "direct",
         "--ple-queue-depth",
         "64",
         "--socket",
         str(socket_path.resolve()),
     ]
+    if ple_storage == "ram":
+        command.extend(["--ple-ram-budget-gib", str(ple_ram_budget_gib)])
     if snapshot is not None:
         command.extend(["--snapshot-journal", str(snapshot.resolve())])
+    if enable_compact_sampling:
+        command.append("--enable-compact-sampling")
+    if enable_adaptive_mtp and not enable_mtp:
+        raise ValueError("adaptive MTP requires --enable-mtp")
+    if enable_adaptive_mtp:
+        command.append("--enable-adaptive-mtp")
     if enable_mtp:
         command.append("--enable-mtp")
     if enable_piecewise_decode_graph:
@@ -359,11 +403,14 @@ def main() -> int:
     )
     parser.add_argument("--chunk", type=int, default=512)
     parser.add_argument("--ple-cache-gib", type=int, default=8)
+    parser.add_argument("--ple-storage", choices=("ssd", "ram"), default="ssd")
+    parser.add_argument("--ple-ram-budget-gib", type=int, default=64)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--tokenizer", type=Path)
     parser.add_argument("--api-key")
     parser.add_argument("--skip-segment-hashes", action="store_true")
+    parser.add_argument("--segment-hash-workers", type=int, choices=range(1, 17), default=1)
     parser.add_argument("--executor-only", action="store_true")
     parser.add_argument("--enable-mtp", action="store_true")
     parser.add_argument(
@@ -373,12 +420,15 @@ def main() -> int:
         help="maximum sidecar MTP draft width (1..64)",
     )
     parser.add_argument("--enable-piecewise-decode-graph", action="store_true")
+    parser.add_argument("--enable-adaptive-mtp", action="store_true")
+    parser.add_argument("--enable-compact-sampling", action="store_true")
     parser.add_argument("--enable-logit-diagnostics", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args()
     if (
         arguments.chunk <= 0
         or arguments.ple_cache_gib <= 0
+        or not 1 <= arguments.ple_ram_budget_gib <= (2**64-1) >> 30
         or not 1 <= arguments.mtp_max_draft <= 64
     ):
         parser.error("chunk/cache must be positive and MTP maximum must be in 1..64")
@@ -387,7 +437,8 @@ def main() -> int:
     if arguments.skip_segment_hashes and not arguments.dry_run:
         parser.error("production launch cannot skip artifact segment hashes")
     validated = validate_ready(
-        arguments.ready, verify_segment_hashes=not arguments.skip_segment_hashes
+        arguments.ready, verify_segment_hashes=not arguments.skip_segment_hashes,
+        segment_hash_workers=arguments.segment_hash_workers
     )
     command = runtime_command(
         validated,
@@ -399,6 +450,10 @@ def main() -> int:
         arguments.enable_mtp,
         arguments.enable_piecewise_decode_graph,
         arguments.enable_logit_diagnostics,
+        arguments.enable_adaptive_mtp,
+        arguments.enable_compact_sampling,
+        arguments.ple_storage,
+        arguments.ple_ram_budget_gib,
     )
     sidecar = [
         sys.executable,
@@ -437,6 +492,8 @@ def main() -> int:
         "artifact_bytes": validated["segment_bytes"],
         "segment_hashes_verified": not arguments.skip_segment_hashes,
         "mtp_enabled": arguments.enable_mtp,
+        "adaptive_mtp_enabled": arguments.enable_adaptive_mtp,
+        "compact_sampling_enabled": arguments.enable_compact_sampling,
         "mtp_max_draft": arguments.mtp_max_draft if arguments.enable_mtp else 0,
         "piecewise_decode_graph_enabled": arguments.enable_piecewise_decode_graph,
         "logit_diagnostics_enabled": arguments.enable_logit_diagnostics,
@@ -457,7 +514,8 @@ def main() -> int:
     frontend: subprocess.Popen | None = None
     try:
         executor = subprocess.Popen(command)
-        wait_for_executor(arguments.socket.resolve(), validated["session_hash"], executor)
+        wait_for_executor(arguments.socket.resolve(), validated["session_hash"], executor,
+                          timeout=900 if arguments.ple_storage == "ram" else 120)
         if arguments.executor_only:
             return executor.wait()
         frontend = subprocess.Popen(sidecar)

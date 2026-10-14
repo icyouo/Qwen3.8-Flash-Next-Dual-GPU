@@ -260,7 +260,11 @@ void SnapshotJournal::append(StateSnapshotV1 snapshot) {
     if (!suffix.empty())
         write_all(impl_->descriptor, suffix.data(),
                   suffix.size() * sizeof(std::int32_t));
+#ifdef __APPLE__
+    if (::fsync(impl_->descriptor) != 0)
+#else
     if (::fdatasync(impl_->descriptor) != 0)
+#endif
         throw std::system_error(errno, std::generic_category(),
                                 "sync snapshot journal");
     snapshot.header.token_start = 0;

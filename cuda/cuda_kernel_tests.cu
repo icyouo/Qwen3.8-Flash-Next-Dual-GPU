@@ -1,4 +1,6 @@
 #include "q38/cuda_kernels.h"
+#include "q38/cuda_padded_gemm.h"
+#include "q38/cuda_sampling.h"
 #include "q38/cuda_moe.h"
 #include "q38/cuda_moe_prefill.h"
 #include "q38/cuda_transport.h"
@@ -13,9 +15,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -55,6 +62,469 @@ T* allocate(std::size_t count, bool zero = false) {
         check(cudaMemset(result, 0, count * sizeof(T)),
               "cudaMemset(test buffer)");
     return result;
+}
+
+void require_device_bits(const std::uint16_t* actual,
+                         const std::uint16_t* expected, std::size_t words,
+                         cudaStream_t stream, const char* label,
+                         std::size_t guard_words = 0) {
+    std::vector<std::uint16_t> a(words + guard_words), b(words);
+    check(cudaMemcpyAsync(a.data(), actual, a.size() * 2,
+                          cudaMemcpyDeviceToHost, stream), label);
+    check(cudaMemcpyAsync(b.data(), expected, b.size() * 2,
+                          cudaMemcpyDeviceToHost, stream), label);
+    check(cudaStreamSynchronize(stream), label);
+    if (!std::equal(b.begin(), b.end(), a.begin()) ||
+        !std::all_of(a.begin() + words, a.end(), [](auto v) { return v == 0x1234; }))
+        throw std::runtime_error(std::string(label) + " bitwise/guard mismatch");
+}
+
+void test_padded_small_gemm(cudaStream_t stream) {
+    cublasHandle_t handle = nullptr;
+    if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error("create small GEMM test handle");
+    for (const unsigned columns : {128u, 320u, 640u, 2560u}) {
+        const unsigned rows = columns == 320 ? 17 : 64;
+        std::vector<std::uint16_t> weights(rows * columns);
+        for (unsigned i = 0; i < weights.size(); ++i)
+            weights[i] = bf16(float(int(i % 11) - 5) * .125f);
+        auto* dw = upload(weights);
+        auto* scratch = allocate<std::uint16_t>(8 * (columns + rows));
+        for (const unsigned batch : {2u, 3u, 5u, 7u}) {
+            std::vector<std::uint16_t> input(batch * columns);
+            for (unsigned i = 0; i < input.size(); ++i)
+                input[i] = bf16(float(int(i % 7) - 3) * .125f);
+            auto* dx = upload(input);
+            auto* dy = upload(std::vector<std::uint16_t>(batch * rows + 16, 0x1234));
+            check(cudaStreamSynchronize(nullptr), "small GEMM fixture upload ready");
+            check(cudaMemsetAsync(scratch, 0xff, 8 * (columns + rows) * 2, stream), "poison GEMM scratch");
+            q38::cuda_padded_gemm_bf16(handle, dw, dx, dy + 8, scratch,
+                scratch + 8 * columns, rows, columns, batch, stream);
+            std::vector<std::uint16_t> actual(batch * rows + 16);
+            check(cudaMemcpyAsync(actual.data(), dy, actual.size() * 2,
+                cudaMemcpyDeviceToHost, stream), "copy small GEMM fixture");
+            check(cudaStreamSynchronize(stream), "small GEMM fixture ready");
+            for (unsigned t = 0; t < batch; ++t)
+                for (unsigned row = 0; row < rows; ++row) {
+                    float expected = 0;
+                    for (unsigned k = 0; k < columns; ++k)
+                        expected += fp32(input[t * columns + k]) * fp32(weights[row * columns + k]);
+                    if (actual[8 + t * rows + row] != bf16(expected))
+                        throw std::runtime_error("padded small GEMM differs from CPU matrix product");
+                }
+            for (unsigned guard = 0; guard < 8; ++guard)
+                if (actual[guard] != 0x1234 || actual[8 + batch * rows + guard] != 0x1234)
+                    throw std::runtime_error("padded small GEMM overwrote output guard");
+            (void)cudaFree(dx); (void)cudaFree(dy);
+        }
+        (void)cudaFree(dw); (void)cudaFree(scratch);
+    }
+    (void)cublasDestroy(handle);
+}
+
+void test_paired_norm(cudaStream_t stream) {
+    for (const auto tokens : {1u, 3u, 32u, 512u}) {
+        const auto words = static_cast<std::size_t>(tokens) * q38::kQ38HyperWidth;
+        std::vector<std::uint16_t> weights0(q38::kQ38HyperWidth), weights1(weights0.size());
+        for (std::size_t i = 0; i < weights0.size(); ++i) {
+            weights0[i] = bf16((static_cast<int>(i % 13) - 6) * 0.125f);
+            weights1[i] = bf16((static_cast<int>(i % 17) - 8) * 0.125f);
+        }
+        auto* w0 = upload(weights0);
+        auto* w1 = upload(weights1);
+        auto* x0 = allocate<std::uint16_t>(words);
+        auto* x1 = allocate<std::uint16_t>(words);
+        auto* y0 = upload(std::vector<std::uint16_t>(words + 8, 0x1234));
+        auto* y1 = upload(std::vector<std::uint16_t>(words + 8, 0x1234));
+        auto* r0 = allocate<std::uint16_t>(words);
+        auto* r1 = allocate<std::uint16_t>(words);
+        const q38::CudaHyperNormV1 first{x0, w0, y0}, second{x1, w1, y1};
+        bool rejected = false;
+        try { q38::cuda_hyper_pair_group_rmsnorm_bf16(
+            first, {x1, w1, y0 + 1}, tokens, stream, 0); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("paired norm accepted alias");
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "norm capture begin");
+        q38::cuda_hyper_pair_group_rmsnorm_bf16(first, second, tokens, stream, 0);
+        check(cudaStreamEndCapture(stream, &graph), "norm capture end");
+        check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "norm instantiate");
+        for (int pattern = 0; pattern < 4; ++pattern) {
+            std::vector<std::uint16_t> a(words), b(words);
+            for (std::size_t i = 0; i < words; ++i) {
+                a[i] = pattern == 0 ? bf16((static_cast<int>(i % 193) - 96) / 97.0f)
+                    : pattern == 1 ? bf16(std::ldexp((i & 1) ? -1.0f : 1.0f,
+                                                    static_cast<int>(i % 41) - 20))
+                    : static_cast<std::uint16_t>((i & 1 ? 0x8000 : 0) | (pattern == 3 ? 1 : 0));
+            }
+            std::reverse_copy(a.begin(), a.end(), b.begin());
+            check(cudaMemcpyAsync(x0, a.data(), words * 2, cudaMemcpyHostToDevice, stream), "norm input0");
+            check(cudaMemcpyAsync(x1, b.data(), words * 2, cudaMemcpyHostToDevice, stream), "norm input1");
+            q38::cuda_hyper_group_rmsnorm_bf16(x0, w0, r0, tokens, stream, 0);
+            q38::cuda_hyper_group_rmsnorm_bf16(x1, w1, r1, tokens, stream, 0);
+            if (pattern & 1) check(cudaGraphLaunch(executable, stream), "norm replay");
+            else q38::cuda_hyper_pair_group_rmsnorm_bf16(first, second, tokens, stream, 0);
+            require_device_bits(y0, r0, words, stream, "paired key norm", 8);
+            require_device_bits(y1, r1, words, stream, "paired query norm", 8);
+        }
+        check(cudaGraphExecDestroy(executable), "norm exec destroy");
+        check(cudaGraphDestroy(graph), "norm graph destroy");
+        for (auto* ptr : {w0, w1, x0, x1, y0, y1, r0, r1}) check(cudaFree(ptr), "norm free");
+    }
+}
+
+void test_ple_residual(cudaStream_t stream) {
+    constexpr std::size_t state_words = q38::kQ38HyperWidth * q38::kQ38PleConvState;
+    for (const auto tokens : {1u, 3u, 32u, 512u}) {
+        const auto words = static_cast<std::size_t>(tokens) * q38::kQ38HyperWidth;
+        std::vector<std::uint16_t> weights(q38::kQ38HyperWidth * 4), state(state_words);
+        for (std::size_t i = 0; i < weights.size(); ++i)
+            weights[i] = bf16((static_cast<int>(i % 19) - 9) * 0.015625f);
+        for (std::size_t i = 0; i < state.size(); ++i)
+            state[i] = bf16((static_cast<int>(i % 23) - 11) * 0.03125f);
+        auto* w = upload(weights);
+        auto* ref_state = upload(state);
+        auto* fused_state = upload(state);
+        auto* gated = allocate<std::uint16_t>(words);
+        auto* normalized = allocate<std::uint16_t>(words);
+        auto* residual = upload(std::vector<std::uint16_t>(words + 8, 0x1234));
+        auto* output = upload(std::vector<std::uint16_t>(words + 8, 0x1234));
+        auto* temporary = allocate<std::uint16_t>(words);
+        auto* expected = allocate<std::uint16_t>(words);
+        bool rejected = false;
+        try { q38::cuda_ple_conv_residual_bf16(gated, normalized, w, fused_state,
+                residual, residual + 1, tokens, stream, 0); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("PLE residual accepted partial alias");
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "residual capture begin");
+        q38::cuda_ple_conv_residual_bf16(gated, normalized, w, fused_state,
+                                       residual, output, tokens, stream, 0);
+        check(cudaStreamEndCapture(stream, &graph), "residual capture end");
+        check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "residual instantiate");
+        for (int step = 0; step < 4; ++step) {
+            std::vector<std::uint16_t> g(words), n(words), r(words);
+            for (std::size_t i = 0; i < words; ++i) {
+                g[i] = bf16((static_cast<int>((i + step * 7) % 137) - 68) * 0.015625f);
+                n[i] = bf16((static_cast<int>((i + step * 11) % 97) - 48) * 0.03125f);
+                r[i] = bf16(-fp32(g[i]) + (static_cast<int>(i % 5) - 2) * 0.00390625f);
+            }
+            check(cudaMemcpyAsync(gated, g.data(), words * 2, cudaMemcpyHostToDevice, stream), "residual gated");
+            check(cudaMemcpyAsync(normalized, n.data(), words * 2, cudaMemcpyHostToDevice, stream), "residual normalized");
+            check(cudaMemcpyAsync(residual, r.data(), words * 2, cudaMemcpyHostToDevice, stream), "residual input");
+            // Exercise both original entry points for a one-token prefill
+            // tail, since the fused dispatcher uses the decode kernel there.
+            if (tokens == 1 && (step & 1) == 0)
+                q38::cuda_ple_conv_decode_bf16(gated, normalized, w, ref_state, temporary, stream, 0);
+            else
+                q38::cuda_ple_conv_prefill_bf16(gated, normalized, w, ref_state, temporary, tokens, stream, 0);
+            q38::cuda_add_bf16(residual, temporary, expected, words, stream, 0);
+            if (step == 1) check(cudaGraphLaunch(executable, stream), "residual replay");
+            else q38::cuda_ple_conv_residual_bf16(gated, normalized, w, fused_state,
+                      residual, step == 3 ? residual : output, tokens, stream, 0);
+            require_device_bits(step == 3 ? residual : output, expected, words,
+                                stream, "PLE residual output", 8);
+            require_device_bits(fused_state, ref_state, state_words, stream, "PLE residual state");
+        }
+        check(cudaGraphExecDestroy(executable), "residual exec destroy");
+        check(cudaGraphDestroy(graph), "residual graph destroy");
+        for (auto* ptr : {w, ref_state, fused_state, gated, normalized, residual, output, temporary, expected})
+            check(cudaFree(ptr), "residual free");
+    }
+}
+
+void test_hc_gemv(cudaStream_t stream) {
+    // Production HC shapes, inject rows, and odd-row tails. Each fixture is
+    // compared with the existing GPU kernel, not a reimplemented CPU oracle.
+    const std::pair<std::uint32_t, std::uint32_t> shapes[] = {
+        {1, 320}, {17, 320}, {10240, 320},
+        {4, 10240}, {17, 10240}, {320, 10240}};
+    std::uint32_t random = 0x89abcdefu;
+    auto next = [&] {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        return random;
+    };
+    for (const auto& shape : shapes) {
+        const auto rows = shape.first, columns = shape.second;
+        std::vector<std::uint16_t> weights(
+            static_cast<std::size_t>(rows) * columns);
+        for (auto& w : weights) {
+            const auto bits = next();
+            w = bf16(std::ldexp((static_cast<int>(bits % 511) - 255) / 256.0f,
+                                static_cast<int>((bits >> 16) % 31) - 15));
+        }
+        auto* w = upload(weights);
+        auto* x = allocate<std::uint16_t>(columns);
+        auto* y = upload(std::vector<std::uint16_t>(rows + 8, 0x1234));
+        auto* reference = allocate<std::uint16_t>(rows);
+        q38::CudaMatrixViewV1 matrix{
+            q38::DeviceWeightFormatV1::kPreserve, w, nullptr,
+            rows, columns, 0, false};
+        // Unsupported layouts must not enter the specialized path.
+        auto unsupported = matrix;
+        unsupported.preserved_f32 = true;
+        if (q38::cuda_try_hc_gemv_bf16(unsupported, x, y, stream, 0))
+            throw std::runtime_error("HC kernel accepted FP32 weights");
+        unsupported = matrix;
+        unsupported.columns = 319;
+        if (q38::cuda_try_hc_gemv_bf16(unsupported, x, y, stream, 0))
+            throw std::runtime_error("HC kernel accepted unsupported columns");
+        for (int mode = 0; mode < 4; ++mode) {
+            const auto activation = mode == 0 ? q38::CudaHcActivation::kNone
+                : mode == 1 ? q38::CudaHcActivation::kSilu
+                            : q38::CudaHcActivation::kSigmoid;
+            const float divisor = (mode == 1 || mode == 3) ? 4.0f : 1.0f;
+            const float scale = mode == 3 ? 2.0f : 1.0f;
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t executable = nullptr;
+            check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+                  "HC capture begin");
+            if (!q38::cuda_try_hc_gemv_bf16(matrix, x, y, stream, 0, activation, divisor, scale))
+                throw std::runtime_error("HC kernel rejected supported shape");
+            check(cudaStreamEndCapture(stream, &graph), "HC capture end");
+            check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+                  "HC graph instantiate");
+            for (int pattern = 0; pattern < 4; ++pattern) {
+                std::vector<std::uint16_t> input(columns);
+                for (std::uint32_t col = 0; col < columns; ++col) {
+                    const auto bits = next();
+                    input[col] = pattern == 0 ? bf16((static_cast<int>(bits % 997) - 498) / 499.0f)
+                        : pattern == 1 ? bf16(std::ldexp((col & 1) ? -1.0f : 1.0f,
+                                               static_cast<int>(col % 41) - 20))
+                        : pattern == 2 ? static_cast<std::uint16_t>((col & 1) ? 0x8000 : 0)
+                        : static_cast<std::uint16_t>((col & 1) ? 0x8001 : 1);
+                }
+                check(cudaMemcpyAsync(x, input.data(), columns * sizeof(*x),
+                    cudaMemcpyHostToDevice, stream), "HC input");
+                q38::cuda_gemv_bf16(matrix, x, reference, 1, stream, 0);
+                if (mode == 1)
+                    q38::cuda_hyper_silu_scaled_bf16(reference, reference, 1,
+                        rows, divisor, stream, 0);
+                else if (mode != 0)
+                    q38::cuda_hyper_sigmoid_bf16(reference, reference, 1,
+                        rows, divisor, scale, stream, 0);
+                for (int replay = 0; replay < 2; ++replay) {
+                    if (replay) check(cudaGraphLaunch(executable, stream), "HC replay");
+                    else (void)q38::cuda_try_hc_gemv_bf16(matrix, x, y, stream, 0, activation, divisor, scale);
+                    std::vector<std::uint16_t> actual(rows + 8), expected(rows);
+                    check(cudaMemcpyAsync(actual.data(), y, actual.size() * sizeof(*y),
+                        cudaMemcpyDeviceToHost, stream), "HC result");
+                    check(cudaMemcpyAsync(expected.data(), reference,
+                        expected.size() * sizeof(*reference), cudaMemcpyDeviceToHost,
+                        stream), "HC reference");
+                    check(cudaStreamSynchronize(stream), "HC sync");
+                    if (!std::equal(expected.begin(), expected.end(), actual.begin()))
+                        throw std::runtime_error("HC GEMV is not bitwise equal to reference");
+                    if (!std::all_of(actual.begin() + rows, actual.end(),
+                                     [](auto value) { return value == 0x1234; }))
+                        throw std::runtime_error("HC GEMV overwrote tail guard");
+                }
+            }
+            check(cudaGraphExecDestroy(executable), "HC graph exec destroy");
+            check(cudaGraphDestroy(graph), "HC graph destroy");
+        }
+        for (void* ptr : {static_cast<void*>(w), static_cast<void*>(x),
+                         static_cast<void*>(y), static_cast<void*>(reference)})
+            check(cudaFree(ptr), "HC test free");
+    }
+}
+
+void test_hc_grouped(cudaStream_t stream) {
+    for (const auto columns : {320u, 10240u}) {
+        for (const auto rows : {1u, 319u, 320u}) {
+            const auto inject_rows = rows == 320 ? 4u : 3u;
+            std::vector<std::uint16_t> weights(
+                static_cast<std::size_t>(rows + inject_rows) * columns);
+            for (std::size_t j = 0; j < weights.size(); ++j)
+                weights[j] = bf16(std::ldexp(
+                    (static_cast<int>((j * 73u + 29u) % 509u) - 254) / 255.0f,
+                    static_cast<int>(j % 17) - 8));
+            auto* w = upload(weights);
+            auto* x = allocate<std::uint16_t>(columns);
+            auto* y = upload(std::vector<std::uint16_t>(rows + 8, 0x1234));
+            auto* z = upload(std::vector<std::uint16_t>(inject_rows + 8, 0x1234));
+            auto* ref_y = allocate<std::uint16_t>(rows);
+            auto* ref_z = allocate<std::uint16_t>(inject_rows);
+            q38::CudaHcProjectionV1 down{
+                {q38::DeviceWeightFormatV1::kPreserve, w, nullptr,
+                 rows, columns, 0, false}, y, q38::CudaHcActivation::kSilu, 4, 1};
+            q38::CudaHcProjectionV1 inject{
+                {q38::DeviceWeightFormatV1::kPreserve,
+                 w + static_cast<std::size_t>(rows) * columns, nullptr,
+                 inject_rows, columns, 0, false}, z,
+                q38::CudaHcActivation::kSigmoid, 4, 2};
+            auto invalid = inject;
+            invalid.matrix.preserved_f32 = true;
+            if (q38::cuda_try_hc_grouped_bf16(down, invalid, x, stream, 0))
+                throw std::runtime_error("grouped HC accepted unsupported second matrix");
+            invalid = inject;
+            invalid.output = y + rows - 1;
+            bool rejected = false;
+            try { (void)q38::cuda_try_hc_grouped_bf16(down, invalid, x, stream, 0); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            if (!rejected) throw std::runtime_error("grouped HC accepted overlapping outputs");
+            std::vector<std::uint16_t> untouched(rows + 8);
+            check(cudaMemcpy(untouched.data(), y, untouched.size() * 2,
+                             cudaMemcpyDeviceToHost), "HC unsupported output");
+            if (!std::all_of(untouched.begin(), untouched.end(),
+                             [](auto v) { return v == 0x1234; }))
+                throw std::runtime_error("grouped HC enqueued partial work on rejection");
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t executable = nullptr;
+            check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+                  "grouped HC capture begin");
+            if (!q38::cuda_try_hc_grouped_bf16(down, inject, x, stream, 0))
+                throw std::runtime_error("grouped HC rejected supported matrices");
+            check(cudaStreamEndCapture(stream, &graph), "grouped HC capture end");
+            check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+                  "grouped HC graph instantiate");
+            for (int pattern = 0; pattern < 4; ++pattern) {
+                std::vector<std::uint16_t> input(columns);
+                for (std::uint32_t j = 0; j < columns; ++j)
+                    input[j] = pattern == 0 ? bf16((static_cast<int>(j % 97) - 48) / 49.0f)
+                        : pattern == 1 ? bf16(std::ldexp((j & 1) ? -1.0f : 1.0f,
+                                                        static_cast<int>(j % 41) - 20))
+                        : pattern == 2 ? static_cast<std::uint16_t>((j & 1) ? 0x8000 : 0)
+                        : static_cast<std::uint16_t>((j & 1) ? 0x8001 : 1);
+                check(cudaMemcpyAsync(x, input.data(), columns * 2,
+                    cudaMemcpyHostToDevice, stream), "grouped HC input");
+                q38::cuda_gemv_bf16(down.matrix, x, ref_y, 1, stream, 0);
+                q38::cuda_hyper_silu_scaled_bf16(ref_y, ref_y, 1, rows, 4, stream, 0);
+                q38::cuda_gemv_bf16(inject.matrix, x, ref_z, 1, stream, 0);
+                q38::cuda_hyper_sigmoid_bf16(ref_z, ref_z, 1, inject_rows, 4, 2, stream, 0);
+                for (int replay = 0; replay < 2; ++replay) {
+                    if (replay) check(cudaGraphLaunch(executable, stream), "grouped HC replay");
+                    else (void)q38::cuda_try_hc_grouped_bf16(down, inject, x, stream, 0);
+                    for (int which = 0; which < 2; ++which) {
+                        const auto count = which ? inject_rows : rows;
+                        std::vector<std::uint16_t> actual(count + 8), expected(count);
+                        check(cudaMemcpyAsync(actual.data(), which ? z : y,
+                            actual.size() * 2, cudaMemcpyDeviceToHost, stream), "grouped HC result");
+                        check(cudaMemcpyAsync(expected.data(), which ? ref_z : ref_y,
+                            expected.size() * 2, cudaMemcpyDeviceToHost, stream), "grouped HC reference");
+                        check(cudaStreamSynchronize(stream), "grouped HC sync");
+                        if (!std::equal(expected.begin(), expected.end(), actual.begin()) ||
+                            !std::all_of(actual.begin() + count, actual.end(),
+                                         [](auto v) { return v == 0x1234; }))
+                            throw std::runtime_error("grouped HC parity/tail failure");
+                    }
+                }
+            }
+            check(cudaGraphExecDestroy(executable), "grouped HC exec destroy");
+            check(cudaGraphDestroy(graph), "grouped HC graph destroy");
+            for (auto* ptr : {w, x, y, z, ref_y, ref_z})
+                check(cudaFree(ptr), "grouped HC free");
+        }
+    }
+}
+
+void test_multi_projection(cudaStream_t stream,
+                           std::uint32_t columns = 256,
+                           std::uint32_t rows = 13) {
+    std::vector<std::uint16_t> input(columns), scales(rows * (columns / 128));
+    std::vector<std::int8_t> w8(rows * columns);
+    std::vector<std::uint8_t> w4(rows * columns / 2);
+    std::vector<std::uint16_t> preserved(rows * columns);
+    std::vector<float> f32(rows * columns);
+    for (std::uint32_t i = 0; i < columns; ++i)
+        input[i] = bf16((static_cast<int>(i % 17) - 8) * 0.125f);
+    for (std::size_t i = 0; i < scales.size(); ++i)
+        scales[i] = bf16(0.01f * (i % 7 + 1));
+    for (std::size_t i = 0; i < w8.size(); ++i) {
+        w8[i] = static_cast<std::int8_t>(static_cast<int>(i % 31) - 15);
+        f32[i] = (static_cast<int>(i % 23) - 11) * 0.03125f;
+        preserved[i] = bf16(f32[i]);
+    }
+    for (std::size_t i = 0; i < w4.size(); ++i)
+        w4[i] = static_cast<std::uint8_t>((i % 16) | ((15 - i % 16) << 4));
+    auto* x = upload(input);
+    auto* scales_device = upload(scales);
+    auto* w8_device = upload(w8);
+    auto* w4_device = upload(w4);
+    auto* bf16_device = upload(preserved);
+    auto* f32_device = upload(f32);
+    q38::CudaProjectionPackV1 pack;
+    pack.count = 4;
+    pack.matrices[0] = {q38::DeviceWeightFormatV1::kW8A16SymG128,
+                        w8_device, scales_device, rows, columns, 128, false};
+    pack.matrices[1] = {q38::DeviceWeightFormatV1::kW4A16SymG128,
+                        w4_device, scales_device, rows, columns, 128, false};
+    pack.matrices[2] = {q38::DeviceWeightFormatV1::kPreserve,
+                        bf16_device, nullptr, rows, columns, 0, false};
+    pack.matrices[3] = {q38::DeviceWeightFormatV1::kPreserve,
+                        f32_device, nullptr, rows, columns, 0, true};
+    auto* reference = allocate<std::uint16_t>(rows);
+    for (auto& out : pack.outputs)
+        out = upload(std::vector<std::uint16_t>(rows + 4, 0x1234));
+    q38::cuda_multi_projection_decode_bf16(pack, x, stream, 0);
+    for (std::uint32_t i = 0; i < pack.count; ++i) {
+        q38::cuda_gemv_bf16(pack.matrices[i], x, reference, 1, stream, 0);
+        std::vector<std::uint16_t> a(rows + 4), b(rows);
+        check(cudaMemcpyAsync(a.data(), pack.outputs[i], a.size() * 2,
+            cudaMemcpyDeviceToHost, stream), "projection test output");
+        check(cudaMemcpyAsync(b.data(), reference, b.size() * 2,
+            cudaMemcpyDeviceToHost, stream), "projection test reference");
+        check(cudaStreamSynchronize(stream), "projection test synchronize");
+        if (!std::equal(b.begin(), b.end(), a.begin()))
+            throw std::runtime_error("fused projection differs from separate GEMV");
+        if (!std::all_of(a.begin() + rows, a.end(),
+                         [](auto value) { return value == 0x1234; }))
+            throw std::runtime_error("fused projection overwrote tail canary");
+    }
+    for (auto* out : pack.outputs) (void)cudaFree(out);
+    for (void* p : {static_cast<void*>(x), static_cast<void*>(scales_device),
+                   static_cast<void*>(w8_device), static_cast<void*>(w4_device),
+                   static_cast<void*>(bf16_device), static_cast<void*>(f32_device),
+                   static_cast<void*>(reference)}) (void)cudaFree(p);
+}
+
+void test_compact_sampling(cudaStream_t stream) {
+    constexpr std::uint32_t size = 4099;
+    q38::CudaSamplingWorkspace scratch(0, size);
+    const auto allocated = scratch.bytes();
+    std::vector<std::uint16_t> logits(size);
+    for (std::uint32_t i = 0; i < size; ++i)
+        logits[i] = bf16((static_cast<int>((i * 37) % 131) - 65) * 0.0625f);
+    logits[0] = 0x7fc1;  // NaN is excluded like the host sampler.
+    logits[1] = 0x7f80;
+    logits[2] = 0xff80;
+    logits[3] = 0x8000;
+    logits[4] = 0;
+    auto* device_logits = upload(logits);
+    for (float temperature : {0.7f, 1.0f, 1000.0f}) {
+        std::vector<std::int32_t> expected(size);
+        std::iota(expected.begin(), expected.end(), 0);
+        auto value = [&](std::int32_t id) {
+            const float raw = fp32(logits[id]);
+            return (std::isfinite(raw) ? raw : -std::numeric_limits<float>::infinity()) /
+                   temperature;
+        };
+        std::sort(expected.begin(), expected.end(), [&](auto a, auto b) {
+            return value(a) > value(b) || (value(a) == value(b) && a < b);
+        });
+        for (std::uint32_t k : {1u, 10u, 64u, size}) {
+            scratch.select(device_logits, k, temperature, stream);
+            std::vector<std::int32_t> ids(k);
+            std::vector<std::uint16_t> selected(k);
+            check(cudaMemcpyAsync(ids.data(), scratch.ids(), k * sizeof(std::int32_t),
+                cudaMemcpyDeviceToHost, stream), "compact sampling IDs");
+            check(cudaMemcpyAsync(selected.data(), scratch.logits(), k * 2,
+                cudaMemcpyDeviceToHost, stream), "compact sampling logits");
+            check(cudaStreamSynchronize(stream), "compact sampling synchronize");
+            if (!std::equal(ids.begin(), ids.end(), expected.begin()))
+                throw std::runtime_error("compact sampling top-k/tie order differs");
+            for (std::uint32_t i = 0; i < k; ++i)
+                if (selected[i] != logits[ids[i]])
+                    throw std::runtime_error("compact sampling altered raw logits");
+            if (scratch.bytes() != allocated)
+                throw std::runtime_error("compact sampling grew its workspace");
+        }
+    }
+    (void)cudaFree(device_logits);
 }
 
 void require_close(const std::vector<std::uint16_t>& left,
@@ -369,6 +839,40 @@ void test_moe_decode_parity(q38::DeviceWeightFormatV1 format,
         std::string(w8 ? "W8" : "W4") + " MoE decode parity";
     require_close(decode, reference, 0.075f, parity_label.c_str());
 
+    // Expert parallel reduction must sum FP32 partials before its sole BF16
+    // rounding boundary. Mask complementary routes on the same fixture and
+    // verify reconstruction of the complete routed result.
+    auto* partial = allocate<float>(down_rows);
+    std::vector<float> full_f32(down_rows), partial0(down_rows), partial1(down_rows);
+    const auto run_partial = [&](const std::vector<std::int32_t>& ids,
+                                  std::vector<float>& values) {
+        check(cudaMemcpyAsync(d_experts, ids.data(), top_k * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice, stream), "upload EP mask");
+        q38::cuda_moe_routed_bf16(
+            gate_view, down_view, d_hidden, d_experts, d_route_weights, 1, top_k,
+            gate_scratch, activated, accumulation, output,
+            reinterpret_cast<void*>(stream), 0, partial);
+        check(cudaMemcpyAsync(values.data(), partial, down_rows * sizeof(float),
+                              cudaMemcpyDeviceToHost, stream), "read EP partial");
+        check(cudaStreamSynchronize(stream), "wait EP partial");
+    };
+    run_partial(experts, full_f32);
+    auto mask0 = experts, mask1 = experts;
+    for (std::uint32_t i = 0; i < top_k; ++i) {
+        if (i % 2) mask0[i] = -1;
+        else mask1[i] = -1;
+    }
+    run_partial(mask0, partial0);
+    run_partial(mask1, partial1);
+    for (std::uint32_t i = 0; i < down_rows; ++i) {
+        if (bf16(full_f32[i]) != decode[i])
+            throw std::runtime_error("EP FP32 changed unsharded rounding");
+        if (std::fabs(partial0[i] + partial1[i] - full_f32[i]) >
+            1e-5f * std::max(1.0f, std::fabs(full_f32[i])))
+            throw std::runtime_error("EP masked FP32 reconstruction differs");
+    }
+    (void)cudaFree(partial);
+
     (void)cudaFree(output_pair);
     (void)cudaFree(output);
     (void)cudaFree(accumulation_pair);
@@ -523,6 +1027,118 @@ void verify_moe_route_plan(std::uint32_t tokens, bool repeated_expert,
 
     (void)cudaFree(device_allocation);
     (void)cudaFree(device_experts);
+}
+
+void test_tp_moe_route_plan() {
+    int device_count = 0;
+    check(cudaGetDeviceCount(&device_count), "count TP route fixture devices");
+    for (const unsigned tokens : {1u, 2u, 7u, 17u, 512u}) {
+        const unsigned routes = tokens * q38::kQ38RouteTopK;
+        for (int pattern = 0; pattern < 3; ++pattern) {
+            std::vector<int> global(routes);
+            std::vector<float> weights(routes);
+            for (unsigned i = 0; i < routes; ++i) weights[i] = float(i % 4 + 1) / 8.0f;
+            for (unsigned i = 0; i < routes; ++i)
+                global[i] = pattern == 0 ? int((i * 173 + 255) % 512)
+                    : pattern == 1 ? 255 : (i / 10 % 2 ? 256 : 3);
+            std::vector<float> total(tokens * q38::kQ38HiddenWidth, 0.0f);
+            for (int rank = 0; rank < 2; ++rank) {
+                const auto device = rank % device_count;
+                check(cudaSetDevice(device), "select TP route fixture rank");
+                cudaStream_t stream;
+                check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+                      "create TP route fixture stream");
+                std::vector<std::int32_t> local(routes, -1);
+                std::vector<std::uint32_t> expected_packed;
+                for (unsigned i = 0; i < routes; ++i)
+                    if (global[i] / 256 == rank) local[i] = global[i] % 256;
+                for (int expert = 0; expert < 256; ++expert)
+                    for (unsigned i = 0; i < routes; ++i)
+                        if (local[i] == expert) expected_packed.push_back(i);
+                const auto owned = expected_packed.size();
+                expected_packed.resize(routes, q38::kQ38RouteUnownedAssignment);
+                auto* ids = upload(local);
+                auto* device_weights = upload(weights);
+                const auto bytes = q38::q38_moe_route_plan_bytes_v1(tokens);
+                auto* allocation = allocate<std::uint8_t>(bytes);
+                const auto plan = q38::cuda_moe_route_plan_storage_v1(allocation, bytes, tokens);
+                // upload() uses the default stream; the fixture deliberately
+                // consumes on a nonblocking stream, so establish readiness.
+                check(cudaStreamSynchronize(nullptr), "TP fixture input upload ready");
+                q38::cuda_moe_build_route_plan_v1(ids, tokens, plan, stream, device, 256, true);
+                std::vector<std::uint32_t> packed(routes), inverse(routes);
+                q38::Q38RoutePlanHeaderV1 header;
+                check(cudaMemcpyAsync(&header, plan.header, sizeof(header), cudaMemcpyDeviceToHost, stream), "TP route header");
+                check(cudaMemcpyAsync(packed.data(), plan.packed_assignment, routes * 4, cudaMemcpyDeviceToHost, stream), "TP packed assignments");
+                check(cudaMemcpyAsync(inverse.data(), plan.assignment_to_packed, routes * 4, cudaMemcpyDeviceToHost, stream), "TP inverse assignments");
+                check(cudaStreamSynchronize(stream), "TP plan ready");
+                if (header.status || header.flags != q38::kQ38RoutePlanAllowUnowned || packed != expected_packed)
+                    throw std::runtime_error("TP sparse expert route plan differs");
+                for (unsigned i = 0; i < routes; ++i) {
+                    if (local[i] == -1) {
+                        if (inverse[i] != q38::kQ38RouteUnownedAssignment)
+                            throw std::runtime_error("unowned route retained stale inverse");
+                    } else if (inverse[i] >= owned || packed[inverse[i]] != i)
+                        throw std::runtime_error("TP owned route inverse differs");
+                }
+                // Poison unused rows so accidentally reading an unowned route
+                // cannot pass as a conveniently zero-initialized contribution.
+                std::vector<float> route_output(routes * q38::kQ38HiddenWidth, NAN);
+                for (unsigned p = 0; p < owned; ++p)
+                    for (unsigned column = 0; column < q38::kQ38HiddenWidth; ++column)
+                        route_output[p * q38::kQ38HiddenWidth + column] =
+                            float(int(packed[p] + 1) * (int(column % 7) - 3));
+                auto* routed = upload(route_output);
+                auto* partial = allocate<float>(total.size());
+                check(cudaStreamSynchronize(nullptr), "TP fixture routed upload ready");
+                q38::cuda_moe_reduce_top10_f32_v1(routed, plan.assignment_to_packed,
+                    tokens, partial, stream, device, device_weights);
+                std::vector<float> actual(total.size());
+                check(cudaMemcpyAsync(actual.data(), partial, actual.size() * 4,
+                    cudaMemcpyDeviceToHost, stream), "TP token-major partial");
+                check(cudaStreamSynchronize(stream), "TP partial ready");
+                for (unsigned token = 0; token < tokens; ++token)
+                    for (unsigned column = 0; column < q38::kQ38HiddenWidth; ++column) {
+                        float expected = 0;
+                        for (unsigned slot = 0; slot < 10; ++slot) {
+                            const auto assignment = token * 10 + slot;
+                            if (local[assignment] >= 0)
+                                expected += float(int(assignment + 1) * (int(column % 7) - 3)) * weights[assignment];
+                        }
+                        const auto index = token * q38::kQ38HiddenWidth + column;
+                        if (actual[index] != expected)
+                            throw std::runtime_error("TP token-major FP32 partial differs: tokens=" +
+                                std::to_string(tokens) + " pattern=" + std::to_string(pattern) +
+                                " rank=" + std::to_string(rank) + " token=" + std::to_string(token) +
+                                " column=" + std::to_string(column) + " actual=" +
+                                std::to_string(actual[index]) + " expected=" + std::to_string(expected));
+                        total[index] += actual[index];
+                    }
+                // -1 is the only permitted missing-route sentinel; an
+                // out-of-range expert must still produce an invalid plan.
+                local[0] = 256;
+                check(cudaMemcpyAsync(ids, local.data(), routes * 4, cudaMemcpyHostToDevice, stream), "TP invalid route input");
+                q38::cuda_moe_build_route_plan_v1(ids, tokens, plan, stream, device, 256, true);
+                check(cudaMemcpyAsync(&header, plan.header, sizeof(header), cudaMemcpyDeviceToHost, stream), "TP invalid header");
+                check(cudaStreamSynchronize(stream), "TP invalid plan ready");
+                if (header.status != static_cast<unsigned>(q38::Q38RoutePlanStatusV1::kInvalidExpert))
+                    throw std::runtime_error("TP accepted an out-of-range local expert");
+                (void)cudaFree(ids); (void)cudaFree(allocation);
+                (void)cudaFree(device_weights);
+                (void)cudaFree(routed); (void)cudaFree(partial);
+                (void)cudaStreamDestroy(stream);
+            }
+            for (unsigned token = 0; token < tokens; ++token)
+                for (unsigned column = 0; column < q38::kQ38HiddenWidth; ++column) {
+                    float expected = 0;
+                    for (unsigned slot = 0; slot < 10; ++slot)
+                        expected += float(int(token * 10 + slot + 1) * (int(column % 7) - 3)) * weights[token * 10 + slot];
+                    if (total[token * q38::kQ38HiddenWidth + column] != expected)
+                        throw std::runtime_error("TP rank partial sum differs from unpartitioned routes");
+                }
+        }
+    }
+    check(cudaSetDevice(0), "restore route fixture device");
 }
 
 void test_moe_route_plan(cudaStream_t stream) {
@@ -846,6 +1462,144 @@ void test_grouped_moe_prefill(q38::DeviceWeightFormatV1 format,
         }
     }
 
+    // TP must apply routing weights after down, without rounding weighted
+    // activations to BF16. Exercise the real W4/W8 kernels with this policy.
+    auto* device_partial = allocate<float>(static_cast<std::size_t>(tokens) * down_rows);
+    for (const auto mode : {q38::Q38PrefillMoeModeV1::kGroupedMmq,
+                            q38::Q38PrefillMoeModeV1::kGroupedMmqSafe,
+                            q38::Q38PrefillMoeModeV1::kGroupedFp32Scales}) {
+        q38::cuda_moe_grouped_gate_up_v1(
+            gate_view, device_packed_hidden, plan.packed_assignment,
+            device_route_weights, plan.tasks, header.task_count,
+            device_weighted_mid, mode, stream, 0, false);
+        q38::cuda_moe_grouped_down_v1(
+            down_view, device_weighted_mid, plan.tasks, header.task_count,
+            device_route_output, mode, stream, 0);
+        q38::cuda_moe_reduce_top10_f32_v1(
+            device_route_output, plan.assignment_to_packed, tokens,
+            device_partial, stream, 0, device_route_weights);
+        std::vector<float> partial(static_cast<std::size_t>(tokens) * down_rows);
+        check(cudaMemcpyAsync(partial.data(), device_partial, partial.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost, stream), "TP grouped partial");
+        check(cudaStreamSynchronize(stream), "TP grouped partial ready");
+        for (unsigned token = 0; token < tokens; ++token) {
+            const float gate = fp32(hidden[static_cast<std::size_t>(token) * gate_columns]);
+            const float activated = fp32(bf16(gate / (1.0f + std::exp(-gate)) * gate));
+            float expected = 0.0f;
+            for (unsigned slot = 0; slot < q38::kQ38RouteTopK; ++slot)
+                expected += activated * (1.0f / static_cast<float>(q38::kQ38RouteTopK));
+            for (unsigned column = 0; column < down_rows; ++column)
+                if (std::abs(partial[token * down_rows + column] - (column == 0 ? expected : 0.0f)) > 1e-6f)
+                    throw std::runtime_error("TP grouped post-down route weighting differs");
+        }
+    }
+    // Non-power-of-two scales on every output column and every G128
+    // group expose dequant-to-BF16 rounding and incorrect scale coordinates.
+    std::fill(gate_data.begin(), gate_data.end(), 0);
+    std::fill(down_data.begin(), down_data.end(), 0);
+    std::fill(hidden.begin(), hidden.end(), bf16(0));
+    const auto quant = [w8](unsigned row, unsigned group) {
+        const int magnitude = w8 ? 57 + int(row % 71) : 1 + int(row % 7);
+        return (row + group) % 3 == 0 ? -magnitude : magnitude;
+    };
+    for (unsigned row = 0; row < gate_rows; ++row)
+        for (unsigned group = 0; group < gate_columns / 128; ++group) {
+            for (const unsigned offset : {0u, 63u, 127u})
+                set_quantized(&gate_data, static_cast<std::size_t>(row) * gate_columns + group * 128 + offset,
+                              static_cast<std::int8_t>(quant(row + offset, group)));
+            gate_scales[row * (gate_columns / 128) + group] =
+                bf16((w8 ? .001f : .01f) * (1.0f + float((row + group) % 11) * .13f));
+        }
+    for (unsigned row = 0; row < down_rows; ++row)
+        for (unsigned group = 0; group < down_columns / 128; ++group) {
+            for (const unsigned offset : {0u, 63u, 127u})
+                set_quantized(&down_data, static_cast<std::size_t>(row) * down_columns + group * 128 + offset,
+                              static_cast<std::int8_t>(quant(row + offset, group)));
+            down_scales[row * (down_columns / 128) + group] =
+                bf16((w8 ? .0005f : .005f) * (1.0f + float((row + group) % 9) * .17f));
+        }
+    for (unsigned token = 0; token < tokens; ++token)
+        for (unsigned group = 0; group < gate_columns / 128; ++group)
+            for (const unsigned offset : {0u, 63u, 127u})
+                hidden[token * gate_columns + group * 128 + offset] = bf16(.25f + float((token + group + offset) % 4) * .125f);
+    const auto upload_into = [&](auto* destination, const auto& source) {
+        check(cudaMemcpyAsync(destination, source.data(), source.size() * sizeof(source[0]),
+                              cudaMemcpyHostToDevice, stream), "upload FP32 group scale fixture");
+    };
+    upload_into(device_gate_data, gate_data); upload_into(device_down_data, down_data);
+    upload_into(device_gate_scales, gate_scales); upload_into(device_down_scales, down_scales);
+    upload_into(device_hidden, hidden);
+    q38::cuda_moe_pack_hidden_v1(device_hidden, plan.packed_assignment, routes,
+                                device_packed_hidden, stream, 0);
+    for (int tiled = 0; tiled < (w8 ? 1 : 2); ++tiled) {
+        q38::CudaTensorViewV1 test_gate = gate_view, test_down = down_view;
+        std::vector<std::uint8_t> gate_tiled, down_tiled;
+        if (tiled) {
+            gate_tiled = tile_w4_16x16(gate_data, gate_rows, gate_columns);
+            down_tiled = tile_w4_16x16(down_data, down_rows, down_columns);
+            upload_into(device_gate_tiled, gate_tiled); upload_into(device_down_tiled, down_tiled);
+            test_gate.data = device_gate_tiled; test_down.data = device_down_tiled;
+            test_gate.layout = test_down.layout = q38::CudaWeightLayoutV1::kMoeW4Tile16x16;
+        }
+        const auto mode = q38::Q38PrefillMoeModeV1::kGroupedFp32Scales;
+        const char* original_flag = std::getenv("Q38_TP_MOE_FP32_SHARED_A");
+        const bool had_flag = original_flag != nullptr;
+        const std::string saved_flag = original_flag ? original_flag : "";
+        const auto run_shared_variant = [&](bool shared) {
+            if (setenv("Q38_TP_MOE_FP32_SHARED_A", shared ? "1" : "0", 1) != 0)
+                throw std::runtime_error("set shared FP32 activation flag failed");
+            q38::cuda_moe_grouped_gate_up_v1(test_gate, device_packed_hidden,
+                plan.packed_assignment, device_route_weights, plan.tasks, header.task_count,
+                device_weighted_mid, mode, stream, 0, false);
+            q38::cuda_moe_grouped_down_v1(test_down, device_weighted_mid, plan.tasks,
+                header.task_count, device_route_output, mode, stream, 0);
+            q38::cuda_moe_reduce_top10_f32_v1(device_route_output, plan.assignment_to_packed,
+                tokens, device_partial, stream, 0, device_route_weights);
+            std::vector<float> partial(tokens * down_rows);
+            check(cudaMemcpyAsync(partial.data(), device_partial, partial.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost, stream), "FP32 group scale result");
+            check(cudaStreamSynchronize(stream), "FP32 group scale fixture ready");
+            return partial;
+        };
+        const auto partial = run_shared_variant(false);
+        const auto shared_partial = run_shared_variant(true);
+        if (had_flag) setenv("Q38_TP_MOE_FP32_SHARED_A", saved_flag.c_str(), 1);
+        else unsetenv("Q38_TP_MOE_FP32_SHARED_A");
+        if (std::memcmp(partial.data(), shared_partial.data(), partial.size() * sizeof(float)) != 0)
+            throw std::runtime_error("shared FP32 activation changed MoE output bits");
+        for (unsigned token = 0; token < tokens; ++token) {
+            std::vector<float> projected(gate_rows), activation(down_columns);
+            for (unsigned row = 0; row < gate_rows; ++row) {
+                float sum = 0;
+                for (unsigned group = 0; group < gate_columns / 128; ++group) {
+                    float dot = 0;
+                    for (const unsigned offset : {0u, 63u, 127u})
+                        dot += float(quant(row + offset, group)) * fp32(hidden[token * gate_columns + group * 128 + offset]);
+                    sum = std::fma(dot, fp32(gate_scales[row * (gate_columns / 128) + group]), sum);
+                }
+                projected[row] = fp32(bf16(sum));
+            }
+            for (unsigned row = 0; row < down_columns; ++row)
+                activation[row] = fp32(bf16(projected[row] / (1.0f + std::exp(-projected[row])) * projected[row + down_columns]));
+            for (unsigned row = 0; row < down_rows; ++row) {
+                float sum = 0;
+                for (unsigned group = 0; group < down_columns / 128; ++group) {
+                    float dot = 0;
+                    for (const unsigned offset : {0u, 63u, 127u})
+                        dot += float(quant(row + offset, group)) * activation[group * 128 + offset];
+                    sum = std::fma(dot, fp32(down_scales[row * (down_columns / 128) + group]), sum);
+                }
+                float expected = 0;
+                for (unsigned slot = 0; slot < q38::kQ38RouteTopK; ++slot)
+                    expected = std::fma(sum, route_weights[token * q38::kQ38RouteTopK + slot], expected);
+                if (std::abs(partial[token * down_rows + row] - expected) > 1e-5f * (1.0f + std::abs(expected)))
+                    throw std::runtime_error("FP32 grouped scale arithmetic differs: row=" +
+                        std::to_string(row) + " expected=" + std::to_string(expected) +
+                        " actual=" + std::to_string(partial[token * down_rows + row]));
+            }
+        }
+    }
+    (void)cudaFree(device_partial);
     (void)cudaFree(device_output_safe);
     (void)cudaFree(device_output);
     (void)cudaFree(device_route_output_safe);
@@ -867,7 +1621,7 @@ void test_grouped_moe_prefill(q38::DeviceWeightFormatV1 format,
     if (device_gate_tiled) (void)cudaFree(device_gate_tiled);
 }
 
-void test_boundary_transport_checksum(cudaStream_t stream) {
+void test_boundary_transport_checksum(cudaStream_t stream, bool asynchronous = false) {
     constexpr std::size_t words = 4096;
     std::vector<std::uint16_t> source(words);
     for (std::size_t index = 0; index < source.size(); ++index)
@@ -879,6 +1633,7 @@ void test_boundary_transport_checksum(cudaStream_t stream) {
     options.slots = 2;
     options.max_tokens = 1;
     options.hidden_width = words;
+    options.asynchronous_copy = asynchronous;
     q38::CudaBoundaryRing ring(options);
 
     q38::BoundaryBuffer boundary;
@@ -890,6 +1645,9 @@ void test_boundary_transport_checksum(cudaStream_t stream) {
     boundary.frame.hidden_width = words;
     boundary.frame.payload_bytes = words * sizeof(std::uint16_t);
     boundary.lease = ring.copy_from_device(device_source, words, stream);
+    if (asynchronous)
+        check(cudaMemsetAsync(device_source, 0, words * sizeof(std::uint16_t), stream),
+              "overwrite boundary producer buffer after handoff");
     boundary.frame.ring_slot = boundary.lease->slot();
     boundary.frame.payload_checksum = boundary.payload_checksum();
     if (boundary.frame.payload_checksum !=
@@ -905,6 +1663,8 @@ void test_boundary_transport_checksum(cudaStream_t stream) {
     if (round_trip != source)
         throw std::runtime_error("boundary round trip differs");
 
+    check(cudaMemcpyAsync(device_source, source.data(), words * sizeof(std::uint16_t),
+        cudaMemcpyHostToDevice, stream), "restore boundary test source");
     auto corrupt = ring.copy_from_device(device_source, words, stream);
     corrupt->wait_ready();
     const_cast<std::uint16_t*>(corrupt->data())[17] ^= 1u;
@@ -918,6 +1678,41 @@ void test_boundary_transport_checksum(cudaStream_t stream) {
         throw std::runtime_error("corrupt boundary checksum was accepted");
     check(cudaFree(device_destination), "cudaFree(boundary destination)");
     check(cudaFree(device_source), "cudaFree(boundary source)");
+}
+
+void test_device_boundary_reuse(cudaStream_t stream) {
+    constexpr std::size_t words = 64, rounds = 32;
+    q38::CudaBoundaryRingOptions options;
+    options.producer_device = 0; options.slots = 2;
+    options.max_tokens = 1; options.hidden_width = words; options.device_only = true;
+    q38::CudaBoundaryRing ring(options);
+    if (ring.pinned_bytes() != 2 * sizeof(unsigned long long))
+        throw std::runtime_error("device boundary allocated a host payload");
+    std::vector<std::uint16_t> expected(words * rounds);
+    for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = (i * 13 + 5) % 65536;
+    auto* source = allocate<std::uint16_t>(words);
+    auto* destination = allocate<std::uint16_t>(words * rounds);
+    cudaStream_t consumer;
+    check(cudaStreamCreateWithFlags(&consumer, cudaStreamNonBlocking), "create boundary test consumer");
+    for (std::size_t i = 0; i < rounds; ++i) {
+        check(cudaMemcpyAsync(source, expected.data() + i * words, words * 2,
+                              cudaMemcpyHostToDevice, stream), "set device boundary input");
+        q38::BoundaryBuffer boundary;
+        boundary.lease = ring.copy_from_device(source, words, stream);
+        boundary.frame.payload_checksum = boundary.payload_checksum();
+        if (boundary.payload_checksum() != q38::boundary_payload_checksum(expected.data() + i * words, words))
+            throw std::runtime_error("device boundary checksum differs");
+        check(cudaMemsetAsync(source, 0, words * 2, stream), "overwrite leased producer input");
+        q38::cuda_copy_boundary_to_device(boundary, destination + i * words, consumer, 0);
+        // Lease released while the other stream can still be consuming its slot.
+    }
+    check(cudaStreamSynchronize(consumer), "finish device boundary consumers");
+    std::vector<std::uint16_t> actual(expected.size());
+    check(cudaMemcpy(actual.data(), destination, actual.size() * 2, cudaMemcpyDeviceToHost), "read boundary generations");
+    if (actual != expected) throw std::runtime_error("device boundary slot reused before consumer finished");
+    check(cudaStreamDestroy(consumer), "destroy boundary test consumer");
+    check(cudaFree(source), "free boundary test input");
+    check(cudaFree(destination), "free boundary test output");
 }
 
 void test_gdn_prefill(cudaStream_t stream) {
@@ -1629,6 +2424,7 @@ int main() {
         test_moe_decode_parity(
             q38::DeviceWeightFormatV1::kW4A16SymG128, stream);
         test_moe_route_plan(stream);
+        test_tp_moe_route_plan();
         test_grouped_moe_prefill(
             q38::DeviceWeightFormatV1::kW8A16SymG128, stream);
         test_grouped_moe_prefill(
@@ -1642,7 +2438,7 @@ int main() {
         auto* device_scales = upload(scales);
         auto* device_input = upload(input);
         std::uint16_t* device_output = nullptr;
-        check(cudaMalloc(reinterpret_cast<void**>(&device_output), 4),
+        check(cudaMalloc(reinterpret_cast<void**>(&device_output), 128 * sizeof(std::uint16_t)),
               "cudaMalloc(test output)");
         q38::CudaMatrixViewV1 matrix{
             q38::DeviceWeightFormatV1::kW8A16SymG128,
@@ -1670,7 +2466,17 @@ int main() {
         if (std::fabs(fp32(output[0]) - 1.0f) > 0.02f)
             throw std::runtime_error("RMSNorm result differs");
 
+        test_padded_small_gemm(stream);
+        test_paired_norm(stream);
+        test_ple_residual(stream);
+        test_hc_gemv(stream);
+        test_hc_grouped(stream);
+        test_multi_projection(stream);
+        test_multi_projection(stream, 2560, 10240);
+        test_compact_sampling(stream);
         test_boundary_transport_checksum(stream);
+        test_boundary_transport_checksum(stream, true);
+        test_device_boundary_reuse(stream);
         test_gdn_prefill(stream);
         test_ple_prefill(stream);
         test_qsa_prefill(stream);

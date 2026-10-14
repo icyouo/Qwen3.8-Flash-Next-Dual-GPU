@@ -2,6 +2,7 @@
 #include "q38/rpc.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <sstream>
@@ -22,6 +23,7 @@ void print_tokens(const std::vector<std::int32_t>& tokens) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::string tp_root;
     std::string stage0;
     std::string stage1;
     std::string ple;
@@ -30,14 +32,19 @@ int main(int argc, char** argv) {
     std::string snapshot_journal_path;
     q38::ExecutorOptions options;
     std::uint64_t ple_cache_gib = 8;
+    std::uint64_t ple_ram_budget_gib = 64;
     q38::PleIoModeV1 ple_io_mode = q38::PleIoModeV1::kIoUringDirect;
     std::uint32_t ple_queue_depth = 64;
     bool enable_mtp = false;
+    bool enable_p2p = false;
+    bool stream_ordered_p2p = false;
     bool enable_piecewise_decode_graph = false;
     bool enable_logit_diagnostics = false;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
-        if (argument == "--stage0-index" && index + 1 < argc)
+        if (argument == "--tp2-root" && index + 1 < argc)
+            tp_root = argv[++index];
+        else if (argument == "--stage0-index" && index + 1 < argc)
             stage0 = argv[++index];
         else if (argument == "--stage1-index" && index + 1 < argc)
             stage1 = argv[++index];
@@ -48,6 +55,8 @@ int main(int argc, char** argv) {
                 static_cast<std::uint32_t>(std::stoul(argv[++index]));
         else if (argument == "--ple-cache-gib" && index + 1 < argc)
             ple_cache_gib = std::stoull(argv[++index]);
+        else if (argument == "--ple-ram-budget-gib" && index + 1 < argc)
+            ple_ram_budget_gib = std::stoull(argv[++index]);
         else if (argument == "--ple-io" && index + 1 < argc) {
             const std::string mode = argv[++index];
             if (mode == "direct")
@@ -56,6 +65,8 @@ int main(int argc, char** argv) {
                 ple_io_mode = q38::PleIoModeV1::kAuto;
             else if (mode == "buffered")
                 ple_io_mode = q38::PleIoModeV1::kBuffered;
+            else if (mode == "ram")
+                ple_io_mode = q38::PleIoModeV1::kRam;
             else
                 throw std::invalid_argument("unknown PLE I/O mode");
         } else if (argument == "--ple-queue-depth" && index + 1 < argc)
@@ -98,10 +109,22 @@ int main(int argc, char** argv) {
         else if (argument == "--stop-token-id" && index + 1 < argc)
             options.stop_token_ids.push_back(
                 static_cast<std::int32_t>(std::stol(argv[++index])));
+        else if (argument == "--tp-p2p")
+            enable_p2p = true;
+        else if (argument == "--tp-p2p-async")
+            stream_ordered_p2p = true;
+        else if (argument == "--tp-batched-mtp") {
+            enable_mtp = true;
+            options.enable_batched_mtp = true;
+        }
         else if (argument == "--enable-mtp")
             enable_mtp = true;
         else if (argument == "--enable-piecewise-decode-graph")
             enable_piecewise_decode_graph = true;
+        else if (argument == "--enable-adaptive-mtp")
+            options.enable_adaptive_mtp = true;
+        else if (argument == "--enable-compact-sampling")
+            options.enable_compact_sampling = true;
         else if (argument == "--enable-logit-diagnostics") {
             enable_logit_diagnostics = true;
             options.retain_last_logits_for_diagnostics = true;
@@ -109,36 +132,60 @@ int main(int argc, char** argv) {
             std::cerr << "usage: q38-cuda-runtime --stage0-index FILE "
                          "--stage1-index FILE --ple-layout FILE "
                          "[--chunk N] [--ple-cache-gib N] "
-                         "[--ple-io direct|auto|buffered] "
+                         "[--ple-io direct|auto|buffered|ram] [--ple-ram-budget-gib N] "
                          "[--ple-queue-depth N] "
                          "[--context-limit N] [--session-hash N] "
                          "[--socket PATH] --identity FILE "
                          "[--sampling greedy|top-k-top-p] "
                          "[--snapshot-journal FILE] [--stop-token-id N] "
-                         "[--enable-mtp] "
+                         "[--enable-mtp] [--tp-batched-mtp] "
                          "[--enable-piecewise-decode-graph] "
-                         "[--enable-logit-diagnostics] "
+                         "[--enable-logit-diagnostics] [--enable-adaptive-mtp] [--enable-compact-sampling] "
+                         "[--tp2-root DIR (experimental, replaces stage indexes)] "
+                         "[--tp-p2p] [--tp-p2p-async] "
                          "[sampling options]\n";
             return 2;
         }
     }
-    if (stage0.empty() || stage1.empty() || ple.empty() ||
+    if ((tp_root.empty() && (stage0.empty() || stage1.empty())) || ple.empty() ||
         identity_path.empty()) {
         std::cerr << "q38-cuda-runtime: artifact and identity paths are required\n";
         return 2;
     }
     try {
+        if (ple_cache_gib > (UINT64_MAX >> 30u) || ple_ram_budget_gib == 0 ||
+            ple_ram_budget_gib > (UINT64_MAX >> 30u))
+            throw std::invalid_argument("PLE memory budget is invalid");
+        if (enable_p2p && tp_root.empty())
+            throw std::invalid_argument("--tp-p2p requires --tp2-root");
+        if (stream_ordered_p2p && !enable_p2p)
+            throw std::invalid_argument("--tp-p2p-async requires --tp-p2p");
         options.identity = q38::load_session_identity(identity_path);
-        auto executor = q38::make_cuda_executor(
+        if (options.enable_batched_mtp && tp_root.empty())
+            throw std::invalid_argument("--tp-batched-mtp requires --tp2-root");
+        if (!tp_root.empty() && ((enable_mtp && !options.enable_batched_mtp) || enable_piecewise_decode_graph ||
+                (options.enable_adaptive_mtp && !options.enable_batched_mtp) || options.enable_compact_sampling))
+            throw std::invalid_argument("TP2 requires its dedicated MTP/graph execution switches");
+        auto executor = !tp_root.empty() ? q38::make_cuda_tp_executor(
+            tp_root, ple, options, ple_cache_gib << 30u, ple_io_mode, ple_queue_depth,
+            enable_p2p, ple_ram_budget_gib << 30u, stream_ordered_p2p)
+            : q38::make_cuda_executor(
             stage0, stage1, ple, options, 0, 1, ple_cache_gib << 30u,
             ple_io_mode, ple_queue_depth, enable_mtp,
-            enable_piecewise_decode_graph);
+            enable_piecewise_decode_graph, 1, 0, ple_ram_budget_gib << 30u);
+        const auto* tp_graph_env = std::getenv("Q38_TP_PIECEWISE_GRAPH");
+        const bool configured_graph = enable_piecewise_decode_graph ||
+            (!tp_root.empty() && tp_graph_env && std::string(tp_graph_env) == "1");
         std::cout << "{\"type\":\"ready\",\"backend\":\"cuda\","
                      "\"contract_version\":1,\"rpc_version\":1,"
-                  << "\"mtp_enabled\":"
+                  << "\"tp_world_size\":" << (tp_root.empty() ? 1 : 2)
+                  << ",\"tp_transport\":\"" << (enable_p2p ? "p2p" : "host") << "\""
+                  << ",\"tp_stream_ordered\":" << (stream_ordered_p2p ? "true" : "false")
+                  << ",\"ple_storage\":\"" << (ple_io_mode == q38::PleIoModeV1::kRam ? "ram" : "ssd") << "\""
+                  << ",\"mtp_enabled\":"
                   << (enable_mtp ? "true" : "false")
                   << ",\"piecewise_decode_graph_enabled\":"
-                  << (enable_piecewise_decode_graph ? "true" : "false")
+                  << (configured_graph ? "true" : "false")
                   << ",\"logit_diagnostics_enabled\":"
                   << (enable_logit_diagnostics ? "true" : "false")
                   << "}\n"

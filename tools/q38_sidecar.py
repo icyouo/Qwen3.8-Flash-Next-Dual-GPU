@@ -13,6 +13,7 @@ import json
 import re
 import secrets
 import sys
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,7 +30,9 @@ from q38_control_plane import (  # noqa: E402
     ExecutorTransport,
     HuggingFaceCodec,
     Q38ControlPlane,
+    StreamingTextDecoder,
 )
+from q38_stream import CommittedEventPump  # noqa: E402
 
 
 MAX_BODY_BYTES = 16 << 20
@@ -40,6 +43,15 @@ OUTPUT_TOKEN_FIELDS = (
     "max_new_tokens",
     "max_output_tokens",
 )
+
+
+def _stream_include_usage(body: dict[str, Any]) -> bool:
+    options = body.get("stream_options")
+    if options is None:
+        return False
+    if not isinstance(options, dict) or not isinstance(options.get("include_usage", False), bool):
+        raise ControlPlaneError(400, "invalid_stream_options", "stream_options.include_usage must be a boolean")
+    return options.get("include_usage", False)
 
 
 def _resolve_output_tokens(
@@ -297,6 +309,10 @@ class SidecarApplication:
         api_key: str | None,
         default_max_tokens: int | None = None,
         max_output_tokens: int | None = None,
+        default_mode: str = 'plain',
+        default_mtp_width: int = 1,
+        stream_decode: str = 'incremental',
+        stream_buffer: int = 2,
     ) -> None:
         if (
             (default_max_tokens is not None and default_max_tokens <= 0)
@@ -313,6 +329,18 @@ class SidecarApplication:
         self.api_key = api_key
         self.default_max_tokens = default_max_tokens
         self.max_output_tokens = max_output_tokens
+        if default_mode not in ('plain', 'mtp') or not 1 <= default_mtp_width <= control.mtp_max_draft:
+            raise ValueError('invalid default execution mode or draft width')
+        if default_mode == 'mtp' and not control.mtp_enabled:
+            raise ValueError('default MTP requires an MTP executor')
+        self.default_mode = default_mode
+        self.default_mtp_width = default_mtp_width
+        if stream_decode not in ('incremental', 'cumulative'):
+            raise ValueError('invalid stream decoder')
+        self.stream_decode = stream_decode
+        if not 0 <= stream_buffer <= 16:
+            raise ValueError('invalid stream buffer capacity')
+        self.stream_buffer = stream_buffer
 
 
 class Q38RequestHandler(BaseHTTPRequestHandler):
@@ -352,6 +380,20 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _error(self, error: Exception) -> None:
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            self.close_connection = True
+            return
+        if getattr(self, '_streaming_response', False):
+            value = error.as_dict() if isinstance(error, ControlPlaneError) else {
+                'error': {'message': str(error), 'type': 'q38_sidecar_error', 'code': 'internal_error'}}
+            try:
+                self.wfile.write(b'data: ' + json.dumps(value, ensure_ascii=False).encode() + b'\n\n')
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
+            return
         if isinstance(error, ControlPlaneError):
             self._json(error.status, error.as_dict())
         else:
@@ -565,6 +607,7 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
                 "tokenizer_unavailable",
                 "OpenAI message input requires --tokenizer; use token-native endpoints otherwise",
             )
+        include_usage = _stream_include_usage(body)
         tools = _function_tools(body.get("tools"))
         selected_tools, required_instruction = _tool_choice(
             body.get("tool_choice"), tools
@@ -601,9 +644,11 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
             maximum_tokens=self.app.max_output_tokens,
             available_tokens=self.app.control.context_limit - len(history),
         )
-        mode = str(body.get("q38_mode", "plain"))
-        width = int(body.get("q38_mtp_width", 1))
+        mode = str(body.get("q38_mode", self.app.default_mode))
+        width = int(body.get("q38_mtp_width", self.app.default_mtp_width))
         timeout = body.get("q38_timeout_ms")
+        stop_event = threading.Event() if body.get('stream', False) and self.app.stream_buffer else None
+        extra = {'stop_event': stop_event} if stop_event is not None else {}
         pairs = self.app.control.complete_full_history(
             session_id,
             history,
@@ -611,15 +656,22 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
             mode=mode,
             mtp_width=width,
             timeout_ms=timeout,
+            **extra,
         )
         request_id = f"chatcmpl-q38-{time.time_ns()}"
         if body.get("stream", False):
-            self._chat_stream(
-                pairs, request_id, session_id, tokenize_ns,
-                tool_parsing=bool(selected_tools),
-                selected_tools=selected_tools,
-                tool_call_required=required_instruction is not None,
-            )
+            def serve(events):
+                self._chat_stream(
+                    events, request_id, session_id, tokenize_ns,
+                    tool_parsing=bool(selected_tools), selected_tools=selected_tools,
+                    tool_call_required=required_instruction is not None,
+                    prompt_tokens=len(history), include_usage=include_usage)
+            if stop_event is None:
+                serve(pairs)
+            else:
+                cancel = getattr(self.app.control, 'stop_stream', lambda _owner: None)
+                with CommittedEventPump(pairs, stop_event, cancel, self.app.stream_buffer) as events:
+                    serve(events)
             return
         events_and_timing = list(pairs)
         output_tokens = [
@@ -683,6 +735,8 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
         tool_parsing: bool = False,
         selected_tools: list[dict[str, object]] | None = None,
         tool_call_required: bool = False,
+        prompt_tokens: int = 0,
+        include_usage: bool = False,
     ) -> None:
         if tool_parsing:
             self._chat_stream_tools(
@@ -692,6 +746,8 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
                 tokenize_ns,
                 selected_tools or [],
                 tool_call_required,
+                prompt_tokens,
+                include_usage,
             )
             return
         self.send_response(200)
@@ -700,12 +756,17 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         accumulated: list[int] = []
+        self._streaming_response = True
         previous = ""
+        decoder = StreamingTextDecoder(self.app.codec) if self.app.stream_decode == 'incremental' else None  # type: ignore[arg-type]
         for event, timing in pairs:
             accumulated.extend(event.token_ids)
-            decoded = self.app.codec.decode(accumulated)  # type: ignore[union-attr]
-            fragment = decoded[len(previous) :] if decoded.startswith(previous) else decoded
-            previous = decoded
+            if decoder is not None:
+                fragment = decoder.push(event.token_ids, final=event.finish_reason is not None)
+            else:
+                decoded = self.app.codec.decode(accumulated)  # type: ignore[union-attr]
+                fragment = decoded[len(previous) :] if decoded.startswith(previous) else decoded
+                previous = decoded
             chunk = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
@@ -731,6 +792,8 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
                 b"data: " + json.dumps(chunk, separators=(",", ":"), ensure_ascii=False).encode() + b"\n\n"
             )
             self.wfile.flush()
+        if include_usage:
+            self._chat_stream_usage(request_id, prompt_tokens, len(accumulated))
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
         self.close_connection = True
@@ -745,6 +808,8 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
         tokenize_ns: int,
         selected_tools: list[dict[str, object]],
         tool_call_required: bool,
+        prompt_tokens: int = 0,
+        include_usage: bool = False,
     ) -> None:
         events_and_timing = list(pairs)
         output_tokens = [
@@ -805,9 +870,26 @@ class Q38RequestHandler(BaseHTTPRequestHandler):
             + json.dumps(final, separators=(",", ":"), ensure_ascii=False).encode()
             + b"\n\n"
         )
+        if include_usage:
+            self._chat_stream_usage(request_id, prompt_tokens, len(output_tokens))
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
         self.close_connection = True
+
+    def _chat_stream_usage(self, request_id: str, prompt_tokens: int, completion_tokens: int) -> None:
+        chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": self.app.control.model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
+        self.wfile.write(b"data: " + json.dumps(chunk, separators=(",", ":")).encode() + b"\n\n")
 
 
 class Q38HttpServer(ThreadingHTTPServer):
@@ -845,6 +927,14 @@ def main() -> int:
     )
     parser.add_argument("--stop-token-id", type=int, action="append", default=[])
     parser.add_argument("--enable-mtp", action="store_true")
+    parser.add_argument('--default-mode', choices=('plain', 'mtp'), default='plain')
+    parser.add_argument('--default-mtp-width', type=int, default=1)
+    parser.add_argument('--stream-decode', choices=('incremental', 'cumulative'), default='incremental',
+                        help='incremental UTF-8-safe decoding; cumulative is the rollback path')
+    parser.add_argument('--stream-buffer', type=int, default=2,
+                        help='maximum queued committed batches; 0 keeps synchronous SSE execution')
+    parser.add_argument('--reuse-terminal-prefix', action='store_true',
+                        help='requires runtime opcode 12; reuse the prefix before an unprocessed EOS')
     parser.add_argument(
         "--mtp-max-draft",
         type=int,
@@ -880,6 +970,7 @@ def main() -> int:
         default_timeout_ms=arguments.timeout_ms,
         mtp_enabled=arguments.enable_mtp,
         mtp_max_draft=arguments.mtp_max_draft,
+        reuse_terminal_prefix=arguments.reuse_terminal_prefix,
     )
     server = Q38HttpServer(
         (arguments.host, arguments.port),
@@ -889,6 +980,10 @@ def main() -> int:
             api_key=arguments.api_key,
             default_max_tokens=arguments.default_max_tokens or None,
             max_output_tokens=arguments.max_output_tokens or None,
+            default_mode=arguments.default_mode,
+            default_mtp_width=arguments.default_mtp_width,
+            stream_decode=arguments.stream_decode,
+            stream_buffer=arguments.stream_buffer,
         ),
     )
     print(

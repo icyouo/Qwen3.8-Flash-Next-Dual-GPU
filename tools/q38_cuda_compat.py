@@ -39,6 +39,12 @@ def main() -> int:
     for old, new in replacements:
         if old in text:
             text = text.replace(old, new, 1)
+        elif old[:-1] + " _NV_RSQRT_SPECIFIER;" in text and (
+            "# define _NV_RSQRT_SPECIFIER noexcept(true)" in text
+        ):
+            # Newer toolkits already select the exception specification for
+            # the host glibc. Preserve their declaration and conditional macro.
+            continue
         elif new not in text:
             raise RuntimeError(f"CUDA math header does not contain expected declaration: {old}")
     crt_output.write_text(text)

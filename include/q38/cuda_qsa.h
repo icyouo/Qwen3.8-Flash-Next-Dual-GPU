@@ -230,6 +230,19 @@ void cuda_qsa_output_grouped_prefill_bf16(
     void* stream,
     int device);
 
+// Canonical cache/scratch head ownership is independent of projection stride.
+struct CudaQsaHeadLayout {
+    unsigned head_begin = 0;
+    unsigned head_count = kQ38QsaHeads;
+    unsigned projected_head_begin = 0;
+    unsigned projected_head_count = kQ38QsaHeads;
+};
+CudaQsaHeadLayout cuda_qsa_set_head_layout(CudaQsaHeadLayout layout);
+
+// Per-thread capture scope only. Null clears the scope; the pointed device
+// word must remain allocated for every replay of the captured graph.
+void cuda_qsa_set_graph_position(const std::uint32_t* position, unsigned tokens);
+
 bool cuda_q38_qsa_compiled();
 
 }  // namespace q38

@@ -11,7 +11,7 @@ namespace q38 {
 
 constexpr std::uint32_t kMetricsMagic = fourcc('Q', '3', '8', 'M');
 constexpr std::uint64_t kMetricsSchemaHashV1 =
-    UINT64_C(0x7133386d6574013b);  // V1 width-N MTP + 58 stage counters.
+    UINT64_C(0x7133386d6574013d);  // V1 width-N MTP + 60 stage counters.
 
 struct ExecutorStatsV1 {
     std::uint64_t transactions = 0;
@@ -67,6 +67,8 @@ struct StageBackendMetricsV1 {
     std::uint64_t ple_read_latency_p99_ns = 0;
     std::uint64_t ple_io_uring_enabled = 0;
     std::uint64_t ple_direct_io_enabled = 0;
+    std::uint64_t ple_ram_enabled = 0;
+    std::uint64_t ple_ram_resident_bytes = 0;
     // Exact allocator ownership census.  Category fields are disjoint for
     // device allocations; host-only weights are deliberately excluded from
     // the CUDA total.  The two pinned fields account for all runtime-owned
@@ -158,7 +160,7 @@ struct alignas(8) MetricsSchemaV1 {
 
 static_assert(sizeof(ExecutorStatsV1) == 21 * sizeof(std::uint64_t),
               "executor metrics ABI changed");
-static_assert(sizeof(StageBackendMetricsV1) == 58 * sizeof(std::uint64_t),
+static_assert(sizeof(StageBackendMetricsV1) == 60 * sizeof(std::uint64_t),
               "stage metrics ABI changed");
 static_assert(sizeof(HostMetricsV1) == 20 * sizeof(std::uint64_t),
               "host metrics ABI changed");

@@ -77,12 +77,15 @@ struct PleCacheStatsV1 {
     std::uint64_t io_uring_enabled = 0;
     std::uint64_t direct_io_enabled = 0;
     std::uint64_t scale_resident_bytes = 0;
+    std::uint64_t ram_enabled = 0;
+    std::uint64_t ram_resident_bytes = 0;
 };
 
 enum class PleIoModeV1 : std::uint32_t {
     kAuto = 0,
     kBuffered = 1,
     kIoUringDirect = 2,
+    kRam = 3,
 };
 
 struct PleStoreOptionsV1 {
@@ -90,6 +93,7 @@ struct PleStoreOptionsV1 {
     std::uint32_t cache_page_bytes = 4096;
     PleIoModeV1 io_mode = PleIoModeV1::kAuto;
     std::uint32_t queue_depth = 64;
+    std::uint64_t ram_budget_bytes = 64ull << 30u;
 };
 
 struct PleReadExtentV1 {
@@ -108,6 +112,8 @@ public:
     void reset();
     std::vector<std::uint64_t> rows(
         const std::vector<std::int32_t>& token_ids);
+    // Append one causal token into a caller-owned, preallocated row plan.
+    void append_rows(std::int32_t token, std::vector<std::uint64_t>& output);
 
 private:
     PleHashConfigV1 config_;
@@ -146,6 +152,7 @@ private:
     struct Cache;
     struct ScalePart;
     struct IoUringProvider;
+    struct RamTable;
 
     const PlePartV1& find_part(std::uint64_t global_row) const;
     int file_descriptor(std::uint32_t file_index) const;
@@ -160,6 +167,7 @@ private:
     std::vector<ScalePart> scale_parts_;
     std::unique_ptr<Cache> cache_;
     std::unique_ptr<IoUringProvider> io_uring_;
+    std::unique_ptr<RamTable> ram_;
     std::uint64_t scale_resident_bytes_ = 0;
 };
 

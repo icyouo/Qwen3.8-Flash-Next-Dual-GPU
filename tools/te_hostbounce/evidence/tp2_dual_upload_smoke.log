@@ -1,0 +1,1 @@
+[TP2 dual-upload hostAR] blk.0.linear_attn.out.weight O=2560 I=3072+3072 max_abs=1.132e-06 mean_abs=1.026e-07 ref_mean=8.368e-02 PASS

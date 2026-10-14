@@ -21,6 +21,11 @@ struct CudaStageBackendOptions {
     bool enable_mtp = false;
     bool enable_speculative_checkpoint = false;
     bool enable_piecewise_decode_graph = false;
+    bool enable_compact_sampling = false;
+    // TP2 host-bounce: world_size 2 loads sharded rank artifacts; collectives
+    // use cuda_te host bounce (no CUDA P2P). Rank is 0 or 1.
+    int te_world_size = 1;
+    int te_rank = 0;
 };
 
 class CudaStageBackend final : public StageBackend {
@@ -78,7 +83,21 @@ std::unique_ptr<DualStageExecutor> make_cuda_executor(
     PleIoModeV1 ple_io_mode = PleIoModeV1::kAuto,
     std::uint32_t ple_queue_depth = 64,
     bool enable_mtp = false,
-    bool enable_piecewise_decode_graph = false);
+    bool enable_piecewise_decode_graph = false,
+    int te_world_size = 1,
+    int te_rank = 0,
+    std::uint64_t ple_ram_budget_bytes = 64ull << 30u);
+
+// Experimental TP2/EP executor: one transaction coordinator for both ranks.
+std::unique_ptr<DualStageExecutor> make_cuda_tp_executor(
+    const std::string& tp_root, const std::string& ple_layout,
+    const ExecutorOptions& executor_options,
+    std::uint64_t ple_cache_bytes = 8ull << 30u,
+    PleIoModeV1 ple_io_mode = PleIoModeV1::kIoUringDirect,
+    std::uint32_t ple_queue_depth = 64,
+    bool enable_p2p = false,
+    std::uint64_t ple_ram_budget_bytes = 64ull << 30u,
+    bool stream_ordered_p2p = false);
 
 bool cuda_q38_backend_compiled();
 

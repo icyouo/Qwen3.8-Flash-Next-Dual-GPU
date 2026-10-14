@@ -34,6 +34,7 @@ public:
                               std::uint32_t evaluated_count,
                               std::string* error);
     bool seed_decode_pending(std::string* error);
+    bool advance_pending_epoch(std::string* error);
     bool prepare(TxnKind kind, std::uint32_t evaluated_count,
                  std::string* error);
     // Retained-draft verification may stop at the first mismatch. Shorten the

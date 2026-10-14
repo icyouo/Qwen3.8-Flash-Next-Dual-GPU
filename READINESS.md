@@ -1,8 +1,68 @@
 # Qwen3.8-Flash-Next-Dual-GPU test readiness
 
+> **2026-10-12 current opt-in candidate:** `mtp4-native-bf16-gdn-qk-candidate` measures 3.035s TTFT on frozen 4K requests, about 9.53% behind the previous-round vLLM reference. Same-path logits/answer/recovery checks pass; scalar/MTP numerical differences and long-term stability remain open. See [current qualification and limits](docs/gdn-normalized-prefill-20261012.md).
+
+> **2026-10-11 frozen 4K A/B:** The opt-in prefill profile passes the qualified full BF16/token oracle, answer-quality and recovery gates. Three-repeat median prefill rises **864.58→990.04 tok/s**, with identical 457-token answers and TTFT **4.75→4.14s**. Decode stays around 85 tok/s; vLLM parity and long-duration reliability are not established. See [measurements and installed profile](docs/native-vllm-parity-20261011.md).
+
+> **2026-10-04 benchmark stability update:** llm_speedtest completed three exact-usage requests, then was interrupted by two whole-host reboots during 32K and 4K prefill. The three-repeat matrix is incomplete; general 160 tok/s and long-context stability are not qualified. See [the report](docs/llm-speedtest-20261004.md).
+
+
 This file records the boundary between implementation evidence and the first
 real dual-GPU/model run. It deliberately does not treat mock execution or a
 successful CUDA compile as model-correctness or performance evidence.
+
+## 2026-10-04 Z4 fixed-MTP4 native fast profile
+
+The optional `mtp4-native-fast` profile reaches three-run mean HTTP decode
+rates of 172.81 tok/s for web and 174.70 tok/s for code on dual 170HX, 200W per
+GPU, existing W4/W8 and RAM PLE. It includes framework-free pinned Marlin MoE,
+lossless vocabulary-row and GDN projection layouts, head-local GDN/QSA,
+whole target/draft graphs, bounded peer-collective fusion and explicit BF16
+rounding boundaries in the subsequent fusions. The qualified follow-up adds
+shared-expert/P2P graph overlap, direct BF16 top10 reduction, MoE/HC finish
+fusion and a normalized MTP embedding cache (about 1.18 GiB per GPU). Persistent
+and wider Marlin scheduling and GDN conv/prepare fusion remain disabled after
+individual measurements. This is a distinct scaled-BF16
+Marlin expert numerical policy; it is not a bitwise-equivalence claim to the
+older FP32-scale MoE backend or the unquantized official model.
+
+C++ runtime/rank-worker and 88 Python tests pass. Model gates cover five prompts
+including 8192-token input, full vocabulary logits, ten forced rejection
+prefixes, nine complete quality answers and three cancellation/deadline recovery
+paths. GPU fixtures cover local GDN/QSA state, MTP QSA graphs, output-head/argmax,
+HC finish, Marlin tails and queued P2P generations; the fused peer path also
+passes paired-graph mismatch, capture failure and reset/rebuild checks. New
+fixtures exercise graph branch ordering, direct expert reduction, explicit HC
+rounding, GDN state/snapshot parity and normalized MTP embedding gathers.
+The official launcher rechecks every segment hash and default MTP4 requests;
+HTTP content exactly matches the preceding qualified outputs. N−1 decode means
+are 172.64/174.36 tok/s and end-to-end means are 171.53/171.54 tok/s.
+
+This validates short-context decode and the tested quality/recovery paths.
+Long-output and 128K/256K performance, context-edge release gates and continuous
+load reliability still require separate validation. See the
+[follow-up report and reproducible launch](docs/native-followup-optimization-20261004.md)
+and the [preceding 162 tok/s qualification](docs/native-fast-optimization-20261004.md).
+Historical results below retain their original contracts and do not describe
+this profile.
+
+## 2026-09-09 HC candidates (GPU validation pending)
+
+Independent paired-row BF16 HC GEMV and activation fusion are opt-in via
+`Q38_CUDA_HC_GEMV` / `Q38_CUDA_HC_FUSED`. Fusion explicitly retains the
+intermediate BF16 rounding. GPU fixtures require bitwise equality with the
+existing projection plus activation kernels, including CUDA Graph replay.
+The next opt-in batch adds `Q38_CUDA_HC_GROUPED` for independent HC projections
+and `Q38_CUDA_PLE_FUSED` for single-token PLE key/value projections. Scalar GEMV
+selection is respected by the multi-projection fallback.
+Further opt-in PLE paths pair key/query norms (`Q38_CUDA_PLE_NORM_PAIR`) and
+fuse convolution with residual (`Q38_CUDA_PLE_RESIDUAL`) for decode/prefill;
+fixtures require bitwise equality of both outputs and convolution state.
+See [implementation and quality gates](docs/hc-optimization-20260909.md).
+
+## 2026-09-06 local implementation (GPU validation pending)
+
+New optimization paths and their switches are listed in [the implementation report](docs/optimization-20260906.md). macOS and Linux CPU tests pass (C++ runtime plus 63 Python tests). CUDA 12.8 on Linux ARM compiled and linked the SM80 runtime and GPU fixtures; GPU fixtures explicitly skip without hardware. Historical hardware evidence below predates these changes.
 
 ## Implemented runtime contracts
 

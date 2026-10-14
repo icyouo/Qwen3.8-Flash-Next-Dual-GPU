@@ -1,4 +1,5 @@
 #include "q38/cuda_weights.h"
+#include "q38/cuda_marlin.h"
 
 #include <cuda_runtime.h>
 
@@ -65,7 +66,7 @@ bool tiled_moe_layout_enabled() {
 }
 
 bool should_tile_moe_w4(const DeviceTensorV1& tensor) {
-    if (!tiled_moe_layout_enabled() ||
+    if (cuda_marlin_moe_enabled() || !tiled_moe_layout_enabled() ||
         tensor.format != DeviceWeightFormatV1::kW4A16SymG128 ||
         tensor.shape.size() != 3 || tensor.shape[1] % 16 != 0 ||
         tensor.shape[2] % 16 != 0)
@@ -84,6 +85,8 @@ struct CudaDeviceWeightStore::Impl {
     std::uint32_t stage = 0;
     std::byte* arena = nullptr;
     cudaStream_t stream = nullptr;
+    void* marlin_data = nullptr;
+    void* marlin_scales = nullptr;
     std::vector<StagingBuffer> staging;
     DeviceStageIndexV1 index;
     std::unordered_map<std::string, TensorPointers> tensors;
@@ -101,6 +104,10 @@ struct CudaDeviceWeightStore::Impl {
             buffer.reusable = nullptr;
             buffer.host = nullptr;
         }
+        if (marlin_data) (void)cudaFree(marlin_data);
+        if (marlin_scales) (void)cudaFree(marlin_scales);
+        marlin_data = nullptr;
+        marlin_scales = nullptr;
         if (stream) (void)cudaStreamDestroy(stream);
         if (arena) (void)cudaFree(arena);
         stream = nullptr;
@@ -203,6 +210,26 @@ struct CudaDeviceWeightStore::Impl {
                   "cudaEventRecord(weight staging initial)");
         }
 
+        // One expert matrix plus its scale vector is the high-water scratch.
+        // Repacking installs into the same arena; source artifacts stay intact.
+        std::uint64_t max_marlin_data = 0, max_marlin_scales = 0;
+        if (cuda_marlin_moe_enabled()) {
+            for (const auto& placement : placements) {
+                const auto& t = index.tensors[placement.tensor];
+                if (t.shape.size() == 3 &&
+                    (ends_with(t.name,"ffn_gate_up_exps.weight") || ends_with(t.name,"ffn_down_exps.weight"))) {
+                    if (!t.shape[0] || !t.shape[1] || !t.shape[2] || t.shape[1] % 64 || t.shape[2] % 128 ||
+                        (t.format != DeviceWeightFormatV1::kW4A16SymG128 && t.format != DeviceWeightFormatV1::kW8A16SymG128))
+                        throw std::runtime_error("unsupported Marlin tensor: " + t.name);
+                    max_marlin_data = std::max(max_marlin_data, t.data_bytes / t.shape[0]);
+                    max_marlin_scales = std::max(max_marlin_scales, t.scale_bytes / t.shape[0]);
+                }
+            }
+            if (!max_marlin_data || !max_marlin_scales)
+                throw std::runtime_error("Marlin profile requires resident expert tensors");
+            check(cudaMalloc(&marlin_data,max_marlin_data), "allocate bounded Marlin repack scratch");
+            check(cudaMalloc(&marlin_scales,max_marlin_scales), "allocate bounded Marlin scale scratch");
+        }
         std::size_t cursor = 0;
         const auto upload_extent = [&](const std::byte* host,
                                        std::byte* device,
@@ -298,13 +325,25 @@ struct CudaDeviceWeightStore::Impl {
                 upload_extent(source_view.scales,
                               arena + placement.scale_offset,
                               tensor.scale_bytes);
+            auto installed_layout = placement.layout;
+            if (cuda_marlin_moe_enabled() && tensor.shape.size()==3 &&
+                (ends_with(tensor.name,"ffn_gate_up_exps.weight") || ends_with(tensor.name,"ffn_down_exps.weight"))) {
+                const auto per_data=tensor.data_bytes/tensor.shape[0];
+                const auto per_scale=tensor.scale_bytes/tensor.shape[0];
+                const auto bits=tensor.format==DeviceWeightFormatV1::kW4A16SymG128?4u:8u;
+                for (std::uint64_t e=0;e<tensor.shape[0];++e)
+                    cuda_marlin_repack_expert(arena+placement.data_offset+e*per_data,
+                        arena+placement.scale_offset+e*per_scale,tensor.shape[1],tensor.shape[2],bits,
+                        marlin_data,marlin_scales,stream);
+                installed_layout=CudaWeightLayoutV1::kMarlinG128;
+            }
             TensorPointers pointers{
                 &tensor,
                 arena + placement.data_offset,
                 tensor.scale_bytes == 0
                     ? nullptr
                     : static_cast<const void*>(arena + placement.scale_offset),
-                placement.layout,
+                installed_layout,
             };
             if (!tensors.emplace(tensor.name, pointers).second)
                 throw std::runtime_error("duplicate CUDA tensor name");
@@ -312,6 +351,8 @@ struct CudaDeviceWeightStore::Impl {
         check(cudaStreamSynchronize(stream),
               "cudaStreamSynchronize(weight upload)");
 
+        if (marlin_data) { check(cudaFree(marlin_data), "release Marlin matrix scratch"); marlin_data=nullptr; }
+        if (marlin_scales) { check(cudaFree(marlin_scales), "release Marlin scale scratch"); marlin_scales=nullptr; }
         for (auto& buffer : staging) {
             check(cudaEventDestroy(buffer.reusable),
                   "cudaEventDestroy(weight staging)");

@@ -2,6 +2,42 @@ English | [简体中文](README.zh-CN.md)
 
 # Qwen3.8-Flash-Next-Dual-GPU
 
+> **2026-10-12 GDN cache update:** The opt-in `mtp4-native-bf16-gdn-qk-candidate` precomputes normalized Q/K into FP32 storage while preserving the existing BF16 results and recurrent accumulation order, adding about 16 MiB/GPU. Two reversed-order rounds, six real 4K requests per binary, measure **3.071→3.035s TTFT (−1.19%)**, with identical complete 409-token answers; an installed three-request confirmation remains **1.62% faster**. The gap to the previous-round 2.771s vLLM reference is about **9.53%**; vLLM was not rerun this round. See [implementation, checks, numerical limits, launch and rollback](docs/gdn-normalized-prefill-20261012.md). Earlier BF16/FP24 binaries and profiles are retained. The 27B service and mining remain stopped; the two ComfyUI services were restored after testing.
+
+> **2026-10-12 prefill repeat:** With background GPU workloads stopped, six cold-prefix 4K requests per engine measure **3.071s** for the installed BF16 runtime and **2.771s** for vLLM: a **300ms / 10.84% TTFT gap**. Two shared-expert overlap variants show no stable gain. The actual 1024-token slab passes same-BF16 full-logit checks but is **2.83% slower** in reversed-order A/B, so none of these candidates was installed. The 512-token BF16 runtime is retained. See [experiments, scope windows and evidence](docs/prefill-optimization-20261012.md).
+
+> **2026-10-12 BF16 update:** The explicit `mtp4-native-bf16-candidate` now uses **16-bit BF16** MoE communication for prefill, decode, MTP and Graph execution. Two reversed-order A/B rounds, six 4K requests per version, measure **3.420→3.067s TTFT (−10.32%)** and **1198→1335 input tokens/TTFT (+11.50%)**, leaving a **10.46% gap** to the retained earlier 2.777s vLLM reference. Answers change to 409 tokens; quality, recovery and repeated full-logit checks pass, while the existing scalar/MTP full-logit difference remains. See [measurements, numerical limits, launch and rollback](docs/bf16-transport-20261012.md). FP24 is retained; no resident inference service was started, and the 27B service and mining are stopped.
+
+> **2026-10-11 stability incident:** A later isolated MoE prefill test coincided with a Z4 whole-host reboot. That MoE candidate remains unqualified and was not installed; the earlier FP24 binary is unchanged. See [incident evidence](docs/moe-prefill-incident-20261011.md).
+
+> **2026-10-11 exact-transport update:** The opt-in `mtp4-native-prefill-fp24-candidate` preserves exact FP32-sum/BF16 results with bounded 24-bit transport and full-FP32 escape reads. Two reversed-order A/B rounds, six requests per version, measure **3.506→3.346s TTFT** and **1168→1224 tok/s prefill (+4.77%)**, with identical complete 457-token answers and full logits/quality/recovery gates. The retained same-day vLLM reference is **2.777s**, leaving a **20.51% TTFT gap**. See [measurements, qualification and launch](docs/prefill-exact-transport-20261011.md).
+
+> **2026-10-11 RSAG update:** The opt-in `mtp4-native-prefill-rsag-candidate` preserves FP32 summation and BF16 rounding while reducing MoE P2P traffic by 25%. Same-input three-repeat HTTP medians improve native TTFT **3.95→3.45s** and input/TTFT throughput **1037→1188 tok/s (+14.57%)**; complete 457-token answers, BF16/quality and recovery gates match the qualified baseline. vLLM measures **2.78s** and remains ahead. See [GPU scope distributions, evidence and launch](docs/prefill-distribution-20261011.md). Z4 NAS is now `/mnt/nas` with legacy compatibility; the 27B service stays stopped.
+
+> **2026-10-11 prefill update:** The opt-in `mtp4-native-prefill-candidate` uses bulk P2P copies for large eager reductions. Three-repeat frozen 4K medians improve prefill **864.58→990.04 tok/s (+14.51%)** and TTFT **4.75→4.14s**; decode remains about **85 tok/s**, with identical 457-token answers. Full-model BF16/token, quality and recovery gates pass. vLLM's historical 1485.51 tok/s prefill is still ahead. See [measurements, evidence and launch](docs/native-vllm-parity-20261011.md).
+
+> **2026-10-04 long-input update:** `mtp4-native-longinput` improves the frozen 4096-token request from **73.73 to 83.14 tok/s** in a paired run; final installed confirmation is **83.59 tok/s**, with the same 457 output tokens/text. Incremental tokenizer decoding and a bounded, request-owned SSE producer are included. Short web decode remains around **177–179 tok/s**; 4K TTFT remains about **4.7 seconds**. Experimental pending-terminal prefix replacement stays disabled because full-rebuild BF16 parity failed. See [validation and launch instructions](docs/native-longinput-optimization-20261004.md).
+
+> **2026-10-04 llm_speedtest check:** Exact-usage random essay requests measured **96.00–98.31 tok/s at 128 input tokens** and **80.09 tok/s at 4K**. Two host reboots interrupted the repeat matrix; the earlier web/code rates are workload-specific. Streaming include_usage is now supported. See [measurements and reboot evidence](docs/llm-speedtest-20261004.md).
+
+
+> **2026-10-04 native fixed-MTP4 fast profile:** `mtp4-native-fast` reaches official-launcher three-run mean decode rates of **172.81 / 174.70 tok/s** for web/code on dual 170HX at 200W per GPU, using the existing W4/W8 weights and RAM PLE. Six follow-up experiments retain shared-expert/P2P overlap, direct BF16 expert reduction, MoE/HC finish fusion and an MTP input cache (about 1.18 GiB extra per GPU). Full-model parity, answer-quality and cancellation-recovery gates pass. See [individual measurements, policy and rollback](docs/native-followup-optimization-20261004.md) and the [preceding 162 tok/s report](docs/native-fast-optimization-20261004.md).
+
+> **2026-10-04 fixed MTP4 register update:** `mtp4-register-candidate` reaches 81.15/81.74 tok/s for web/code with exact operator and full-model parity checks. This register candidate did not meet 160 tok/s; the fast profile above is the later implementation. See [measurements and validation](docs/native-register-optimization-20261004.md).
+
+> **2026-10-04 fixed MTP4 routing update:** `--execution-profile mtp4-route-candidate` enables exact parallel route planning and omits unused plan diagnostic hashes. Paired HTTP measurements reached 74.34/74.50 tok/s for web/code and 47.70 tok/s at 8K input, a 2.6–3.3% improvement over the existing integrated profile. See [validation, measurements and launch command](docs/native-route-optimization-20261004.md).
+
+> **2026-09-21 native TP optimization plan:** The staged program covers measurement, persistent rank workers, stream-ordered P2P, multi-row MoE/target execution, TP graphs, exact speculative state, and shape-specific kernels. See the [complete plan and implementation status](docs/native-tp-optimization-plan-20260921.md). Planned capabilities are not enabled merely by selecting TP.
+
+> **2026-09-20 Z4 TP2 update:** An opt-in eager TP2/EP runtime now serves HTTP/SSE on dual CMP 170HX. Producer-stream synchronization, reductions, multi-token slicing, and rank coordination were repaired. The native 256-step probe measured **32.43 tok/s**; TP has not surpassed the earlier PP baseline. PP remains the default. See [implementation, evidence, and launch instructions](docs/tp2-host-bounce-20260920.md).
+
+> **P2P and PLE storage update:** The TP launcher now accepts `--tp-transport host|p2p`, and both launchers accept `--ple-storage ssd|ram`. RAM mode preloads one byte-preserving PLE table shared by both TP ranks. See [measured comparisons and commands](docs/p2p-ram-20260920.md) and the [updated SM80 reference assessment](docs/reference-sm80-170hx-20260920.md).
+
+> **Fixed MTP4 integration:** `--execution-profile mtp4-candidate` selects the native W4/W8 graph configuration with GPU P2P ordering, device stage boundaries and fixed MTP4 HTTP defaults. Both `--ple-storage ram` and `ssd` remain available. See [implementation, validation and measurements](docs/native-mtp4-implementation-20260921.md).
+
+> **2026-09-06 local changes:** Additional prefill/decode optimizations are implemented but await GPU validation. Historical results below do not measure this source revision. See [implementation and validation plan](docs/optimization-20260906.md).
+
+
 A purpose-built, standalone runtime for running **Qwen3.8-Flash-Next** on two
 Ampere GPUs. The current hardware target is 2 × 64 GiB CMP 170HX (SM80), with
 no CUDA P2P requirement and as little as PCIe 2.0 x4 per card.
@@ -129,9 +165,9 @@ claim worst-case PLE locality or model-quality parity.
 #### Experimental piecewise CUDA Graph decode
 
 `--enable-piecewise-decode-graph` enables a graph lane for ordinary one-token
-decode only. Each stage captures the fixed-shape embedding/GDN/MoE/PLE-GPU/head
-work as seven static fragments and runs the six position-dependent exact-QSA
-layers eagerly between them. PLE reads and H2D staging, inter-stage transport,
+decode and one-token speculative target verification. Each stage captures the
+fixed-shape layer body as seven static fragments and runs the six position-dependent exact-QSA
+layers eagerly between them. Dynamic input/output endpoints, PLE reads and H2D staging, inter-stage transport,
 sampling, cancellation, and transaction commit/rollback stay outside capture.
 
 CUDA graph nodes retain raw state pointers, while GDN and PLE transactions
@@ -347,12 +383,20 @@ stage-owned layout for Ampere.
 | GDN recurrent and accumulator state | FP32 | protects long-sequence recurrence |
 | Vision tensors | skipped | current runtime is text-only |
 
-Only the PLE table is SSD-resident. The default host PLE cache is 8 GiB and is
-hard-bounded; the complete table is not copied into RAM or VRAM. Reads use
+In the default `--ple-storage ssd` mode, the PLE table stays on SSD. The host
+PLE cache is bounded to 8 GiB per store (one store per TP rank). Reads use
 `io_uring READ_FIXED + O_DIRECT` into registered pinned host buffers, followed
 by asynchronous host-to-device transfer. This implementation does **not** use
 GPUDirect Storage. Stage-owned weights and active model state remain on their
 respective GPUs.
+
+`--ple-storage ram --ple-ram-budget-gib 64` instead preloads all PLE payload and
+BF16 row scales into owned host memory (approximately 48.28 GiB for this artifact).
+The two TP ranks share one immutable table; their transaction state stays separate.
+The budget includes payload and scales. Preload fails if the budget or available
+host memory is insufficient, and there is no silent SSD fallback. RAM lookups do
+not read the source files after preload. The allocation is not locked against OS
+swap. RAM mode ignores the SSD page-cache capacity and does not pin the full table.
 
 The exact policy in
 [tools/q38_quant_policy.py](tools/q38_quant_policy.py) is authoritative. Its
@@ -452,8 +496,9 @@ Strict durability is the default:
 
 The launcher verifies the source commit, quantization policy, all artifact
 segments, runtime identity, stage plan, state layout, and context/sampling
-contracts before CUDA execution. Production PLE startup requires a working
+contracts before CUDA execution. Default SSD PLE startup requires a working
 `io_uring + O_DIRECT` lane and will not silently fall back to buffered I/O.
+Explicit RAM mode uses bounded full-table preload and does not require this I/O lane.
 
 For a benchmark or a client that can replay the complete canonical token
 history, disable only crash recovery:

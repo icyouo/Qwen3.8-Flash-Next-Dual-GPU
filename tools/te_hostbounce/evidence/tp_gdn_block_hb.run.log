@@ -1,0 +1,2 @@
+S3.4b baseline (real GDN) ref_mean=1.095e-02
+[S3.4b realGDN+TP+hostAR] max_abs=1.490e-07 mean_abs=1.096e-08 ref_mean=1.095e-02 PASS

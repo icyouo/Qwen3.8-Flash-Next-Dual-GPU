@@ -1,0 +1,4 @@
+This directory contains an adaptation of the Marlin MoE CUDA code from vLLM v0.12.0.
+Upstream: https://github.com/vllm-project/vllm/tree/v0.12.0/csrc/moe/marlin_moe_wna16
+License: Apache-2.0 (see LICENSE); original copyright notices remain in source files.
+Local modifications remove ATen dependencies and use bounded full-K dispatch with native expert routing.

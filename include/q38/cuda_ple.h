@@ -2,6 +2,7 @@
 #define Q38_CUDA_PLE_H
 
 #include <cstdint>
+#include "q38/cuda_prefix_snapshot.h"
 #include <memory>
 
 namespace q38 {
@@ -74,7 +75,18 @@ void cuda_ple_conv_prefill_bf16(
     std::uint16_t* output,
     std::uint32_t tokens,
     void* stream,
-    int device);
+    int device, CudaPrefixSnapshotView snapshots = {});
+
+// Same convolution/state update, followed by the original BF16-rounded
+// convolution output plus residual. No intermediate activation precision change.
+// tokens must be 1..512. Exact output==residual is supported; partial overlap
+// and overlap with other input, weight, or state buffers are rejected.
+void cuda_ple_conv_residual_bf16(
+    const std::uint16_t* gated_value,
+    const std::uint16_t* normalized_gated_value,
+    const std::uint16_t* conv_weight, std::uint16_t* conv_state,
+    const std::uint16_t* residual, std::uint16_t* output,
+    std::uint32_t tokens, void* stream, int device, CudaPrefixSnapshotView snapshots = {});
 
 bool cuda_q38_ple_compiled();
 

@@ -62,12 +62,26 @@ public:
     SamplerDecisionV1 prepare(
         const std::vector<std::uint16_t>& logits_bf16,
         const std::vector<std::int32_t>& additional_penalty_tokens = {}) const;
+    bool can_sample_compact() const {
+        return sampled() && config_.top_k > 0 &&
+               config_.repetition_penalty == 1.0f &&
+               config_.frequency_penalty == 0.0f &&
+               config_.presence_penalty == 0.0f;
+    }
+    SamplerDecisionV1 prepare_compact(
+        const std::vector<std::uint16_t>& logits_bf16,
+        const std::vector<std::int32_t>& token_ids) const;
     void commit(const SamplerDecisionV1& decision);
     void commit_tokens(const std::vector<std::int32_t>& tokens);
     void commit_token(std::int32_t token);
+    void replace_last_token(std::int32_t expected, std::int32_t replacement);
     void reset();
 
 private:
+    SamplerDecisionV1 prepare_impl(
+        const std::vector<std::uint16_t>& logits_bf16,
+        const std::vector<std::int32_t>& additional_penalty_tokens,
+        const std::vector<std::int32_t>* token_ids) const;
     std::uint32_t vocabulary_ = 0;
     SamplingConfigV1 config_{};
     SamplerStateV1 state_{};

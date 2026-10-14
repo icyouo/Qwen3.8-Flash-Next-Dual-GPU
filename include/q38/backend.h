@@ -97,6 +97,9 @@ public:
     virtual void wait_ready() const = 0;
     virtual std::uint32_t slot() const { return 0; }
     virtual std::uint64_t payload_checksum() const { return 0; }
+    // Optional same-device transport. CPU/PP leases retain the host contract.
+    virtual const std::uint16_t* device_data(int) const { return nullptr; }
+    virtual void record_device_consumer(int, void*) const {}
 };
 
 struct BoundaryBuffer {
@@ -130,6 +133,9 @@ struct StageInput {
     std::uint32_t chunk_offset = 0;
     bool final_chunk = true;
     bool need_logits = false;
+    // Optional exact top-k preselection, only without history penalties.
+    std::uint32_t compact_top_k = 0;
+    float sampling_temperature = 1.0f;
     std::shared_ptr<CancellationToken> cancellation;
 };
 
@@ -141,6 +147,10 @@ struct StageOutput {
     // Populated only for a final target step that requested transactional
     // host sampling. Greedy and intermediate prefill chunks keep this empty.
     std::vector<std::uint16_t> logits_bf16;
+    std::vector<std::int32_t> logit_token_ids;
+    // Target predictions for each supplied speculative row, in input order.
+    // CUDA TP uses these to require rank agreement before prefix publication.
+    std::vector<std::int32_t> target_predictions;
 };
 
 class StageBackend {

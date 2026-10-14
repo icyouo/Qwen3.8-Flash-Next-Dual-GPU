@@ -1,4 +1,5 @@
 #include "q38/executor.h"
+#include "q38/adaptive_mtp.h"
 
 #include "q38/mock_backend.h"
 
@@ -6,12 +7,15 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <future>
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
@@ -192,6 +196,11 @@ struct DualStageExecutor::Impl {
     void ensure_healthy() const {
         if (poisoned) throw std::runtime_error("executor is fail-closed");
     }
+    void poison_for_cancellation() {
+        if (!options.backend_cancellation_is_fatal) return;
+        if (!poisoned) cancellation_resettable = options.backend_cancellation_resettable;
+        poisoned = true;
+    }
 
     void rollback_prepared(std::uint64_t epoch) noexcept {
         ++stats.rollbacks;
@@ -207,6 +216,7 @@ struct DualStageExecutor::Impl {
         } catch (...) {
             ++stats.failures;
             poisoned = true;
+            cancellation_resettable = false;
         }
     }
 
@@ -374,6 +384,13 @@ struct DualStageExecutor::Impl {
                      options.retain_last_logits_for_diagnostics) &&
                     pending0->final_chunk &&
                     kind != TxnKind::kSpeculative;
+                if (input1.need_logits && options.enable_compact_sampling &&
+                    !options.retain_last_logits_for_diagnostics &&
+                    sampler.can_sample_compact()) {
+                    input1.compact_top_k = std::min(sampler.config().top_k,
+                                                   options.vocab_size);
+                    input1.sampling_temperature = sampler.config().temperature;
+                }
                 input1.cancellation = cancellation;
                 const auto stage1_start = std::chrono::steady_clock::now();
                 auto stage1 = worker1.submit(
@@ -452,7 +469,10 @@ struct DualStageExecutor::Impl {
                     throw std::logic_error(
                         "sampled mode requires non-speculative target decode");
                 const auto sampling_start = std::chrono::steady_clock::now();
-                sampler_decision = sampler.prepare(
+                sampler_decision = !output1.logit_token_ids.empty()
+                    ? sampler.prepare_compact(output1.logits_bf16,
+                                              output1.logit_token_ids)
+                    : sampler.prepare(
                     output1.logits_bf16,
                     kind == TxnKind::kAppendKnown
                         ? eval_tokens
@@ -566,12 +586,14 @@ struct DualStageExecutor::Impl {
         } catch (const ExecutionDeadlineExceeded&) {
             ++stats.failures;
             ++stats.deadline_exceeded;
+            poison_for_cancellation();
             if (engine.has_active_transaction()) rollback_prepared(txn.epoch);
             transaction_latency.record(elapsed_ns(transaction_start));
             throw;
         } catch (const ExecutionCancelled&) {
             ++stats.failures;
             ++stats.cancellations;
+            poison_for_cancellation();
             if (engine.has_active_transaction()) rollback_prepared(txn.epoch);
             transaction_latency.record(elapsed_ns(transaction_start));
             throw;
@@ -584,6 +606,28 @@ struct DualStageExecutor::Impl {
         }
     }
 
+    DecodeResult publish_verified(const PairResult& pair,
+                                  const std::vector<std::int32_t>& eval,
+                                  std::uint32_t draft_count) {
+        const auto accepted_drafts = pair.commit.newly_published - 1;
+        stats.accepted_draft_tokens += accepted_drafts;
+        stats.rejected_draft_tokens += draft_count - accepted_drafts;
+        stats.maximum_draft_width =
+            std::max<std::uint64_t>(stats.maximum_draft_width,
+                                    draft_count);
+
+        DecodeResult result;
+        result.commit = pair.commit;
+        for (std::uint32_t i = 1; i < pair.commit.newly_published; ++i)
+            result.published_tokens.push_back(eval.at(i));
+        result.published_tokens.push_back(pair.stage1.next_token);
+        tokens.insert(tokens.end(), result.published_tokens.begin(),
+                             result.published_tokens.end());
+        sampler.commit_tokens(result.published_tokens);
+        last_sample = pair.stage1.next_token;
+        return result;
+    }
+
     ExecutorOptions options;
     SessionTxnEngine engine;
     TransactionalSampler sampler;
@@ -594,6 +638,7 @@ struct DualStageExecutor::Impl {
     bool have_last_sample = false;
     std::optional<LogitSnapshotV1> last_logit_snapshot;
     bool poisoned = false;
+    bool cancellation_resettable = false;
     ExecutorStatsV1 stats{};
     LatencyTracker transaction_latency;
     LatencyTracker stage0_latency;
@@ -601,6 +646,8 @@ struct DualStageExecutor::Impl {
     LatencyTracker commit_latency;
     LatencyTracker draft_latency;
     LatencyTracker sampling_latency;
+    AdaptiveMtpPolicy adaptive_mtp;
+    BatchedMtpWidthPolicy batched_mtp_policy;
 };
 
 DualStageExecutor::DualStageExecutor(ExecutorOptions options,
@@ -643,6 +690,35 @@ void DualStageExecutor::append(
     impl_->sampler.commit_tokens(token_ids);
     impl_->last_sample = result.stage1.next_token;
     impl_->have_last_sample = true;
+}
+
+void DualStageExecutor::replace_pending_terminal(
+    std::uint32_t expected_canonical, std::uint32_t expected_epoch, std::int32_t expected_token,
+    std::int32_t replacement, std::shared_ptr<CancellationToken> cancellation) {
+    impl_->ensure_healthy();
+    if (cancellation) cancellation->throw_if_requested();
+    const auto& f = impl_->engine.frontiers();
+    if (impl_->sampler.sampled() || impl_->engine.has_active_transaction() ||
+        f.canonical != expected_canonical || f.epoch != expected_epoch || f.canonical - f.target != 1 ||
+        f.stage0 != f.target || f.stage1 != f.target || f.draft != f.target ||
+        impl_->tokens.size() != f.canonical || impl_->tokens.empty() ||
+        impl_->tokens.back() != expected_token ||
+        !std::binary_search(impl_->options.stop_token_ids.begin(),
+                            impl_->options.stop_token_ids.end(), expected_token))
+        throw std::invalid_argument("pending terminal replacement precondition failed");
+    if (replacement < 0 || static_cast<std::uint32_t>(replacement) >= impl_->options.vocab_size)
+        throw std::invalid_argument("replacement token is outside vocabulary");
+    // Prepare all throwing sampler work before the atomic state transition.
+    auto sampler = impl_->sampler;
+    sampler.replace_last_token(expected_token, replacement);
+    if (cancellation) cancellation->seal();
+    std::string error;
+    if (!impl_->engine.advance_pending_epoch(&error))
+        throw std::invalid_argument("pending replacement failed: " + error);
+    impl_->sampler = std::move(sampler);
+    impl_->tokens.back() = replacement;
+    impl_->last_sample = -1;
+    impl_->have_last_sample = false;
 }
 
 std::int32_t DualStageExecutor::seed_decode(
@@ -705,39 +781,140 @@ DecodeResult DualStageExecutor::speculative_step(
         throw std::length_error(
             "speculative decode would exceed the context limit");
     const auto remaining = impl_->options.context_limit - f.canonical;
-    const auto capped_draft = static_cast<std::uint32_t>(
+    const auto requested_draft = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(max_draft, remaining - 1));
-    if (capped_draft == 0) return decode_one(std::move(cancellation));
+    const auto capped_draft = impl_->options.enable_adaptive_mtp
+                                  ? (impl_->options.enable_batched_mtp
+                                         ? impl_->batched_mtp_policy.choose(requested_draft)
+                                         : impl_->adaptive_mtp.choose(requested_draft))
+                                  : requested_draft;
+    const auto batch_start = std::chrono::steady_clock::now();
+    const auto observe_batch = [&](std::uint32_t width, const DecodeResult& result) {
+        if (!impl_->options.enable_batched_mtp || !impl_->options.enable_adaptive_mtp ||
+            requested_draft == 0) return;
+        const bool stopped = std::binary_search(impl_->options.stop_token_ids.begin(),
+            impl_->options.stop_token_ids.end(), result.published_tokens.back());
+        const auto duration = elapsed_ns(batch_start);
+        impl_->batched_mtp_policy.observe(width,
+            static_cast<std::uint32_t>(result.published_tokens.size()), duration, stopped);
+        // Diagnostic only: the published count and actual selected width let
+        // offline analysis distinguish policy choices from requested caps.
+        // Keep logging outside the timed observation and off by default.
+        const char* trace = std::getenv("Q38_TP_ADAPTIVE_DIAGNOSTICS");
+        if (trace && trace[0] == '1' && trace[1] == '\0') {
+            std::ostringstream record;
+            record << "{\"type\":\"q38_tp_adaptive_observation\",\"cap\":"
+                   << requested_draft << ",\"width\":" << width
+                   << ",\"published\":" << result.published_tokens.size()
+                   << ",\"elapsed_ns\":" << duration
+                   << ",\"stopped\":" << (stopped ? "true" : "false")
+                   << ",\"observations\":" << impl_->batched_mtp_policy.observations()
+                   << "}\n";
+            std::fputs(record.str().c_str(), stderr);
+        }
+    };
+    if (capped_draft == 0) {
+        auto result = decode_one(std::move(cancellation));
+        observe_batch(0, result);
+        return result;
+    }
     const auto pending = impl_->tokens.at(f.target);
+    if (impl_->options.enable_batched_mtp) {
+        if (capped_draft + 1 > impl_->options.append_chunk_tokens)
+            throw std::length_error("MTP verification exceeds a backend workspace batch");
+        std::vector<std::int32_t> candidates;
+        try {
+            auto result = impl_->worker1.submit(
+                [pending, position = f.target, capped_draft, cancellation](StageBackend& backend) {
+                    const auto start = std::chrono::steady_clock::now();
+                    auto tokens = backend.draft(pending, position, capped_draft, cancellation);
+                    return TimedDraftOutput{std::move(tokens), elapsed_ns(start)};
+                }).get();
+            impl_->stats.draft_ns += result.execute_ns;
+            impl_->draft_latency.record(result.execute_ns);
+            candidates = std::move(result.tokens);
+            if (candidates.size() != capped_draft)
+                throw std::runtime_error("batched MTP draft backend returned a partial width");
+            for (auto token : candidates)
+                if (token < 0 || static_cast<std::uint32_t>(token) >= impl_->options.vocab_size)
+                    throw std::runtime_error("batched MTP draft outside vocabulary");
+            if (cancellation) cancellation->throw_if_requested();
+        } catch (const ExecutionDeadlineExceeded&) {
+            ++impl_->stats.failures;
+            ++impl_->stats.deadline_exceeded;
+            impl_->poison_for_cancellation();
+            throw;
+        } catch (const ExecutionCancelled&) {
+            ++impl_->stats.failures;
+            ++impl_->stats.cancellations;
+            impl_->poison_for_cancellation();
+            throw;
+        } catch (...) {
+            ++impl_->stats.failures;
+            if (impl_->options.backend_failure_is_fatal) impl_->poisoned = true;
+            throw;
+        }
+        auto result = verify_candidates(candidates, std::move(cancellation));
+        observe_batch(capped_draft, result);
+        return result;
+    }
     std::vector<std::int32_t> eval(
         static_cast<std::size_t>(capped_draft) + 1, 0);
     eval.front() = pending;
     const RetainedDraftRequest request{pending, f.target, capped_draft};
+    const auto adaptive_start = std::chrono::steady_clock::now();
+    const auto stats_before = impl_->stats;
     auto pair = impl_->run_transaction(TxnKind::kSpeculative, eval, 1,
                                        std::move(cancellation), 0, &request);
     // SessionTxnEngine guarantees a non-empty prefix bounded by the N+1 rows.
     // Do not introduce a new failure point after both backends have committed.
     const auto accepted_drafts = pair.commit.newly_published - 1;
-    impl_->stats.accepted_draft_tokens += accepted_drafts;
-    impl_->stats.rejected_draft_tokens += capped_draft - accepted_drafts;
-    impl_->stats.maximum_draft_width =
-        std::max<std::uint64_t>(impl_->stats.maximum_draft_width,
-                                capped_draft);
-
-    DecodeResult result;
-    result.commit = pair.commit;
-    for (std::uint32_t i = 1; i < pair.commit.newly_published; ++i)
-        result.published_tokens.push_back(eval.at(i));
-    result.published_tokens.push_back(pair.stage1.next_token);
-    impl_->tokens.insert(impl_->tokens.end(), result.published_tokens.begin(),
-                         result.published_tokens.end());
-    impl_->sampler.commit_tokens(result.published_tokens);
-    impl_->last_sample = pair.stage1.next_token;
+    auto result = impl_->publish_verified(pair, eval, capped_draft);
+    if (impl_->options.enable_adaptive_mtp) {
+        const bool stopped = std::binary_search(
+            impl_->options.stop_token_ids.begin(),
+            impl_->options.stop_token_ids.end(), result.published_tokens.back());
+        impl_->adaptive_mtp.observe(
+            capped_draft, accepted_drafts, stopped, elapsed_ns(adaptive_start),
+            impl_->stats.draft_ns - stats_before.draft_ns,
+            (impl_->stats.stage0_execute_ns - stats_before.stage0_execute_ns) +
+                (impl_->stats.stage1_execute_ns - stats_before.stage1_execute_ns));
+    }
     return result;
 }
 
-void DualStageExecutor::reset_session() {
+DecodeResult DualStageExecutor::verify_candidates(
+    const std::vector<std::int32_t>& candidates,
+    std::shared_ptr<CancellationToken> cancellation) {
     impl_->ensure_healthy();
+    if (cancellation) cancellation->throw_if_requested();
+    if (candidates.size() > kMaximumMtpDraftWidth)
+        throw std::invalid_argument("target verification width exceeds 64");
+    for (auto token : candidates)
+        if (token < 0 || static_cast<std::uint32_t>(token) >= impl_->options.vocab_size)
+            throw std::invalid_argument("target candidate outside vocabulary");
+    if (impl_->sampler.sampled() || candidates.empty())
+        return decode_one(std::move(cancellation));
+    const auto& f = impl_->engine.frontiers();
+    if (f.canonical - f.target != 1)
+        throw std::runtime_error("target verification requires one pending token");
+    if (f.canonical >= impl_->options.context_limit)
+        throw std::length_error("target verification exceeds context limit");
+    const auto draft_count = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        candidates.size(), impl_->options.context_limit - f.canonical - 1));
+    if (!draft_count) return decode_one(std::move(cancellation));
+    if (draft_count + 1 > impl_->options.append_chunk_tokens)
+        throw std::length_error("target verification exceeds a backend workspace batch");
+    std::vector<std::int32_t> eval{impl_->tokens.at(f.target)};
+    eval.insert(eval.end(), candidates.begin(), candidates.begin() + draft_count);
+    impl_->stats.drafted_tokens += draft_count;
+    auto pair = impl_->run_transaction(TxnKind::kSpeculative, eval, draft_count + 1,
+                                      std::move(cancellation));
+    return impl_->publish_verified(pair, eval, draft_count);
+}
+
+void DualStageExecutor::reset_session() {
+    if (!cancellation_resettable()) impl_->ensure_healthy();
     if (impl_->engine.has_active_transaction())
         throw std::logic_error("cannot reset an active executor transaction");
     try {
@@ -760,15 +937,20 @@ void DualStageExecutor::reset_session() {
     } catch (...) {
         // A reset cannot be rolled back after one device has completed it.
         impl_->poisoned = true;
+        impl_->cancellation_resettable = false;
         ++impl_->stats.failures;
         throw;
     }
     impl_->engine.reset();
     impl_->sampler.reset();
+    impl_->adaptive_mtp.reset();
+    impl_->batched_mtp_policy.reset();
     impl_->tokens.clear();
     impl_->last_sample = -1;
     impl_->have_last_sample = false;
     impl_->last_logit_snapshot.reset();
+    impl_->poisoned = false;
+    impl_->cancellation_resettable = false;
 }
 
 const SessionFrontiersV1& DualStageExecutor::frontiers() const {
@@ -848,9 +1030,15 @@ DualStageExecutor::diagnostic_logit_snapshot() const {
     return impl_->last_logit_snapshot;
 }
 
-void DualStageExecutor::fail_closed() { impl_->poisoned = true; }
+void DualStageExecutor::fail_closed() {
+    impl_->poisoned = true;
+    impl_->cancellation_resettable = false;
+}
 
 bool DualStageExecutor::poisoned() const { return impl_->poisoned; }
+bool DualStageExecutor::cancellation_resettable() const {
+    return impl_->poisoned && impl_->cancellation_resettable;
+}
 
 std::unique_ptr<DualStageExecutor> make_mock_executor(
     const ExecutorOptions& options) {

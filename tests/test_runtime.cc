@@ -1,4 +1,5 @@
 #include "q38/artifact.h"
+#include "q38/adaptive_mtp.h"
 #include "q38/contracts.h"
 #include "q38/device_artifact.h"
 #include "q38/executor.h"
@@ -6,6 +7,7 @@
 #include "q38/mapped_weights.h"
 #include "q38/mock_backend.h"
 #include "q38/ple.h"
+#include "q38/ple_prefetch.h"
 #include "q38/rpc.h"
 #include "q38/snapshot.h"
 #include "q38/transaction.h"
@@ -95,6 +97,58 @@ private:
     std::uint32_t execute_call_ = 1;
     std::uint32_t execute_calls_ = 0;
     bool failed_ = false;
+};
+
+class DraftFaultBackend final : public q38::StageBackend {
+public:
+    DraftFaultBackend(std::unique_ptr<q38::StageBackend> inner, int mode)
+        : inner_(std::move(inner)), mode_(mode) {}
+    q38::Stage stage() const override { return inner_->stage(); }
+    q38::StageOutput execute(q38::StageInput input) override { return inner_->execute(std::move(input)); }
+    std::vector<std::int32_t> draft(std::int32_t token, std::uint64_t position,
+        std::uint32_t width, std::shared_ptr<q38::CancellationToken> cancel) override {
+        auto result = inner_->draft(token, position, width, cancel);
+        if (!faulted_) {
+            faulted_ = true;
+            if (mode_ == 0) cancel->request_cancel();
+            if (mode_ == 1) throw std::runtime_error("injected draft failure");
+            if (mode_ == 2) result.pop_back();
+            if (mode_ == 3) result.front() = -1;
+            if (mode_ == 4) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return result;
+    }
+    void commit(std::uint64_t epoch, std::uint32_t count) override { inner_->commit(epoch, count); }
+    void rollback(std::uint64_t epoch) override { inner_->rollback(epoch); }
+    void reset_session() override { inner_->reset_session(); }
+private:
+    std::unique_ptr<q38::StageBackend> inner_;
+    int mode_;
+    bool faulted_ = false;
+};
+
+class CancelAfterCandidateExecuteBackend final : public q38::StageBackend {
+public:
+    explicit CancelAfterCandidateExecuteBackend(std::unique_ptr<q38::StageBackend> inner)
+        : inner_(std::move(inner)) {}
+    q38::Stage stage() const override { return inner_->stage(); }
+    q38::StageOutput execute(q38::StageInput input) override {
+        const auto cancellation = input.cancellation;
+        const bool candidate = input.txn.kind == q38::TxnKind::kSpeculative;
+        auto output = inner_->execute(std::move(input));
+        if (candidate && cancellation && !cancelled_) {
+            cancelled_ = true;
+            cancellation->request_cancel();
+        }
+        return output;
+    }
+    void commit(std::uint64_t epoch, std::uint32_t count) override {
+        inner_->commit(epoch, count);
+    }
+    void rollback(std::uint64_t epoch) override { inner_->rollback(epoch); }
+private:
+    std::unique_ptr<q38::StageBackend> inner_;
+    bool cancelled_ = false;
 };
 
 class WaitForCancellationBackend final : public q38::StageBackend {
@@ -508,6 +562,57 @@ void test_randomized_frontiers() {
     }
 }
 
+void test_pending_terminal_replacement() {
+    q38::ExecutorOptions options;
+    options.vocab_size = 1024;
+    options.context_limit = 128;
+    auto probe = q38::make_mock_executor(options);
+    probe->append({1,2,3});
+    const auto first = probe->seed_decode();
+    const auto terminal = probe->decode_one().published_tokens.back();
+    options.stop_token_ids = {terminal};
+    auto candidate = q38::make_mock_executor(options);
+    candidate->append({1,2,3});
+    CHECK(candidate->seed_decode() == first);
+    CHECK(candidate->decode_one().published_tokens.back() == terminal);
+    const auto before = candidate->frontiers();
+    const auto original = candidate->canonical_tokens();
+    auto rejected = [&](std::uint32_t count,std::uint32_t epoch,std::int32_t expected,std::int32_t replacement) {
+        bool failed = false;
+        try {candidate->replace_pending_terminal(count,epoch,expected,replacement);}
+        catch(const std::invalid_argument&){failed=true;}
+        CHECK(failed);
+        CHECK(candidate->canonical_tokens()==original);
+        CHECK(candidate->frontiers().epoch==before.epoch);
+    };
+    rejected(4,before.epoch,terminal,7);
+    rejected(5,before.epoch+1,terminal,7);
+    rejected(5,before.epoch,terminal+1,7);
+    rejected(5,before.epoch,terminal,-1);
+    auto cancel = std::make_shared<q38::CancellationToken>();
+    cancel->request_cancel();
+    bool cancelled=false;
+    try {candidate->replace_pending_terminal(5,before.epoch,terminal,7,cancel);}
+    catch(const q38::ExecutionCancelled&){cancelled=true;}
+    CHECK(cancelled);
+    CHECK(candidate->canonical_tokens()==original);
+    candidate->replace_pending_terminal(5,before.epoch,terminal,7);
+    CHECK(candidate->canonical_tokens()==std::vector<std::int32_t>({1,2,3,first,7}));
+    CHECK(candidate->frontiers().target==before.target);
+    CHECK(candidate->frontiers().draft==before.draft);
+    CHECK(candidate->frontiers().epoch==before.epoch+1);
+    bool stale_seed=false;
+    try {(void)candidate->seed_decode();}catch(const std::runtime_error&){stale_seed=true;}
+    CHECK(stale_seed);
+    candidate->append({8,9});
+    auto oracle=q38::make_mock_executor(options);
+    oracle->append({1,2,3,first,7,8,9});
+    CHECK(candidate->sampler_state().penalty_checksum==oracle->sampler_state().penalty_checksum);
+    CHECK(candidate->seed_decode()==oracle->seed_decode());
+    for(int i=0;i<4;i++)CHECK(candidate->speculative_step(4).published_tokens==oracle->speculative_step(4).published_tokens);
+    CHECK(candidate->canonical_tokens()==oracle->canonical_tokens());
+}
+
 void test_mock_executor() {
     q38::ExecutorOptions options;
     options.append_chunk_tokens = 3;
@@ -541,6 +646,234 @@ void test_mock_executor() {
         CHECK(executor->frontiers().stage1 == executor->frontiers().target);
         CHECK(executor->canonical_tokens().size() ==
               executor->frontiers().canonical);
+    }
+}
+
+void test_supplied_candidate_verification() {
+    q38::ExecutorOptions options;
+    options.hidden_width = 8;
+    options.vocab_size = 1024;
+    options.context_limit = 256;
+    const std::vector<std::int32_t> prompt{11, 12, 13};
+    auto oracle = q38::make_mock_executor(options);
+    oracle->append(prompt); (void)oracle->seed_decode();
+    std::vector<std::int32_t> continuation;
+    for (unsigned i = 0; i < 65; ++i)
+        continuation.push_back(oracle->decode_one().published_tokens.front());
+    for (unsigned width : {1u, 2u, 4u, 6u, 16u, 64u}) {
+        for (unsigned accepted = 0; accepted <= width; ++accepted) {
+            auto executor = q38::make_mock_executor(options);
+            auto reference = q38::make_mock_executor(options);
+            executor->append(prompt); (void)executor->seed_decode();
+            reference->append(prompt); (void)reference->seed_decode();
+            std::vector<std::int32_t> draft(continuation.begin(), continuation.begin() + width);
+            if (accepted < width) draft[accepted] = (draft[accepted] + 1) % options.vocab_size;
+            const auto before = executor->metrics();
+            const auto result = executor->verify_candidates(draft);
+            CHECK(result.published_tokens == std::vector<std::int32_t>(
+                continuation.begin(), continuation.begin() + accepted + 1));
+            const auto after = executor->metrics();
+            CHECK(after.stage0.execute_calls == before.stage0.execute_calls + 1);
+            CHECK(after.stage1.execute_calls == before.stage1.execute_calls + 1);
+            for (unsigned i = 0; i <= accepted; ++i) (void)reference->decode_one();
+            CHECK(executor->canonical_tokens() == reference->canonical_tokens());
+            CHECK(executor->frontiers().target == reference->frontiers().target);
+            for (unsigned i = 0; i < 3; ++i)
+                CHECK(executor->decode_one().published_tokens == reference->decode_one().published_tokens);
+        }
+    }
+    options.stop_token_ids = {continuation[2]};
+    auto stopped = q38::make_mock_executor(options);
+    stopped->append(prompt); (void)stopped->seed_decode();
+    auto result = stopped->verify_candidates(std::vector<std::int32_t>(continuation.begin(), continuation.begin() + 6));
+    CHECK(result.published_tokens == std::vector<std::int32_t>(continuation.begin(), continuation.begin() + 3));
+    options.stop_token_ids.clear();
+    options.context_limit = 5;
+    auto tail = q38::make_mock_executor(options);
+    tail->append(prompt); (void)tail->seed_decode();
+    CHECK(tail->verify_candidates({continuation[0], continuation[1]}).published_tokens.size() == 1);
+    CHECK(tail->frontiers().canonical == options.context_limit);
+    options.context_limit = 256;
+    auto cancelled = q38::make_mock_executor(options);
+    cancelled->append(prompt); (void)cancelled->seed_decode();
+    const auto before = cancelled->canonical_tokens();
+    auto cancellation = std::make_shared<q38::CancellationToken>();
+    cancellation->request_cancel();
+    bool rejected = false;
+    try { (void)cancelled->verify_candidates({continuation[0]}, cancellation); }
+    catch (const q38::ExecutionCancelled&) { rejected = true; }
+    CHECK(rejected && cancelled->canonical_tokens() == before);
+    for (const auto& invalid : {std::vector<std::int32_t>{-1}, std::vector<std::int32_t>(65, 1)}) {
+        rejected = false;
+        try { (void)cancelled->verify_candidates(invalid); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected && cancelled->canonical_tokens() == before);
+    }
+    CHECK(cancelled->verify_candidates({continuation[0]}).published_tokens.size() == 2);
+
+    options.append_chunk_tokens = 2;
+    auto bounded = q38::make_mock_executor(options);
+    bounded->append(prompt); (void)bounded->seed_decode();
+    const auto bounded_before = bounded->canonical_tokens();
+    rejected = false;
+    try { (void)bounded->verify_candidates({continuation[0], continuation[1]}); }
+    catch (const std::length_error&) { rejected = true; }
+    CHECK(rejected && bounded->canonical_tokens() == bounded_before);
+    CHECK(bounded->verify_candidates({continuation[0]}).published_tokens.size() == 2);
+
+    options.append_chunk_tokens = 512;
+    for (const auto failing_stage : {q38::Stage::kStage0, q38::Stage::kStage1}) {
+        auto backend = [&](q38::Stage stage) -> std::unique_ptr<q38::StageBackend> {
+            auto inner = std::make_unique<q38::MockStageBackend>(
+                stage, options.hidden_width, options.vocab_size);
+            if (stage == failing_stage)
+                return std::make_unique<FailOnceBackend>(std::move(inner),
+                    FailOnceBackend::Point::kExecute, 2);
+            return inner;
+        };
+        q38::DualStageExecutor failing(options, backend(q38::Stage::kStage0),
+                                      backend(q38::Stage::kStage1));
+        failing.append(prompt); (void)failing.seed_decode();
+        const auto before_failure = failing.canonical_tokens();
+        rejected = false;
+        try { (void)failing.verify_candidates({continuation[0], continuation[1]}); }
+        catch (const std::runtime_error&) { rejected = true; }
+        CHECK(rejected && !failing.poisoned());
+        CHECK(failing.canonical_tokens() == before_failure);
+        CHECK(failing.frontiers().target == prompt.size());
+        CHECK(failing.verify_candidates({continuation[0], continuation[1]}).published_tokens ==
+              std::vector<std::int32_t>(continuation.begin(), continuation.begin() + 3));
+    }
+    for (const auto cancelling_stage : {q38::Stage::kStage0, q38::Stage::kStage1}) {
+        auto backend = [&](q38::Stage stage) -> std::unique_ptr<q38::StageBackend> {
+            auto inner = std::make_unique<q38::MockStageBackend>(
+                stage, options.hidden_width, options.vocab_size);
+            if (stage == cancelling_stage)
+                return std::make_unique<CancelAfterCandidateExecuteBackend>(std::move(inner));
+            return inner;
+        };
+        q38::DualStageExecutor interrupted(options, backend(q38::Stage::kStage0),
+                                          backend(q38::Stage::kStage1));
+        interrupted.append(prompt); (void)interrupted.seed_decode();
+        const auto before_cancel = interrupted.canonical_tokens();
+        rejected = false;
+        try { (void)interrupted.verify_candidates({continuation[0], continuation[1]},
+                  std::make_shared<q38::CancellationToken>()); }
+        catch (const q38::ExecutionCancelled&) { rejected = true; }
+        CHECK(rejected && !interrupted.poisoned());
+        CHECK(interrupted.canonical_tokens() == before_cancel);
+        CHECK(interrupted.frontiers().target == prompt.size());
+        CHECK(interrupted.verify_candidates({continuation[0], continuation[1]}).published_tokens ==
+              std::vector<std::int32_t>(continuation.begin(), continuation.begin() + 3));
+    }
+}
+
+void test_batched_mtp_draft_faults() {
+    for (int mode = 0; mode < 4; ++mode) {
+        for (bool fatal : {false, true}) {
+            q38::ExecutorOptions options;
+            options.enable_batched_mtp = true;
+            options.backend_failure_is_fatal = fatal;
+            q38::DualStageExecutor executor(options,
+                std::make_unique<q38::MockStageBackend>(q38::Stage::kStage0, options.hidden_width, options.vocab_size),
+                std::make_unique<DraftFaultBackend>(std::make_unique<q38::MockStageBackend>(
+                    q38::Stage::kStage1, options.hidden_width, options.vocab_size), mode));
+            executor.append({11, 12, 13});
+            (void)executor.seed_decode();
+            const auto before = executor.metrics();
+            bool caught = false;
+            try { (void)executor.speculative_step(4, std::make_shared<q38::CancellationToken>()); }
+            catch (const std::exception&) { caught = true; }
+            CHECK(caught);
+            CHECK(executor.frontiers().canonical == before.frontiers.canonical);
+            CHECK(executor.frontiers().target == before.frontiers.target);
+            CHECK(executor.metrics().stage0.execute_calls == before.stage0.execute_calls);
+            CHECK(executor.poisoned() == (fatal && mode != 0));
+            if (!executor.poisoned()) CHECK(!executor.speculative_step(4).published_tokens.empty());
+        }
+    }
+}
+
+void test_batched_mtp_boundaries() {
+    q38::ExecutorOptions options;
+    options.enable_batched_mtp = true;
+    options.context_limit = 8;
+    options.append_chunk_tokens = 8;
+    auto oracle = q38::make_mock_executor(options);
+    oracle->append({1, 2, 3});
+    (void)oracle->seed_decode();
+    const auto stop = oracle->decode_one().published_tokens.front();
+    options.stop_token_ids = {stop};
+    auto stopped = q38::make_mock_executor(options);
+    stopped->append({1, 2, 3});
+    (void)stopped->seed_decode();
+    CHECK(stopped->speculative_step(6).published_tokens == std::vector<std::int32_t>{stop});
+    options.stop_token_ids.clear();
+    auto tail = q38::make_mock_executor(options);
+    tail->append({1, 2, 3});
+    (void)tail->seed_decode();
+    while (tail->frontiers().canonical < options.context_limit)
+        CHECK(!tail->speculative_step(6).published_tokens.empty());
+    CHECK(tail->frontiers().canonical == options.context_limit);
+    bool rejected = false;
+    try { (void)tail->speculative_step(6); } catch (const std::length_error&) { rejected = true; }
+    CHECK(rejected);
+    options.context_limit = 32;
+    options.append_chunk_tokens = 2;
+    auto bounded = q38::make_mock_executor(options);
+    bounded->append({1, 2, 3});
+    (void)bounded->seed_decode();
+    const auto before = bounded->frontiers();
+    rejected = false;
+    try { (void)bounded->speculative_step(2); } catch (const std::length_error&) { rejected = true; }
+    CHECK(rejected);
+    CHECK(bounded->frontiers().target == before.target);
+    CHECK(bounded->stats().drafted_tokens == 0);
+    auto cancel = std::make_shared<q38::CancellationToken>();
+    cancel->request_cancel();
+    rejected = false;
+    try { (void)bounded->speculative_step(1, cancel); } catch (const q38::ExecutionCancelled&) { rejected = true; }
+    CHECK(rejected);
+    CHECK(!bounded->speculative_step(1).published_tokens.empty());
+    options.sampling.mode = q38::SamplingModeV1::kTopKTopP;
+    options.sampling.top_k = 3;
+    options.vocab_size = 100;
+    auto sampled = q38::make_mock_executor(options);
+    sampled->append({1, 2, 3});
+    (void)sampled->seed_decode();
+    CHECK(sampled->speculative_step(6).published_tokens.size() == 1);
+    CHECK(sampled->stats().drafted_tokens == 0);
+    CHECK(sampled->stats().speculative_transactions == 0);
+}
+
+void test_batched_mtp_pipeline() {
+    for (const auto width : {1u, 2u, 4u, 6u}) {
+        q38::ExecutorOptions options;
+        options.append_chunk_tokens = 8;
+        options.enable_batched_mtp = true;
+        auto candidate = q38::make_mock_executor(options);
+        options.enable_batched_mtp = false;
+        auto oracle = q38::make_mock_executor(options);
+        for (int reset = 0; reset < 2; ++reset) {
+            candidate->reset_session();
+            oracle->reset_session();
+            candidate->append({31, 32, 33, 34, 35, 36, 37});
+            oracle->append({31, 32, 33, 34, 35, 36, 37});
+            CHECK(candidate->seed_decode() == oracle->seed_decode());
+            for (int step = 0; step < 128; ++step) {
+                const auto before = candidate->metrics();
+                const auto result = candidate->speculative_step(width);
+                const auto after = candidate->metrics();
+                CHECK(after.stage0.execute_calls == before.stage0.execute_calls + 1);
+                CHECK(after.stage1.execute_calls == before.stage1.execute_calls + 1);
+                CHECK(after.executor.drafted_tokens == before.executor.drafted_tokens + width);
+                CHECK(after.executor.evaluated_tokens == before.executor.evaluated_tokens + width + 1);
+                for (const auto token : result.published_tokens)
+                    CHECK(oracle->decode_one().published_tokens == std::vector<std::int32_t>{token});
+                CHECK(candidate->frontiers().target == oracle->frontiers().target);
+                CHECK(candidate->frontiers().draft == candidate->frontiers().target);
+            }
+        }
     }
 }
 
@@ -786,6 +1119,31 @@ void test_executor_context_limit() {
     }
 }
 
+void test_fixed_mtp4_full_context_contract() {
+    q38::ExecutorOptions options;
+    options.context_limit = 262144;
+    options.append_chunk_tokens = 512;
+    auto executor = q38::make_mock_executor(options);
+    executor->append(std::vector<std::int32_t>(options.context_limit - 5, 1));
+    (void)executor->seed_decode();
+    while(executor->frontiers().canonical < options.context_limit) {
+        const auto before = executor->frontiers().canonical;
+        const auto step = executor->speculative_step(4);
+        CHECK(!step.published_tokens.empty());
+        CHECK(step.published_tokens.size() <= options.context_limit - before);
+        CHECK(executor->frontiers().canonical <= options.context_limit);
+    }
+    const auto before = executor->canonical_tokens();
+    bool rejected = false;
+    try { executor->append({1}); } catch(const std::length_error&) { rejected = true; }
+    CHECK(rejected);
+    CHECK(executor->canonical_tokens() == before);
+    rejected = false;
+    try { (void)executor->speculative_step(4); } catch(const std::length_error&) { rejected = true; }
+    CHECK(rejected);
+    CHECK(executor->canonical_tokens() == before);
+}
+
 q38::ExecutorRpcRequestV1 rpc_request(
     q38::ExecutorRpcOpcodeV1 opcode, std::uint64_t request_id,
     std::uint64_t session_hash) {
@@ -794,6 +1152,63 @@ q38::ExecutorRpcRequestV1 rpc_request(
     request.header.session_hash = session_hash;
     request.header.opcode = opcode;
     return request;
+}
+
+void test_pending_terminal_replacement_rpc() {
+    q38::ExecutorOptions options;
+    options.vocab_size = 1024;
+    auto probe = q38::make_mock_executor(options);
+    probe->append({1,2,3});
+    (void)probe->seed_decode();
+    const auto terminal = probe->decode_one().published_tokens.back();
+    options.stop_token_ids = {terminal};
+    auto executor = q38::make_mock_executor(options);
+    executor->append({1,2,3});
+    (void)executor->seed_decode();
+    (void)executor->decode_one();
+    const auto before = executor->frontiers();
+    q38::ExecutorRpcServiceV1 service(executor.get(), options.session_hash);
+    auto request = rpc_request(q38::ExecutorRpcOpcodeV1::kReplacePendingTerminal, 1, options.session_hash);
+    request.tokens = {terminal,7};
+    request.header.token_count = 2;
+    request.header.payload_bytes = 8;
+    request.header.argument0 = static_cast<std::uint32_t>(before.canonical);
+    request.header.argument1 = static_cast<std::uint32_t>(before.epoch);
+    const auto first = service.handle(request);
+    CHECK(first.header.status == q38::ExecutorRpcStatusV1::kOk);
+    const auto epoch = executor->frontiers().epoch;
+    CHECK(epoch == before.epoch+1);
+    CHECK(service.handle(request).header.status == q38::ExecutorRpcStatusV1::kOk);
+    CHECK(executor->frontiers().epoch == epoch);
+    request.tokens[1] = 8;
+    CHECK(service.handle(request).header.status == q38::ExecutorRpcStatusV1::kBadRequest);
+    request.header.request_id = 2;
+    CHECK(service.handle(request).header.status == q38::ExecutorRpcStatusV1::kBadRequest);
+    CHECK(executor->frontiers().epoch == epoch);
+    CHECK(executor->canonical_tokens().back() == 7);
+}
+
+void test_candidate_verification_rpc() {
+    q38::ExecutorOptions options;
+    options.hidden_width = 8;
+    auto executor = q38::make_mock_executor(options);
+    executor->append({11, 12, 13}); (void)executor->seed_decode();
+    q38::ExecutorRpcServiceV1 service(executor.get(), options.session_hash);
+    auto request = rpc_request(q38::ExecutorRpcOpcodeV1::kVerifyCandidates, 1, options.session_hash);
+    request.tokens = {17, 18, 19};
+    request.header.token_count = 3;
+    request.header.payload_bytes = 12;
+    const auto first = service.handle(request);
+    CHECK(first.header.status == q38::ExecutorRpcStatusV1::kOk);
+    const auto frontier = executor->frontiers().canonical;
+    CHECK(service.handle(request).tokens == first.tokens);
+    CHECK(executor->frontiers().canonical == frontier);
+    request.tokens[0] = 20;
+    CHECK(service.handle(request).header.status == q38::ExecutorRpcStatusV1::kBadRequest);
+    request.header.request_id = 2;
+    request.header.argument0 = 1;
+    CHECK(service.handle(request).header.status == q38::ExecutorRpcStatusV1::kBadRequest);
+    CHECK(executor->frontiers().canonical == frontier);
 }
 
 void test_executor_rpc_service() {
@@ -1085,6 +1500,202 @@ void test_executor_rpc_cancel_and_deadline() {
     }
 }
 
+void test_fatal_cancellation_keeps_rpc_category() {
+  for (bool recover : {false, true}) {
+    for (bool deadline : {false, true}) {
+        q38::ExecutorOptions options;
+        options.enable_batched_mtp = true;
+        options.backend_failure_is_fatal = true;
+        options.backend_cancellation_is_fatal = true;
+        options.backend_cancellation_resettable = recover;
+        q38::DualStageExecutor executor(options,
+            std::make_unique<q38::MockStageBackend>(q38::Stage::kStage0, options.hidden_width, options.vocab_size),
+            std::make_unique<DraftFaultBackend>(std::make_unique<q38::MockStageBackend>(
+                q38::Stage::kStage1, options.hidden_width, options.vocab_size), deadline ? 4 : 0));
+        executor.append({1, 2, 3}); (void)executor.seed_decode();
+        const auto before = executor.frontiers();
+        q38::ExecutorRpcServiceV1 service(&executor, options.session_hash);
+        auto request = rpc_request(q38::ExecutorRpcOpcodeV1::kSpeculative, 1, options.session_hash);
+        request.header.argument0 = 1;
+        request.header.argument1 = 4;
+        if (deadline) {
+            request.header.flags = q38::kExecutorRpcFlagDeadline;
+            request.header.timeout_ms = 2;
+        }
+        auto response = service.handle(request);
+        CHECK(response.header.status == (deadline ? q38::ExecutorRpcStatusV1::kDeadlineExceeded : q38::ExecutorRpcStatusV1::kCancelled));
+        CHECK(executor.poisoned());
+        CHECK(executor.frontiers().canonical == before.canonical);
+        CHECK(executor.frontiers().target == before.target);
+        response = service.handle(rpc_request(q38::ExecutorRpcOpcodeV1::kReset, 2, options.session_hash));
+        CHECK(response.header.status == (recover ? q38::ExecutorRpcStatusV1::kOk : q38::ExecutorRpcStatusV1::kPoisoned));
+        if (recover) {
+            CHECK(!executor.poisoned());
+            executor.append({1, 2, 3});
+            (void)executor.seed_decode();
+            executor.fail_closed();
+            CHECK(!executor.cancellation_resettable());
+        }
+    }
+  }
+}
+
+void test_batched_adaptive_executor() {
+    q38::ExecutorOptions options;
+    options.enable_batched_mtp = true;
+    options.enable_adaptive_mtp = true;
+    auto candidate = q38::make_mock_executor(options);
+    options.enable_adaptive_mtp = false;
+    auto oracle = q38::make_mock_executor(options);
+    for (int reset = 0; reset < 2; ++reset) {
+        candidate->reset_session(); oracle->reset_session();
+        candidate->append({1, 2, 3}); oracle->append({1, 2, 3});
+        CHECK(candidate->seed_decode() == oracle->seed_decode());
+        for (int step = 0; step < 64; ++step) {
+            const auto before = candidate->stats().drafted_tokens;
+            const auto result = candidate->speculative_step(6);
+            if (step == 0) CHECK(candidate->stats().drafted_tokens - before == 2);
+            for (auto token : result.published_tokens)
+                CHECK(oracle->decode_one().published_tokens == std::vector<std::int32_t>{token});
+            CHECK(candidate->frontiers().target == oracle->frontiers().target);
+        }
+    }
+}
+
+void test_batched_mtp_width_policy() {
+    q38::BatchedMtpWidthPolicy policy;
+    CHECK(policy.choose(6) == 2);
+    CHECK(policy.choose(1) <= 1);
+    CHECK(policy.choose(0) == 0);
+    const std::array<std::uint64_t, 7> cost{{50, 75, 90, 0, 150, 0, 180}};
+    for (int workload = 0; workload < 3; ++workload) {
+        int selected_best = 0;
+        const auto best = workload == 0 ? 6u : workload == 1 ? 0u : 2u;
+        for (int step = 0; step < 300; ++step) {
+            const auto width = policy.choose(6);
+            CHECK(width == 0 || width == 1 || width == 2 || width == 4 || width == 6);
+            const auto published = workload == 0 ? width + 1 : workload == 1 ? 1u : std::min(width + 1, 3u);
+            policy.observe(width, published, cost[width]);
+            if (step >= 200 && width == best) ++selected_best;
+        }
+        CHECK(selected_best >= 80);
+    }
+    const auto observations = policy.observations();
+    policy.observe(3, 1, 10);
+    policy.observe(6, 8, 10);
+    policy.observe(1, 0, 10);
+    policy.observe(1, 1, 0);
+    policy.observe(1, 1, 10, true);
+    CHECK(policy.observations() == observations);
+    for (std::uint32_t cap = 0; cap <= 64; ++cap) CHECK(policy.choose(cap) <= cap);
+    policy.reset();
+    CHECK(policy.observations() == 0);
+    CHECK(policy.choose(6) == 2);
+}
+
+void test_batched_mtp_variable_acceptance_cost() {
+    q38::BatchedMtpWidthPolicy policy;
+    // Width 6 alternates one and seven publications at 70 time units per
+    // transaction: its long-run cost is 17.5 per token, beating decode's 25.
+    // Averaging per-transaction ratios instead gives (70 + 10) / 2 = 40,
+    // incorrectly preferring ordinary decode for this bursty acceptance.
+    for (int sample = 0; sample < 41; ++sample) {
+        for (const auto width : {0u, 1u, 2u, 4u, 6u}) {
+            const auto published = width == 6 ? (sample % 2 ? 7u : 1u) : 1u;
+            const auto elapsed = width == 6 ? 70u : width == 0 ? 25u : 100u;
+            policy.observe(width, published, elapsed);
+        }
+    }
+    CHECK(policy.observations() == 205);
+    CHECK(policy.choose(6) == 6);
+}
+
+void test_adaptive_mtp() {
+    q38::AdaptiveMtpPolicy policy;
+    CHECK(policy.choose(0) == 0);
+    CHECK(policy.choose(1) == 1);
+    CHECK(policy.choose(64) == 2);
+    for (int i = 0; i < 65; ++i)
+        policy.observe(4, 4, false, 10000000, 1000000, 4000000);
+    CHECK(policy.choose(4) > 1);
+    for (int i = 0; i < 129; ++i)
+        policy.observe(4, 0, false, 10000000, 9000000, 1000000);
+    CHECK(policy.choose(4) == 1);
+    CHECK(policy.choose(1) == 1);
+    const auto observations = policy.observations();
+    policy.observe(65, 1, false, 1, 1, 1);
+    CHECK(policy.observations() == observations);
+    policy.reset();
+    CHECK(policy.observations() == 0);
+
+    q38::ExecutorOptions options;
+    options.enable_adaptive_mtp = true;
+    options.context_limit = 80;
+    auto adaptive = q38::make_mock_executor(options);
+    options.enable_adaptive_mtp = false;
+    auto plain = q38::make_mock_executor(options);
+    adaptive->append({1, 2, 3});
+    plain->append({1, 2, 3});
+    CHECK(adaptive->seed_decode() == plain->seed_decode());
+    while (adaptive->frontiers().canonical < options.context_limit) {
+        const auto result = adaptive->speculative_step(4);
+        for (const auto token : result.published_tokens)
+            CHECK(plain->decode_one().published_tokens.front() == token);
+        CHECK(adaptive->canonical_tokens() == plain->canonical_tokens());
+        CHECK(adaptive->frontiers().stage0 == adaptive->frontiers().target);
+        CHECK(adaptive->frontiers().stage1 == adaptive->frontiers().target);
+    }
+    adaptive->reset_session();
+    adaptive->append({4, 5});
+    (void)adaptive->seed_decode();
+    const auto before = adaptive->stats().drafted_tokens;
+    (void)adaptive->speculative_step(4);
+    CHECK(adaptive->stats().drafted_tokens - before == 2);
+}
+
+void test_compact_sampling() {
+    auto bf16 = [](float value) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return static_cast<std::uint16_t>(bits >> 16u);
+    };
+    for (const auto top_p : {0.4f, 0.95f, 1.0f}) {
+        q38::SamplingConfigV1 config;
+        config.mode = q38::SamplingModeV1::kTopKTopP;
+        config.top_k = 3;
+        config.top_p = top_p;
+        config.temperature = 0.7f;
+        q38::TransactionalSampler full(6, config), compact(6, config);
+        const std::vector<std::uint16_t> logits{
+            bf16(-1), bf16(2), bf16(2), bf16(0), bf16(3), bf16(-4)};
+        const std::vector<std::uint16_t> selected{logits[4], logits[1], logits[2]};
+        const std::vector<std::int32_t> ids{4, 1, 2};
+        for (int step = 0; step < 128; ++step) {
+            const auto a = full.prepare(logits, {1, 1, 4});
+            const auto b = compact.prepare_compact(selected, ids);
+            CHECK(a.token == b.token);
+            CHECK(a.rng_before == b.rng_before && a.rng_after == b.rng_after);
+            const auto retry = compact.prepare_compact(selected, ids);
+            CHECK(retry.token == b.token && retry.rng_before == b.rng_before);
+            full.commit(a);
+            compact.commit(b);
+            full.commit_token(a.token);
+            compact.commit_token(b.token);
+        }
+        bool rejected = false;
+        try { (void)compact.prepare_compact(selected, {4, 1, 1}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected);
+        config.presence_penalty = 0.1f;
+        q38::TransactionalSampler penalized(6, config);
+        CHECK(!penalized.can_sample_compact());
+        rejected = false;
+        try { (void)penalized.prepare_compact(selected, ids); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected);
+    }
+}
+
 void test_transactional_sampling() {
     const auto bf16 = [](float value) {
         std::uint32_t bits = 0;
@@ -1132,6 +1743,12 @@ void test_transactional_sampling() {
     CHECK(executor->sampler_state().canonical_tokens == 7);
     (void)executor->speculative_step(4);
     CHECK(executor->sampler_state().sampled_tokens == 3);
+    CHECK(executor->stats().speculative_transactions == 0);
+    CHECK(executor->stats().drafted_tokens == 0);
+    const auto sampling_before = executor->sampler_state().sampled_tokens;
+    const auto target_only = executor->verify_candidates({1, 2, 3, 4});
+    CHECK(target_only.published_tokens.size() == 1);
+    CHECK(executor->sampler_state().sampled_tokens == sampling_before + 1);
     CHECK(executor->stats().speculative_transactions == 0);
     CHECK(executor->stats().drafted_tokens == 0);
 }
@@ -1568,6 +2185,25 @@ void test_ple_layout_hash_and_store() {
     }
     const auto layout = q38::load_ple_layout(layout_path);
     q38::PleHashState hash(layout.hash);
+    {
+        auto config = layout.hash;
+        for (std::uint32_t head = 0; head < q38::kPleHeads; ++head)
+            config.head_vocab_sizes[head] = 97 + 2 * head;
+        q38::PleHashState batched(config), appended(config);
+        for (const auto& tokens : {std::vector<std::int32_t>{1, 2, 31, 4, 5},
+                                   std::vector<std::int32_t>{31, 31, 7, 8, 9}}) {
+            std::vector<std::uint64_t> planned;
+            planned.reserve(tokens.size() * q38::kPleHeads);
+            for (const auto token : tokens) appended.append_rows(token, planned);
+            CHECK(planned == batched.rows(tokens));
+        }
+        std::vector<std::uint64_t> unchanged{17};
+        bool rejected = false;
+        try { appended.append_rows(-1, unchanged); }
+        catch (const std::runtime_error&) { rejected = true; }
+        CHECK(rejected && unchanged == std::vector<std::uint64_t>{17});
+        CHECK(appended.rows({10}) == batched.rows({10}));
+    }
     const auto rows = hash.rows({1, 2});
     CHECK(rows.size() == 32);
     for (std::uint32_t head = 0; head < q38::kPleHeads; ++head) {
@@ -1608,6 +2244,38 @@ void test_ple_layout_hash_and_store() {
     CHECK(stats.unique_page_requests == 6);
     CHECK(stats.useful_bytes == 8);
     CHECK(stats.scale_resident_bytes == 0);
+    {
+        q38::PleStoreOptionsV1 options;
+        options.io_mode = q38::PleIoModeV1::kRam;
+        options.ram_budget_bytes = 31;
+        bool rejected = false;
+        try { q38::PleStore too_small(layout, options); }
+        catch (const std::runtime_error&) { rejected = true; }
+        CHECK(rejected);
+        options.ram_budget_bytes = 32;
+        options.cache_bytes = 1ull << 30u; // RAM must not also allocate an LRU.
+        q38::PleStore memory(layout, options);
+        const std::vector<std::uint64_t> rows{15, 0, 7, 7, 1};
+        const auto expected = store.read_rows(rows);
+        CHECK(memory.read_rows(rows) == expected);
+        const auto before = memory.cache_stats();
+        CHECK(before.ram_enabled == 1);
+        CHECK(before.ram_resident_bytes == 32);
+        CHECK(before.resident_bytes == 0 && before.capacity_bytes == 0);
+        CHECK(before.io_uring_enabled == 0 && before.direct_io_enabled == 0);
+        // A file-backed mapping or filesystem fallback would now fail/change.
+        { std::ofstream truncate(data_path, std::ios::binary | std::ios::trunc); }
+        CHECK(memory.read_rows(rows) == expected);
+        CHECK(memory.read_row(5) == row);
+        CHECK(memory.read_rows({}).empty());
+        CHECK(memory.cache_stats().physical_read_bytes == before.physical_read_bytes);
+        CHECK(memory.cache_stats().read_operations == before.read_operations);
+        std::array<std::uint8_t,4> untouched{91,92,93,94};
+        bool invalid = false;
+        try { memory.read_rows_into({0,16},untouched.data(),untouched.size()); }
+        catch (const std::runtime_error&) { invalid = true; }
+        CHECK(invalid && untouched[0] == 91 && untouched[3] == 94);
+    }
     std::remove(layout_path.c_str());
     std::remove(data_path.c_str());
 
@@ -1642,6 +2310,75 @@ void test_ple_layout_hash_and_store() {
     CHECK(row_scales[1] == 0x3f8f);
     const auto scaled_stats = scaled_store.cache_stats();
     CHECK(scaled_stats.scale_resident_bytes == 32);
+    {
+        auto shared_store = std::make_shared<q38::PleStore>(
+            q38::load_ple_layout(scaled_layout_path), 16, 16);
+        q38::PleAsyncReader reader(shared_store, 5);
+        auto requested = std::make_shared<std::vector<std::uint64_t>>();
+        for (std::uint64_t i = 0; i < 37; ++i) requested->push_back(i % 16);
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            reader.submit(requested);
+            bool out_of_order = false;
+            std::uint8_t invalid_value = 0;
+            std::uint16_t invalid_scale = 0;
+            try { reader.take(1, 1, &invalid_value, 1, &invalid_scale, 1); }
+            catch (const std::invalid_argument&) { out_of_order = true; }
+            CHECK(out_of_order);
+            std::size_t first = 0;
+            for (const std::size_t count : {1u, 7u, 2u, 17u, 10u}) {
+                std::vector<std::uint8_t> values(count);
+                std::vector<std::uint16_t> scales(count);
+                reader.take(first, count, values.data(), count, scales.data(), count);
+                for (std::size_t i = 0; i < count; ++i) {
+                    CHECK(values[i] == (first + i) % 16);
+                    CHECK(scales[i] == 0x3f80 + (first + i) % 16);
+                }
+                first += count;
+            }
+            reader.submit(requested);
+            reader.cancel(); // producer may be blocked on its two-tile bound
+            auto invalid_rows = std::make_shared<std::vector<std::uint64_t>>(1, 9999);
+            reader.submit(invalid_rows);
+            bool read_failed = false;
+            try { reader.take(0, 1, &invalid_value, 1, &invalid_scale, 1); }
+            catch (const std::exception&) { read_failed = true; }
+            CHECK(read_failed);
+            reader.cancel();
+        }
+    }
+    {
+        q38::PleStoreOptionsV1 options;
+        options.io_mode = q38::PleIoModeV1::kRam;
+        options.ram_budget_bytes = 48;
+        auto memory = std::make_shared<q38::PleStore>(scaled_layout, options);
+        const auto expected = scaled_store.read_rows({0,15,7});
+        { std::ofstream truncate(scaled_data_path, std::ios::binary | std::ios::trunc); }
+        std::thread readers[2];
+        std::exception_ptr errors[2];
+        for(int r=0;r<2;++r) readers[r]=std::thread([&,r] {
+            try {
+                for(int i=0;i<20;++i) {
+                    CHECK(memory->read_rows({0,15,7}) == expected);
+                    std::uint16_t scales[3]{};
+                    memory->read_row_scales_into({0,15,7},scales,3);
+                    CHECK(scales[0]==0x3f80 && scales[1]==0x3f8f && scales[2]==0x3f87);
+                }
+            } catch (...) { errors[r]=std::current_exception(); }
+        });
+        for(auto& reader:readers) reader.join();
+        for(auto error:errors) if(error) std::rethrow_exception(error);
+        CHECK(memory->cache_stats().ram_resident_bytes == 16);
+        CHECK(memory->cache_stats().scale_resident_bytes == 32);
+        CHECK(memory->cache_stats().physical_read_bytes == 48);
+        CHECK(memory->cache_stats().requested_rows == 120);
+        q38::PleAsyncReader reader(memory, 2);
+        auto rows = std::make_shared<std::vector<std::uint64_t>>(std::initializer_list<std::uint64_t>{0,15,7});
+        reader.submit(rows);
+        std::uint8_t values[3]{}; std::uint16_t scales[3]{};
+        reader.take(0,3,values,3,scales,3);
+        CHECK(values[0]==0 && values[1]==15 && values[2]==7);
+        CHECK(scales[2]==0x3f87);
+    }
     std::remove(scaled_layout_path.c_str());
     std::remove(scaled_data_path.c_str());
 
@@ -1702,16 +2439,30 @@ int main() {
     test_shortens_only_unacknowledged_speculation();
     test_randomized_frontiers();
     test_mock_executor();
+    test_pending_terminal_replacement();
+    test_pending_terminal_replacement_rpc();
+    test_supplied_candidate_verification();
+    test_candidate_verification_rpc();
+    test_batched_mtp_boundaries();
+    test_batched_mtp_draft_faults();
+    test_batched_mtp_pipeline();
     test_width_one_speculative_pipeline();
     test_width_n_speculative_pipeline();
     test_retained_draft_cancellation_rolls_back_transaction();
     test_retained_draft_overlaps_first_stage0_row();
     test_speculative_stop_token_is_transactionally_truncated();
     test_executor_context_limit();
+    test_fixed_mtp4_full_context_contract();
     test_executor_rpc_service();
     test_executor_rpc_logit_diagnostics();
     test_executor_rpc_cancel_and_deadline();
     test_transactional_sampling();
+    test_fatal_cancellation_keeps_rpc_category();
+    test_batched_adaptive_executor();
+    test_batched_mtp_width_policy();
+    test_batched_mtp_variable_acceptance_cost();
+    test_adaptive_mtp();
+    test_compact_sampling();
     test_session_identity_contract();
     test_append_only_snapshot_journal();
     test_metrics_schema();

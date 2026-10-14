@@ -1,0 +1,7 @@
+OK reconstruct stage0 row_shard blk.0.ffn_gate_shexp.weight (1638400 B)
+OK reconstruct stage0 row_shard blk.0.ffn_up_shexp.weight (1638400 B)
+OK reconstruct stage0 row_shard blk.0.hc_attn.inject.weight (81920 B)
+OK reconstruct stage1 row_shard blk.25.ffn_gate_shexp.weight (1638400 B)
+OK reconstruct stage1 row_shard blk.25.ffn_up_shexp.weight (1638400 B)
+OK reconstruct stage1 row_shard blk.25.hc_attn.inject.weight (81920 B)
+PASS tp2_artifact_smoke

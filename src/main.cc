@@ -104,7 +104,11 @@ int main(int argc, char** argv) {
         } else if (arg == "--stop-token-id" && i + 1 < argc) {
             options.stop_token_ids.push_back(
                 static_cast<std::int32_t>(std::stol(argv[++i])));
-        } else if (arg == "--enable-logit-diagnostics") {
+        } else if (arg == "--enable-adaptive-mtp")
+            options.enable_adaptive_mtp = true;
+        else if (arg == "--enable-compact-sampling")
+            options.enable_compact_sampling = true;
+        else if (arg == "--enable-logit-diagnostics") {
             enable_logit_diagnostics = true;
             options.retain_last_logits_for_diagnostics = true;
         } else {
@@ -112,7 +116,7 @@ int main(int argc, char** argv) {
                          "--stage1-index FILE] [--ple-layout FILE] [--chunk N] "
                          "[--identity FILE] [--sampling greedy|top-k-top-p] "
                          "[--snapshot-journal FILE] [--stop-token-id N] "
-                         "[--enable-logit-diagnostics] "
+                         "[--enable-logit-diagnostics] [--enable-adaptive-mtp] [--enable-compact-sampling] "
                          "[sampling options]\n";
             return 2;
         }

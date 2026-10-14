@@ -50,6 +50,8 @@ bool valid_opcode(ExecutorRpcOpcodeV1 opcode) {
     case ExecutorRpcOpcodeV1::kSeed:
     case ExecutorRpcOpcodeV1::kDecode:
     case ExecutorRpcOpcodeV1::kSpeculative:
+    case ExecutorRpcOpcodeV1::kVerifyCandidates:
+    case ExecutorRpcOpcodeV1::kReplacePendingTerminal:
     case ExecutorRpcOpcodeV1::kStats:
     case ExecutorRpcOpcodeV1::kCancel:
     case ExecutorRpcOpcodeV1::kReset:
@@ -66,6 +68,8 @@ bool is_writer_opcode(ExecutorRpcOpcodeV1 opcode) {
            opcode == ExecutorRpcOpcodeV1::kSeed ||
            opcode == ExecutorRpcOpcodeV1::kDecode ||
            opcode == ExecutorRpcOpcodeV1::kSpeculative ||
+           opcode == ExecutorRpcOpcodeV1::kVerifyCandidates ||
+           opcode == ExecutorRpcOpcodeV1::kReplacePendingTerminal ||
            opcode == ExecutorRpcOpcodeV1::kReset;
 }
 
@@ -330,6 +334,10 @@ bool validate_executor_rpc_request(const ExecutorRpcRequestV1& request,
         return fail(error, "executor RPC payload byte count is invalid");
 
     switch (header.opcode) {
+    case ExecutorRpcOpcodeV1::kReplacePendingTerminal:
+        if (request.tokens.size() != 2 || header.argument0 == 0)
+            return fail(error, "pending terminal replacement RPC arguments are invalid");
+        break;
     case ExecutorRpcOpcodeV1::kAppend:
         if (request.tokens.empty())
             return fail(error, "append RPC requires tokens");
@@ -348,6 +356,11 @@ bool validate_executor_rpc_request(const ExecutorRpcRequestV1& request,
             header.argument1 == 0 ||
             header.argument1 > kMaximumMtpDraftWidth)
             return fail(error, "speculative RPC arguments are invalid");
+        break;
+    case ExecutorRpcOpcodeV1::kVerifyCandidates:
+        if (request.tokens.size() > kMaximumMtpDraftWidth ||
+            header.argument0 != 0 || header.argument1 != 0)
+            return fail(error, "candidate verification RPC arguments are invalid");
         break;
     case ExecutorRpcOpcodeV1::kLogits:
         if (!request.tokens.empty() || header.argument0 > 1 ||
@@ -491,7 +504,9 @@ ExecutorRpcResponseV1 ExecutorRpcServiceV1::handle(
                     return response;
                 }
                 state.highest_writer_request_id = request.header.request_id;
-                if (state.published_poisoned) {
+                if (state.published_poisoned &&
+                    !(request.header.opcode == ExecutorRpcOpcodeV1::kReset &&
+                      state.executor->cancellation_resettable())) {
                     response.header.status = ExecutorRpcStatusV1::kPoisoned;
                     response.message = "executor is fail-closed";
                     execute = false;
@@ -526,6 +541,11 @@ ExecutorRpcResponseV1 ExecutorRpcServiceV1::handle(
                         response.tokens = std::move(result.published_tokens);
                         break;
                     }
+                    case ExecutorRpcOpcodeV1::kVerifyCandidates: {
+                        auto result = state.executor->verify_candidates(request.tokens, cancellation);
+                        response.tokens = std::move(result.published_tokens);
+                        break;
+                    }
                     case ExecutorRpcOpcodeV1::kReset:
                         // Session reset is the commit point: after either
                         // backend starts clearing state it cannot be cancelled
@@ -534,6 +554,11 @@ ExecutorRpcResponseV1 ExecutorRpcServiceV1::handle(
                         cancellation->seal();
                         state.executor->reset_session();
                         response.message = "session state reset";
+                        break;
+                    case ExecutorRpcOpcodeV1::kReplacePendingTerminal:
+                        state.executor->replace_pending_terminal(request.header.argument0,
+                            request.header.argument1, request.tokens[0], request.tokens[1], cancellation);
+                        response.message = "unprocessed terminal replaced";
                         break;
                     default:
                         throw std::logic_error(

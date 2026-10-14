@@ -121,6 +121,8 @@ void PleStage0Backend::reset_session() {
 StageBackendMetricsV1 PleStage0Backend::metrics() const {
     auto result = inner_->metrics();
     const auto cache = store_->cache_stats();
+    result.ple_ram_enabled = cache.ram_enabled;
+    result.ple_ram_resident_bytes = cache.ram_resident_bytes;
     result.ple_cache_hits = cache.hits;
     result.ple_cache_misses = cache.misses;
     result.ple_cache_evictions = cache.evictions;

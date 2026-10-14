@@ -14,6 +14,10 @@ constexpr std::uint32_t kQ38MmqM = 16;
 constexpr std::uint32_t kQ38PrefillSlabMaxTokens = 512;
 constexpr std::uint32_t kQ38RoutePlanMagicV1 = 0x52383351u;  // "Q38R"
 constexpr std::uint32_t kQ38RoutePlanVersionV1 = 1;
+constexpr std::uint32_t kQ38RouteUnownedAssignment = UINT32_MAX;
+constexpr std::uint32_t kQ38RoutePlanAllowUnowned = 1;
+// A runtime-only plan may omit diagnostic hashes; offsets/tasks remain exact.
+constexpr std::uint32_t kQ38RoutePlanHashesOmitted = 2;
 
 enum class Q38RoutePlanStatusV1 : std::uint32_t {
     kOk = 0,
@@ -67,6 +71,7 @@ struct Q38PrefillMoeWorkspaceV1 {
 enum class Q38PrefillMoeModeV1 : std::uint32_t {
     kGroupedMmq = 1,
     kGroupedMmqSafe = 2,
+    kGroupedFp32Scales = 3,
     kLegacyAtomicDiagnostic = 3,
 };
 
@@ -101,7 +106,10 @@ Q38RoutePlanStorageV1 cuda_moe_route_plan_storage_v1(
 void cuda_moe_build_route_plan_v1(const std::int32_t* expert_ids,
                                   std::uint32_t tokens,
                                   Q38RoutePlanStorageV1 plan, void* stream,
-                                  int device);
+                                  int device,
+                                  std::uint32_t local_experts = kQ38RouteExperts,
+                                  bool allow_unowned = false,
+                                  bool compute_hashes = true);
 
 void cuda_moe_pack_hidden_v1(const std::uint16_t* hidden,
                              const std::uint32_t* packed_assignment,
@@ -115,7 +123,8 @@ void cuda_moe_grouped_gate_up_v1(
     const std::uint32_t* packed_assignment,
     const float* token_rank_weights, const Q38ExpertMmqTaskV1* tasks,
     std::uint32_t task_count, std::uint16_t* weighted_mid,
-    Q38PrefillMoeModeV1 mode, void* stream, int device);
+    Q38PrefillMoeModeV1 mode, void* stream, int device,
+    bool apply_route_weights = true);
 
 void cuda_moe_grouped_down_v1(const CudaTensorViewV1& down_experts,
                               const std::uint16_t* weighted_mid,
@@ -129,6 +138,14 @@ void cuda_moe_reduce_top10_and_combine_shared_v1(
     const std::uint32_t* assignment_to_packed,
     const std::uint16_t* shared_output, const std::uint16_t* shared_gate,
     std::uint32_t tokens, std::uint16_t* output, void* stream, int device);
+
+// Undo this rank's expert packing before a cross-rank reduction. Missing
+// (-1) routes contribute exactly zero; output is token-major FP32 and is
+// rounded only after the rank sum, matching the TP decode boundary.
+void cuda_moe_reduce_top10_f32_v1(
+    const float* route_output, const std::uint32_t* assignment_to_packed,
+    std::uint32_t tokens, float* output, void* stream, int device,
+    const float* route_weights = nullptr);
 
 bool cuda_q38_moe_prefill_compiled();
 

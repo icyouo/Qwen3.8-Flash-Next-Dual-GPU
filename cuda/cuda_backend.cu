@@ -1,10 +1,16 @@
+#include "q38/cuda_te_graph.h"
 #include "q38/cuda_backend.h"
+#include "q38/cuda_te.h"
+#include "q38/cuda_sampling.h"
+#include "q38/cuda_padded_gemm.h"
+#include "q38/ple_prefetch.h"
 
 #include "q38/cuda_gdn.h"
 #include "q38/cuda_hyper.h"
 #include "q38/cuda_kernels.h"
 #include "q38/cuda_moe.h"
 #include "q38/cuda_moe_prefill.h"
+#include "q38/cuda_marlin.h"
 #include "q38/cuda_ple.h"
 #include "q38/cuda_qsa.h"
 #include "q38/cuda_transport.h"
@@ -12,11 +18,15 @@
 #include "q38/production_contract.h"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cublas_v2.h>
 
 #include <algorithm>
+#include <map>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -24,6 +34,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -45,10 +56,87 @@ constexpr std::uint32_t kCut = kQ38ProductionCut;
 constexpr std::uint32_t kPrefillTile = kQ38PrefillSlabMaxTokens;
 constexpr std::uint32_t kSmallBoundaryTokens = 128;
 
+__global__ void te_remap_experts_kernel(std::int32_t* ids, float* weights,
+                                        std::size_t count, int base, int local) {
+    const auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int id = ids[i] - base;
+    ids[i] = id >= 0 && id < local ? id : -1;
+    if (ids[i] < 0) weights[i] = 0.0f;
+}
+
+__global__ void te_round_f32_bf16_kernel(const float* input, std::uint16_t* output,
+                                        std::size_t count) {
+    const auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) reinterpret_cast<__nv_bfloat16*>(output)[i] = __float2bfloat16_rn(input[i]);
+}
+
+__global__ void head_candidate_kernel(const std::uint16_t* logits,const std::int32_t* local_ids,
+    std::uint16_t* candidates,unsigned rows,unsigned tokens,unsigned rank){
+    const unsigned row=threadIdx.x;if(row>=tokens)return;const unsigned local=local_ids[row],id=rank*rows+local;
+    candidates[row*4]=logits[static_cast<std::uint64_t>(row)*rows+local];candidates[row*4+1]=id&65535u;candidates[row*4+2]=id>>16;candidates[row*4+3]=0;
+}
+__global__ void head_choose_kernel(const std::uint16_t* candidates,std::int32_t* output,unsigned tokens){
+    const unsigned row=threadIdx.x;if(row>=tokens)return;const auto* c=candidates+row*8;
+    const unsigned a=c[1]|(unsigned(c[2])<<16),b=c[5]|(unsigned(c[6])<<16);
+    const float av=__bfloat162float(__ushort_as_bfloat16(c[0])),bv=__bfloat162float(__ushort_as_bfloat16(c[4]));output[row]=bv>av||(bv==av&&b<a)?b:a;
+}
+
+inline int te_bridge_group_for(const CudaStageBackendOptions& opt) {
+    return opt.stage == Stage::kStage1 ? 1 : 0;
+}
+
+inline float te_bf16_to_float(std::uint16_t bits) {
+    const std::uint32_t bits32 = static_cast<std::uint32_t>(bits) << 16;
+    float out;
+    std::memcpy(&out, &bits32, sizeof(out));
+    return out;
+}
+inline void te_debug_probe_bf16(const char* tag, int rank, const std::uint16_t* device_ptr,
+                                cudaStream_t stream) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("Q38_TE_DEBUG");
+        return v && v[0] && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
+    }();
+    if (!enabled) return;
+    if (!device_ptr) return;
+    std::uint16_t bits = 0;
+    if (cudaMemcpyAsync(&bits, device_ptr, sizeof(bits), cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess)
+        return;
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return;
+    std::fprintf(stderr, "te-probe rank=%d %s bits=0x%04x value=%g\n",
+                 rank, tag, bits, te_bf16_to_float(bits));
+    std::fflush(stderr);
+}
+
 bool profile_requested(const char* name) {
     const char* value = std::getenv(name);
     return value && std::strcmp(value, "0") != 0 &&
            std::strcmp(value, "false") != 0;
+}
+
+std::uint32_t bounded_setting(const char* name, std::uint32_t fallback,
+                              std::uint32_t maximum) {
+    const char* value = std::getenv(name);
+    if (!value) return fallback;
+    char* end = nullptr;
+    const auto parsed = std::strtoul(value, &end, 10);
+    if (value == end || *end != '\0' || parsed == 0 || parsed > maximum)
+        throw std::invalid_argument(std::string("invalid ") + name);
+    return static_cast<std::uint32_t>(parsed);
+}
+std::uint32_t prefill_tile_tokens() {
+    static const auto value = bounded_setting("Q38_CUDA_PREFILL_TILE", 512, 512);
+    return value;
+}
+std::uint32_t ple_io_tile_tokens() {
+    static const auto value = bounded_setting("Q38_PLE_IO_TILE", 512, 4096);
+    return value;
+}
+std::uint32_t prefill_sync_tiles() {
+    static const auto value = bounded_setting("Q38_CUDA_PREFILL_SYNC_TILES", 1, 8);
+    return value;
 }
 
 bool grouped_qsa_prefill_enabled() {
@@ -124,16 +212,28 @@ void check_cublas(cublasStatus_t status, const char* operation) {
                                  std::to_string(static_cast<int>(status)));
 }
 
+__global__ void graph_clock_marker(std::uint64_t* timestamp) {
+    std::uint64_t value;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+    *timestamp = value;
+}
+
 // Opt-in event profiling for real-model batch-1 decode.  It has no CUDA
 // events, records, synchronization, or logging cost unless explicitly enabled.
 // Repeated labels are aggregated across all layers owned by the stage.
 class CudaEventProfile {
 public:
-    CudaEventProfile(int value_device, std::string value_type)
-        : device_(value_device), type_(std::move(value_type)) {}
+    CudaEventProfile(int value_device, std::string value_type, bool external = false)
+        : device_(value_device), type_(std::move(value_type)), external_(external) {
+        if (external_) {
+            check(cudaSetDevice(device_), "select graph clock device");
+            check(cudaMalloc(reinterpret_cast<void**>(&device_clocks_), clock_capacity_ * sizeof(std::uint64_t)), "allocate graph clock markers");
+        }
+    }
     ~CudaEventProfile() {
         (void)cudaSetDevice(device_);
         for (auto event : events_) (void)cudaEventDestroy(event);
+        if (device_clocks_) (void)cudaFree(device_clocks_);
     }
 
     CudaEventProfile(const CudaEventProfile&) = delete;
@@ -152,15 +252,22 @@ public:
         record(stream);
     }
 
-    void finish(Stage stage, std::uint64_t position, cudaStream_t stream) {
+    void finish(Stage stage, std::uint64_t position, cudaStream_t stream,
+                std::uint32_t tokens = 1, bool reusable = false) {
         if (!active_) return;
         check(cudaStreamSynchronize(stream),
               "cudaStreamSynchronize(decode profile)");
+        std::vector<std::uint64_t> clocks;
+        if (external_) {
+            clocks.resize(event_count_);
+            check(cudaMemcpy(clocks.data(), device_clocks_, event_count_*sizeof(std::uint64_t), cudaMemcpyDeviceToHost), "read graph clock markers");
+        }
         std::vector<std::pair<std::string, double>> totals;
         double total_ms = 0.0;
         for (std::size_t index = 0; index < labels_.size(); ++index) {
             float elapsed_ms = 0.0f;
-            check(cudaEventElapsedTime(&elapsed_ms, events_[index],
+            if (external_) elapsed_ms = static_cast<float>(clocks[index+1]-clocks[index]) * 1.0e-6f;
+            else check(cudaEventElapsedTime(&elapsed_ms, events_[index],
                                        events_[index + 1]),
                   "cudaEventElapsedTime(decode profile)");
             total_ms += elapsed_ms;
@@ -173,36 +280,64 @@ public:
             else
                 found->second += elapsed_ms;
         }
-        std::cerr << "{\"type\":\"q38_cuda_" << type_
+        std::ostringstream record;
+        record << "{\"type\":\"q38_cuda_" << type_
                   << "_profile\",\"stage\":"
-                  << static_cast<unsigned>(stage) << ",\"position\":"
+                  << static_cast<unsigned>(stage) << ",\"device\":" << device_
+                  << ",\"tokens\":" << tokens << ",\"position\":"
                   << position << ",\"total_ms\":" << total_ms
                   << ",\"categories_ms\":{";
         for (std::size_t index = 0; index < totals.size(); ++index) {
-            if (index) std::cerr << ',';
-            std::cerr << '\"' << totals[index].first << "\":"
+            if (index) record << ',';
+            record << '\"' << totals[index].first << "\":"
                       << totals[index].second;
         }
-        std::cerr << "}}\n";
-        active_ = false;
+        record << "}";
+        if (external_ && type_ == "prefill" &&
+            profile_requested("Q38_CUDA_PROFILE_PREFILL_TIMELINE")) {
+            record << ",\"intervals_ns\":[";
+            for (std::size_t index = 0; index < labels_.size(); ++index) {
+                if (index) record << ',';
+                record << "{\"label\":\"" << labels_[index]
+                       << "\",\"start_ns\":" << clocks[index]
+                       << ",\"end_ns\":" << clocks[index + 1] << '}';
+            }
+            record << ']';
+        }
+        record << "}\n";
+        // Rank threads finish together. Publish each JSON record atomically
+        // through stdio rather than interleaving individual stream inserts.
+        std::fputs(record.str().c_str(), stderr);
+        std::fflush(stderr);
+        active_ = reusable;
     }
 
     bool active() const { return active_; }
 
 private:
     void record(cudaStream_t stream) {
+        if (external_) {
+            if (event_count_ >= clock_capacity_) throw std::runtime_error("graph clock marker capacity exceeded");
+            graph_clock_marker<<<1,1,0,stream>>>(device_clocks_ + event_count_++);
+            check(cudaPeekAtLastError(), "graph clock marker");
+            return;
+        }
         if (event_count_ == events_.size()) {
             cudaEvent_t event = nullptr;
             check(cudaEventCreate(&event),
                   "cudaEventCreate(decode profile)");
             events_.push_back(event);
         }
-        check(cudaEventRecord(events_[event_count_++], stream),
+        check(cudaEventRecordWithFlags(events_[event_count_++], stream,
+                                        external_ ? cudaEventRecordExternal : cudaEventRecordDefault),
               "cudaEventRecord(decode profile)");
     }
 
+    static constexpr std::size_t clock_capacity_ = 4096;
+    std::uint64_t* device_clocks_ = nullptr;
     int device_ = 0;
     std::string type_;
+    bool external_ = false;
     bool active_ = false;
     std::size_t event_count_ = 0;
     std::vector<cudaEvent_t> events_;
@@ -216,8 +351,14 @@ private:
 class CapturedCudaGraph {
 public:
     CapturedCudaGraph(int value_device, cudaStream_t stream,
-                      const std::function<void()>& enqueue)
-        : device_(value_device) {
+                      const std::function<void()>& enqueue, bool tp = false,
+                      std::unique_ptr<CudaEventProfile> profile = {})
+        : device_(value_device), profile_(std::move(profile)) {
+        if (tp) {
+            tape_ = std::make_unique<CudaTeGraphTape>(value_device, stream, enqueue);
+            nodes_ = tape_->nodes();
+            return;
+        }
         check(cudaSetDevice(device_), "cudaSetDevice(graph capture)");
         // Capture is lazy and happens after transaction inputs/state clones
         // have been enqueued.  Drain that setup once so it stays outside the
@@ -263,17 +404,27 @@ public:
     CapturedCudaGraph(const CapturedCudaGraph&) = delete;
     CapturedCudaGraph& operator=(const CapturedCudaGraph&) = delete;
 
-    void launch(cudaStream_t stream) const {
+    void launch(cudaStream_t stream, const std::function<void()>& cancel = {}) const {
+        if (tape_) { tape_->launch(stream, cancel); return; }
+        if (cancel) cancel();
         if (!exec_) throw std::logic_error("CUDA decode graph is unavailable");
         check(cudaGraphLaunch(exec_, stream),
               "cudaGraphLaunch(decode fragment)");
     }
 
+    void profile_finish(Stage stage, std::uint64_t position,
+                        cudaStream_t stream, std::uint32_t tokens) {
+        if (profile_) profile_->finish(stage, position, stream, tokens, true);
+    }
+
     std::size_t nodes() const { return nodes_; }
+    std::size_t graphs() const { return tape_ ? tape_->graphs() : 1; }
+    std::size_t held_bytes() const { return tape_ ? tape_->held_bytes() : 0; }
 
 private:
     void release() noexcept {
         (void)cudaSetDevice(device_);
+        tape_.reset();
         if (exec_) (void)cudaGraphExecDestroy(exec_);
         if (graph_) (void)cudaGraphDestroy(graph_);
         exec_ = nullptr;
@@ -281,6 +432,8 @@ private:
         nodes_ = 0;
     }
 
+    std::unique_ptr<CudaEventProfile> profile_;
+    std::unique_ptr<CudaTeGraphTape> tape_;
     int device_ = 0;
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t exec_ = nullptr;
@@ -309,13 +462,29 @@ const std::uint16_t* require_bf16(const CudaDeviceWeightStore& weights,
     return static_cast<const std::uint16_t*>(tensor.data);
 }
 
+thread_local int g_te_bind_world_size = 1;
+
+// When te_world_size==2, TP2 shards may halve rows (row_shard) or columns
+// (col_shard). Accept exact full shape or exact half along one axis.
 CudaMatrixViewV1 require_matrix(const CudaDeviceWeightStore& weights,
                                 const std::string& name,
                                 std::uint32_t rows,
                                 std::uint32_t columns) {
     auto result = cuda_matrix_view(weights.require(name));
-    if (result.rows != rows || result.columns != columns)
-        throw std::runtime_error("invalid CUDA matrix dimensions " + name);
+    const int te_world_size = g_te_bind_world_size;
+    const bool exact = result.rows == rows && result.columns == columns;
+    const bool half_rows =
+        te_world_size == 2 && result.rows * 2u == rows &&
+        result.columns == columns;
+    const bool half_cols =
+        te_world_size == 2 && result.rows == rows &&
+        result.columns * 2u == columns;
+    if (!exact && !half_rows && !half_cols)
+        throw std::runtime_error(
+            "invalid CUDA matrix dimensions " + name + " got " +
+            std::to_string(result.rows) + "x" + std::to_string(result.columns) +
+            " want " + std::to_string(rows) + "x" + std::to_string(columns) +
+            (te_world_size == 2 ? " (te half ok)" : ""));
     return result;
 }
 
@@ -344,6 +513,8 @@ HyperWeights bind_hyper(const CudaDeviceWeightStore& weights,
 
 struct GdnWeights {
     CudaMatrixViewV1 qkv;
+    CudaMatrixViewV1 qkv_prefill_full;
+    CudaMatrixViewV1 packed;
     CudaMatrixViewV1 z;
     CudaMatrixViewV1 b;
     CudaMatrixViewV1 a;
@@ -354,9 +525,21 @@ struct GdnWeights {
     const std::uint16_t* norm = nullptr;
 };
 
+class ScopedQsaHeadLayout {
+public:
+    explicit ScopedQsaHeadLayout(CudaQsaHeadLayout layout)
+        : previous_(cuda_qsa_set_head_layout(layout)) {}
+    ~ScopedQsaHeadLayout() { (void)cuda_qsa_set_head_layout(previous_); }
+    ScopedQsaHeadLayout(const ScopedQsaHeadLayout&) = delete;
+    ScopedQsaHeadLayout& operator=(const ScopedQsaHeadLayout&) = delete;
+private:
+    CudaQsaHeadLayout previous_;
+};
+
 struct QsaWeights {
     CudaMatrixViewV1 index_qk;
     CudaMatrixViewV1 q_gate;
+    CudaMatrixViewV1 q_gate_local;
     CudaMatrixViewV1 k;
     CudaMatrixViewV1 v;
     CudaMatrixViewV1 output;
@@ -459,6 +642,10 @@ LayerWeights bind_layer(const CudaDeviceWeightStore& weights,
         result.gdn.qkv = require_matrix(
             weights, prefix + "linear_attn.qkv.weight", kQ38GdnQkvWidth,
             kQ38HiddenWidth);
+        if(!weights.find(prefix+"linear_attn.qkv_prefill_full.weight").empty())
+            result.gdn.qkv_prefill_full=require_matrix(weights,prefix+"linear_attn.qkv_prefill_full.weight",10240,kQ38HiddenWidth);
+        if(!weights.find(prefix+"linear_attn.qkvzba_packed.weight").empty())
+            result.gdn.packed=require_matrix(weights,prefix+"linear_attn.qkvzba_packed.weight",8192,kQ38HiddenWidth);
         result.gdn.z = require_matrix(weights, prefix + "linear_attn.z.weight",
                                       kQ38GdnValueWidth, kQ38HiddenWidth);
         result.gdn.b = require_matrix(weights, prefix + "linear_attn.in_b.weight",
@@ -552,191 +739,6 @@ MtpWeights bind_mtp(const CudaDeviceWeightStore& weights) {
 // One persistent producer per stage0 backend.  It warms the non-semantic PLE
 // page cache for a complete known-token transaction, allowing I/O for later
 // device-workspace chunks to overlap the current GPU slab.
-class PleAsyncReader {
-public:
-    explicit PleAsyncReader(std::shared_ptr<PleStore> value_store)
-        : store_(std::move(value_store)) {
-        if (!store_) throw std::invalid_argument("PLE async store is null");
-        worker_ = std::thread([this] { run(); });
-    }
-
-    ~PleAsyncReader() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
-            cancel_requested_ = true;
-        }
-        ready_.notify_all();
-        finished_.notify_all();
-        if (worker_.joinable()) worker_.join();
-    }
-
-    PleAsyncReader(const PleAsyncReader&) = delete;
-    PleAsyncReader& operator=(const PleAsyncReader&) = delete;
-
-    void submit(std::shared_ptr<const std::vector<std::uint64_t>> rows) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!rows || rows->empty())
-            throw std::invalid_argument("PLE async row set is empty");
-        if (request_ready_ || working_ || result_ready_ || stopping_)
-            throw std::logic_error("PLE async reader already has work");
-        rows_ = std::move(rows);
-        error_ = nullptr;
-        total_rows_ = rows_->size();
-        cancel_requested_ = false;
-        request_ready_ = true;
-        ready_.notify_one();
-    }
-
-    void take(std::size_t first_row, std::size_t row_count,
-              std::uint8_t* output, std::size_t output_bytes,
-              std::uint16_t* scale_output,
-              std::size_t output_scales) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        const auto row_bytes = store_->layout().row_stride_bytes;
-        if (row_count == 0 || first_row > total_rows_ ||
-            row_count > total_rows_ - first_row || !output ||
-            output_bytes != row_count * row_bytes || !scale_output ||
-            output_scales != row_count)
-            throw std::invalid_argument("PLE async take extent is invalid");
-        finished_.wait(lock, [this, first_row] {
-            return (!ready_tiles_.empty() &&
-                    ready_tiles_.front().first_row == first_row) ||
-                   result_ready_ || stopping_;
-        });
-        if (ready_tiles_.empty() ||
-            ready_tiles_.front().first_row != first_row) {
-            auto error = error_;
-            if (result_ready_) {
-                result_ready_ = false;
-                error_ = nullptr;
-            }
-            lock.unlock();
-            if (error) std::rethrow_exception(error);
-            throw std::runtime_error("PLE async reader stopped early");
-        }
-        auto tile = std::move(ready_tiles_.front());
-        ready_tiles_.pop_front();
-        ready_.notify_one();
-        if (tile.rows != row_count || tile.bytes.size() != output_bytes ||
-            tile.scales.size() != output_scales)
-            throw std::logic_error("PLE async tile extent differs");
-        const bool final = first_row + row_count == total_rows_;
-        if (final) {
-            finished_.wait(lock, [this] { return result_ready_ || stopping_; });
-            const auto error = error_;
-            result_ready_ = false;
-            error_ = nullptr;
-            if (error) std::rethrow_exception(error);
-        }
-        lock.unlock();
-        std::copy(tile.bytes.begin(), tile.bytes.end(), output);
-        std::copy(tile.scales.begin(), tile.scales.end(), scale_output);
-    }
-
-    void cancel() noexcept {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (!request_ready_ && !working_ && !result_ready_) return;
-        cancel_requested_ = true;
-        ready_.notify_all();
-        finished_.notify_all();
-        finished_.wait(lock, [this] {
-            return result_ready_ ||
-                   (!request_ready_ && !working_) || stopping_;
-        });
-        result_ready_ = false;
-        error_ = nullptr;
-        rows_.reset();
-        ready_tiles_.clear();
-        total_rows_ = 0;
-        cancel_requested_ = false;
-    }
-
-private:
-    struct PleTileResult {
-        std::size_t first_row = 0;
-        std::size_t rows = 0;
-        std::vector<std::uint8_t> bytes;
-        std::vector<std::uint16_t> scales;
-    };
-
-    void run() noexcept {
-        for (;;) {
-            std::shared_ptr<const std::vector<std::uint64_t>> rows;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                ready_.wait(lock,
-                            [this] { return stopping_ || request_ready_; });
-                if (stopping_ && !request_ready_) return;
-                rows = std::move(rows_);
-                request_ready_ = false;
-                working_ = true;
-            }
-            std::exception_ptr error;
-            try {
-                if (!rows || rows->empty())
-                    throw std::invalid_argument("PLE async row set vanished");
-                constexpr std::size_t kRowsPerTile =
-                    static_cast<std::size_t>(kPrefillTile) *
-                    kQ38PleRowsPerToken;
-                for (std::size_t first = 0; first < rows->size();
-                     first += kRowsPerTile) {
-                    {
-                        std::unique_lock<std::mutex> lock(mutex_);
-                        ready_.wait(lock, [this] {
-                            return ready_tiles_.size() < 2 ||
-                                   cancel_requested_ || stopping_;
-                        });
-                        if (cancel_requested_ || stopping_) break;
-                    }
-                    const auto count =
-                        std::min<std::size_t>(kRowsPerTile,
-                                              rows->size() - first);
-                    std::vector<std::uint64_t> tile(
-                        rows->begin() + static_cast<std::ptrdiff_t>(first),
-                        rows->begin() +
-                            static_cast<std::ptrdiff_t>(first + count));
-                    PleTileResult result;
-                    result.first_row = first;
-                    result.rows = count;
-                    result.bytes = store_->read_rows(tile);
-                    result.scales.resize(count);
-                    store_->read_row_scales_into(
-                        tile, result.scales.data(), result.scales.size());
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        ready_tiles_.push_back(std::move(result));
-                        finished_.notify_all();
-                    }
-                }
-            } catch (...) {
-                error = std::current_exception();
-            }
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                working_ = false;
-                result_ready_ = true;
-                error_ = error;
-            }
-            finished_.notify_one();
-        }
-    }
-
-    std::shared_ptr<PleStore> store_;
-    std::thread worker_;
-    std::mutex mutex_;
-    std::condition_variable ready_;
-    std::condition_variable finished_;
-    std::shared_ptr<const std::vector<std::uint64_t>> rows_;
-    std::deque<PleTileResult> ready_tiles_;
-    std::exception_ptr error_;
-    std::size_t total_rows_ = 0;
-    bool request_ready_ = false;
-    bool working_ = false;
-    bool result_ready_ = false;
-    bool cancel_requested_ = false;
-    bool stopping_ = false;
-};
 
 class PrefillMatrixCache {
 public:
@@ -744,8 +746,20 @@ public:
         : device_(value_device), max_bytes_(value_max_bytes) {
         check(cudaSetDevice(device_), "cudaSetDevice(prefill cache)");
         check_cublas(cublasCreate(&handle_), "cublasCreate(prefill)");
-        check_cublas(cublasSetMathMode(handle_, CUBLAS_TENSOR_OP_MATH),
-                     "cublasSetMathMode(prefill)");
+        try {
+            check_cublas(cublasSetMathMode(handle_, CUBLAS_TENSOR_OP_MATH),
+                         "cublasSetMathMode(prefill)");
+            if (profile_requested("Q38_TP_PAIRED_GRAPH")) {
+                blas_workspace_bytes_ = 32ull << 20u;
+                check(cudaMalloc(&blas_workspace_, blas_workspace_bytes_),
+                      "allocate persistent cuBLAS workspace");
+                resident_bytes_ += blas_workspace_bytes_;
+            }
+        } catch (...) {
+            if (blas_workspace_) (void)cudaFree(blas_workspace_);
+            (void)cublasDestroy(handle_);
+            throw;
+        }
     }
 
     ~PrefillMatrixCache() {
@@ -755,7 +769,10 @@ public:
         // failure and future alternate call sites.
         (void)cudaDeviceSynchronize();
         for (auto& item : matrices_) (void)cudaFree(item.second);
+        if (small_scratch_) (void)cudaFree(small_scratch_);
+        for (auto* scratch : retired_small_scratch_) (void)cudaFree(scratch);
         if (handle_) (void)cublasDestroy(handle_);
+        if (blas_workspace_) (void)cudaFree(blas_workspace_);
     }
 
     PrefillMatrixCache(const PrefillMatrixCache&) = delete;
@@ -766,34 +783,93 @@ public:
         return allocation_failures_;
     }
 
+    void seal() { sealed_ = true; }
+
+    void warm(const CudaMatrixViewV1& matrix, cudaStream_t stream) {
+        (void)require(matrix, stream);
+    }
+
+    void warm_small(const CudaMatrixViewV1& matrix, cudaStream_t stream) {
+        if (require(matrix, stream)) (void)reserve_small_scratch(matrix, stream);
+    }
+
     bool gemm(const CudaMatrixViewV1& matrix, const std::uint16_t* input,
               std::uint16_t* output, std::uint32_t batch,
-              cudaStream_t stream) {
+              cudaStream_t stream, bool borrowed_small = false) {
         if (!input || !output || batch < 2 || !stream)
             throw std::invalid_argument("invalid prefill GEMM buffers");
         const auto* expanded = require(matrix, stream);
         if (!expanded) return false;
+        if (batch < 8 && !borrowed_small) {
+            if (!reserve_small_scratch(matrix, stream)) return false;
+            cuda_padded_gemm_bf16(handle_, expanded, input, output, small_scratch_,
+                small_scratch_ + static_cast<std::size_t>(8) * matrix.columns,
+                matrix.rows, matrix.columns, batch, stream,
+                blas_workspace_, blas_workspace_bytes_);
+            return true;
+        }
         check_cublas(cublasSetStream(handle_, stream),
                      "cublasSetStream(prefill)");
+        // SetStream resets the handle workspace. Bind it again before every
+        // GEMM so capture contains no cuBLAS temporary allocation nodes.
+        if (blas_workspace_)
+            check_cublas(cublasSetWorkspace(handle_, blas_workspace_, blas_workspace_bytes_),
+                         "cublasSetWorkspace(prefill)");
         const float alpha = 1.0f;
         const float beta = 0.0f;
         // Row-major output [batch, rows] is column-major [rows, batch].
         // Row-major W [rows, columns] is column-major [columns, rows], so
         // transpose that view and multiply by input's [columns, batch] view.
-        check_cublas(
-            cublasGemmEx(
+        const cublasStatus_t st = cublasGemmEx(
                 handle_, CUBLAS_OP_T, CUBLAS_OP_N,
-                static_cast<int>(matrix.rows), static_cast<int>(batch),
+                static_cast<int>(matrix.rows), static_cast<int>(borrowed_small ? 8 : batch),
                 static_cast<int>(matrix.columns), &alpha, expanded,
                 CUDA_R_16BF, static_cast<int>(matrix.columns), input,
                 CUDA_R_16BF, static_cast<int>(matrix.columns), &beta, output,
                 CUDA_R_16BF, static_cast<int>(matrix.rows),
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-            "cublasGemmEx(prefill)");
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr,
+                "prefill GemmEx fail status=%d rows=%u cols=%u batch=%u "
+                "expanded=%p input=%p output=%p\n",
+                static_cast<int>(st), matrix.rows, matrix.columns, batch,
+                (void*)expanded, (void*)input, (void*)output);
+            std::fflush(stderr);
+        }
+        check_cublas(st, "cublasGemmEx(prefill)");
         return true;
     }
 
 private:
+    bool reserve_small_scratch(const CudaMatrixViewV1& matrix, cudaStream_t stream) {
+        const auto bytes = (static_cast<std::uint64_t>(matrix.columns) + matrix.rows) * 8 * 2;
+        if (bytes <= small_scratch_bytes_) return true;
+        if (sealed_ || bytes > max_bytes_ - std::min(max_bytes_, resident_bytes_))
+            return false;
+        std::uint16_t* replacement = nullptr;
+        const auto allocated = cudaMalloc(reinterpret_cast<void**>(&replacement), bytes);
+        if (allocated == cudaErrorMemoryAllocation) {
+            ++allocation_failures_;
+            (void)cudaGetLastError();
+            return false;
+        }
+        check(allocated, "allocate small GEMM scratch");
+        const auto completed = cudaStreamSynchronize(stream);
+        if (completed != cudaSuccess) {
+            (void)cudaFree(replacement);
+            check(completed, "drain small GEMM scratch before growth");
+        }
+        // A lazy MTP graph can be captured before target warmup grows this
+        // scratch. Keep prior allocations alive for those captured pointers.
+        if (small_scratch_) {
+            try { retired_small_scratch_.push_back(small_scratch_); }
+            catch (...) { (void)cudaFree(replacement); throw; }
+        }
+        resident_bytes_ += bytes;
+        small_scratch_ = replacement;
+        small_scratch_bytes_ = bytes;
+        return true;
+    }
     const std::uint16_t* require(const CudaMatrixViewV1& matrix,
                                  cudaStream_t stream) {
         if (matrix.format == DeviceWeightFormatV1::kPreserve &&
@@ -801,7 +877,7 @@ private:
             return static_cast<const std::uint16_t*>(matrix.data);
         const auto found = matrices_.find(matrix.data);
         if (found != matrices_.end()) return found->second;
-        if (disabled_.count(matrix.data) != 0) return nullptr;
+        if (sealed_ || disabled_.count(matrix.data) != 0) return nullptr;
         const auto elements =
             static_cast<std::uint64_t>(matrix.rows) * matrix.columns;
         if (elements > std::numeric_limits<std::size_t>::max() /
@@ -849,24 +925,44 @@ private:
 
     int device_;
     cublasHandle_t handle_ = nullptr;
+    void* blas_workspace_ = nullptr;
+    std::size_t blas_workspace_bytes_ = 0;
+    bool sealed_ = false;
     std::unordered_map<const void*, std::uint16_t*> matrices_;
     std::unordered_set<const void*> disabled_;
     std::uint64_t resident_bytes_ = 0;
     std::uint64_t max_bytes_ = 0;
     std::uint64_t allocation_failures_ = 0;
+    std::uint16_t* small_scratch_ = nullptr;
+    std::vector<std::uint16_t*> retired_small_scratch_;
+    std::uint64_t small_scratch_bytes_ = 0;
 };
 
 class Workspace {
 public:
     Workspace(int value_device, Stage stage, std::uint32_t max_tokens,
-              bool enable_mtp)
+              bool enable_mtp, bool enable_tp)
         : device(value_device), maximum_tokens(max_tokens) {
         check(cudaSetDevice(device), "cudaSetDevice(workspace)");
         check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
               "cudaStreamCreate(stage)");
         try {
+            if (stage == Stage::kStage0 && profile_requested("Q38_CUDA_PLE_COPY_STREAM")) {
+                check(cudaStreamCreateWithFlags(&ple_copy_stream, cudaStreamNonBlocking),
+                      "cudaStreamCreate(PLE copy)");
+                check(cudaEventCreateWithFlags(&ple_copy_ready, cudaEventDisableTiming),
+                      "cudaEventCreate(PLE copy)");
+                check(cudaEventCreateWithFlags(&ple_consumer_done, cudaEventDisableTiming),
+                      "cudaEventCreate(PLE consumer)");
+            }
+            qsa_graph_position = allocate<std::uint32_t>(1);
             tokens = allocate<std::int32_t>(max_tokens);
             predictions = allocate<std::int32_t>(max_tokens);
+            if (enable_mtp && profile_requested("Q38_CUDA_MTP_GRAPH")) {
+                mtp_graph_hc = allocate<std::uint16_t>(kQ38HyperWidth);
+                mtp_graph_token = allocate<std::int32_t>(1);
+                mtp_graph_prediction = allocate<std::int32_t>(1);
+            }
             boundary = allocate<std::uint16_t>(
                 static_cast<std::uint64_t>(max_tokens) * kQ38HyperWidth);
             hyper_a = allocate<std::uint16_t>(
@@ -922,6 +1018,7 @@ public:
                 static_cast<std::uint64_t>(legacy_moe_tokens) *
                 kQ38MoeTopK *
                 kQ38MoeIntermediate);
+            if (enable_tp) te_routed = allocate<float>(static_cast<std::uint64_t>(kPrefillTile) * kQ38HiddenWidth);
             moe_accumulation = allocate<float>(
                 static_cast<std::uint64_t>(legacy_moe_tokens) *
                 kQ38HiddenWidth);
@@ -943,6 +1040,18 @@ public:
                 moe_route_output = allocate<float>(
                     static_cast<std::uint64_t>(kPrefillTile) *
                     kQ38MoeTopK * kQ38HiddenWidth);
+                if (cuda_marlin_moe_enabled()) {
+                    if (!enable_tp) throw std::runtime_error("Marlin candidate requires TP2");
+                    const auto tasks=q38_moe_prefill_max_tasks_v1(kPrefillTile);
+                    marlin.sorted=allocate<std::int32_t>(tasks*16);
+                    marlin.experts=allocate<std::int32_t>(tasks*2);
+                    marlin.padded=allocate<std::int32_t>(1);
+                    marlin.locks=allocate<std::int32_t>(4096);
+                    marlin.gate_up=allocate<std::uint16_t>(static_cast<std::uint64_t>(kPrefillTile)*kQ38MoeTopK*1280);
+                    marlin.down=allocate<std::uint16_t>(static_cast<std::uint64_t>(kPrefillTile)*kQ38MoeTopK*2560);
+                    marlin.tmp=allocate<float>(tasks*16*2560ull);
+                    check(cudaMemsetAsync(marlin.locks,0,4096*sizeof(std::int32_t),stream),"initialize Marlin locks");
+                }
             }
             selected_indices = allocate<std::int32_t>(
                 static_cast<std::uint64_t>(kPrefillTile) *
@@ -950,11 +1059,23 @@ public:
             block_scores = allocate<float>(
                 static_cast<std::uint64_t>(kPrefillTile) *
                 (kQ38ContextLimit / kQ38QsaBlockTokens));
+            if (enable_tp && profile_requested("Q38_CUDA_GDN_PREFILL_NORMALIZED_QK"))
+                gdn_normalized_qk = allocate<float>(2ull * kPrefillTile *
+                    kQ38GdnKeyHeads * kQ38GdnHeadWidth);
             attention_scores = allocate<float>(
                 static_cast<std::uint64_t>(kPrefillTile) * kQ38QsaHeads *
                 kQ38QsaMaximumSelected);
             if (stage == Stage::kStage1)
                 logits = allocate<std::uint16_t>(kVocabulary);
+            if (stage == Stage::kStage1 && enable_tp &&
+                (profile_requested("Q38_TP_HEAD_BATCH_REDUCE") || profile_requested("Q38_TP_VOCAB_ROWS"))) {
+                head_batch_logits = allocate<std::uint16_t>(7ull * kVocabulary);
+                head_local_ids=allocate<std::int32_t>(7);
+                head_partial_values=allocate<float>(7*128);
+                head_partial_ids=allocate<std::int32_t>(7*128);
+                head_candidates=allocate<std::uint16_t>(7*4);
+                head_candidates_full=allocate<std::uint16_t>(7*8);
+            }
             if (stage == Stage::kStage1 && enable_mtp) {
                 final_hc = allocate<std::uint16_t>(
                     static_cast<std::uint64_t>(max_tokens) * kQ38HyperWidth);
@@ -1013,18 +1134,40 @@ public:
         const auto bytes = count * sizeof(T);
         check(cudaMalloc(reinterpret_cast<void**>(&result), bytes),
               "cudaMalloc(workspace)");
-        allocations.push_back(result);
+        try {
+            check(cudaMemsetAsync(result,0,bytes,stream),"initialize workspace allocation");
+            allocations.push_back({result,bytes});
+        } catch (...) { (void)cudaFree(result); throw; }
         device_bytes += bytes;
         return result;
     }
 
+    bool owns_range(const void* pointer,std::uint64_t bytes) const {
+        const auto p=reinterpret_cast<std::uintptr_t>(pointer);
+        for(const auto& allocation:allocations){const auto base=reinterpret_cast<std::uintptr_t>(allocation.first);
+            if(p>=base && p-base<=allocation.second && bytes<=allocation.second-(p-base))return true;
+        }
+        return false;
+    }
+    bool borrowed_gemm_ranges(const void* input,const void* output,unsigned columns,unsigned rows) const {
+        const auto in_bytes=16ull*columns,out_bytes=16ull*rows;
+        if(!owns_range(input,in_bytes)||!owns_range(output,out_bytes))return false;
+        const auto a=reinterpret_cast<std::uintptr_t>(input),b=reinterpret_cast<std::uintptr_t>(output);
+        return a<=b ? in_bytes<=b-a : out_bytes<=a-b;
+    }
     void release() noexcept {
         (void)cudaSetDevice(device);
         if (stream) (void)cudaStreamSynchronize(stream);
+        if (ple_copy_stream) (void)cudaStreamSynchronize(ple_copy_stream);
+        if (ple_consumer_done) (void)cudaEventDestroy(ple_consumer_done);
+        if (ple_copy_ready) (void)cudaEventDestroy(ple_copy_ready);
+        if (ple_copy_stream) (void)cudaStreamDestroy(ple_copy_stream);
+        ple_copy_ready = nullptr;
+        ple_copy_stream = nullptr;
         if (host_predictions) (void)cudaFreeHost(host_predictions);
         if (host_ple_rows) (void)cudaFreeHost(host_ple_rows);
         if (host_ple_scales) (void)cudaFreeHost(host_ple_scales);
-        for (auto* allocation : allocations) (void)cudaFree(allocation);
+        for (const auto& allocation : allocations) (void)cudaFree(allocation.first);
         allocations.clear();
         if (stream) (void)cudaStreamDestroy(stream);
         stream = nullptr;
@@ -1042,15 +1185,24 @@ public:
     std::uint64_t pinned_bytes = 0;
     std::uint64_t mtp_state_bytes = 0;
     cudaStream_t stream = nullptr;
-    std::vector<void*> allocations;
+    cudaStream_t ple_copy_stream = nullptr;
+    cudaEvent_t ple_consumer_done = nullptr;
+    bool ple_copy_pending = false;
+    cudaEvent_t ple_copy_ready = nullptr;
+    std::vector<std::pair<void*,std::uint64_t>> allocations;
     std::int32_t* tokens = nullptr;
     std::int32_t* predictions = nullptr;
     std::int32_t* host_predictions = nullptr;
+    std::uint16_t* mtp_graph_hc = nullptr;
+    std::uint16_t* mtp_normalized_embedding = nullptr;
+    std::int32_t* mtp_graph_token = nullptr;
+    std::int32_t* mtp_graph_prediction = nullptr;
     std::uint8_t* ple_rows = nullptr;
     std::uint8_t* host_ple_rows = nullptr;
     std::uint16_t* ple_scales = nullptr;
     std::uint16_t* host_ple_scales = nullptr;
     std::uint16_t* boundary = nullptr;
+    std::uint32_t* qsa_graph_position = nullptr;
     std::uint16_t* hyper_a = nullptr;
     std::uint16_t* hyper_b = nullptr;
     std::uint16_t* hyper_norm = nullptr;
@@ -1071,9 +1223,11 @@ public:
     std::uint16_t* small2 = nullptr;
     std::int32_t* expert_ids = nullptr;
     float* expert_weights = nullptr;
+    CudaMarlinWorkspace marlin;
     std::uint16_t* moe_gate_up = nullptr;
     std::uint16_t* moe_activated = nullptr;
     float* moe_accumulation = nullptr;
+    float* te_routed = nullptr;
     std::uint8_t* moe_route_plan_allocation = nullptr;
     Q38RoutePlanStorageV1 moe_route_plan;
     std::uint16_t* moe_packed_hidden = nullptr;
@@ -1081,14 +1235,45 @@ public:
     float* moe_route_output = nullptr;
     std::int32_t* selected_indices = nullptr;
     float* block_scores = nullptr;
+    float* gdn_normalized_qk = nullptr;
     float* attention_scores = nullptr;
     std::uint16_t* logits = nullptr;
+    std::uint16_t* head_batch_logits = nullptr;
+    std::int32_t* head_local_ids=nullptr;
+    float* head_partial_values=nullptr;
+    std::int32_t* head_partial_ids=nullptr;
+    std::uint16_t *head_candidates=nullptr,*head_candidates_full=nullptr;
     std::uint16_t* final_hc = nullptr;
     std::uint16_t* mtp_pending_hc = nullptr;
     std::uint16_t* mtp_candidate_hc = nullptr;
 };
 
 }  // namespace
+
+// Fixed six rejected-suffix prefixes cover the qualified MTP widths 1/2/4/6.
+// Allocation persists across transactions; each kernel writes its layer slice.
+struct TargetPrefixStorage {
+    int device;
+    std::uint8_t* data = nullptr;
+    std::uint64_t gdn_bytes, ple_bytes, stride;
+    static constexpr std::uint32_t capacity = 6;
+    TargetPrefixStorage(int d, std::uint64_t gdn, std::uint64_t ple)
+        : device(d), gdn_bytes(gdn), ple_bytes(ple), stride(gdn + ple) {
+        check(cudaSetDevice(device), "set prefix storage device");
+        check(cudaMalloc(reinterpret_cast<void**>(&data), stride * capacity),
+              "allocate target prefix storage");
+        check(cudaMemset(data,0,stride*capacity),"initialize prefix storage");
+    }
+    ~TargetPrefixStorage() {
+        (void)cudaSetDevice(device);
+        if (data) (void)cudaFree(data);
+    }
+    CudaPrefixSnapshotView view(std::uint64_t offset, std::uint32_t count) {
+        if (count == 0 || count > capacity || offset >= stride)
+            throw std::logic_error("invalid target prefix storage view");
+        return {data + offset, stride, count};
+    }
+};
 
 struct CudaStageBackend::Impl {
     enum class DecodeStaticActionKind : std::uint8_t {
@@ -1100,6 +1285,8 @@ struct CudaStageBackend::Impl {
         kPrepareMoe,
         kMoe,
         kOutput,
+        kQsa,
+        kMoeFinish,
     };
 
     struct DecodeStaticAction {
@@ -1110,8 +1297,12 @@ struct CudaStageBackend::Impl {
     };
 
     struct DecodeGraphVariant {
+        std::uint16_t* output_hc = nullptr;
         std::uintptr_t gdn_working = 0;
         std::uintptr_t ple_working = 0;
+        std::uint32_t tokens = 1;
+        bool sparse_qsa = false;
+        std::uintptr_t prefix_storage = 0;
         std::vector<std::unique_ptr<CapturedCudaGraph>> fragments;
         std::vector<std::uint32_t> qsa_layers;
     };
@@ -1125,22 +1316,55 @@ struct CudaStageBackend::Impl {
           prefill_cache(value_options.device,
                         value_options.prefill_matrix_cache_bytes),
           workspace(options.device, options.stage,
-                    options.max_transaction_tokens, options.enable_mtp),
+                    options.max_transaction_tokens, options.enable_mtp, options.te_world_size == 2),
           ple_store(std::move(value_ple)) {
         if (options.device < 0 || options.max_transaction_tokens == 0 ||
             options.context_capacity == 0 ||
             options.context_capacity > kQ38ContextLimit ||
             weights.stage() != static_cast<std::uint32_t>(options.stage))
             throw std::invalid_argument("invalid CUDA stage backend options");
+        const bool marked_gdn = !weights.find("q38.tp.gdn_heads.stage" + std::to_string(unsigned(options.stage)) + ".rank0").empty() ||
+                                !weights.find("q38.tp.gdn_heads.stage" + std::to_string(unsigned(options.stage)) + ".rank1").empty();
+        const bool local_gdn = profile_requested("Q38_TP_GDN_LOCAL");
+        if(marked_gdn != local_gdn || (local_gdn &&
+            (options.te_world_size!=2 || weights.find("q38.tp.gdn_heads.stage" + std::to_string(unsigned(options.stage)) + ".rank" +
+                 std::to_string(options.te_rank)).empty())))
+            throw std::invalid_argument("GDN head ownership does not match execution policy/rank");
+        const std::string packed_marker="q38.tp.gdn_packed.stage"+std::to_string(unsigned(options.stage))+".rank";
+        const bool marked_packed=!weights.find(packed_marker+"0").empty() || !weights.find(packed_marker+"1").empty();
+        if(marked_packed!=profile_requested("Q38_TP_GDN_PACKED") || (marked_packed && (!local_gdn || weights.find(packed_marker+std::to_string(options.te_rank)).empty())))
+            throw std::invalid_argument("packed GDN artifact does not match execution policy/rank");
         const auto first = options.stage == Stage::kStage0 ? 0u : kCut;
         const auto end = options.stage == Stage::kStage0 ? kCut : kLayers;
         std::uint32_t gdn_local = 0;
         std::uint32_t qsa_local = 0;
+        g_te_bind_world_size = options.te_world_size > 0 ? options.te_world_size : 1;
         for (auto layer = first; layer < end; ++layer) {
             const bool qsa = layer % 4 == 3;
             layers.push_back(bind_layer(weights, layer,
                                         qsa ? qsa_local++ : gdn_local++));
         }
+        if (profile_requested("Q38_TP_QSA_LOCAL")) {
+            if (options.te_world_size != 2 || options.te_rank < 0 || options.te_rank > 1)
+                throw std::invalid_argument("QSA local heads require TP2");
+            for (auto& layer : layers) {
+                if (!layer.qsa) continue;
+                auto view = layer.sparse.q_gate;
+                if (view.rows != 12288 || view.columns != 2560 || layer.sparse.output.columns != 3072)
+                    throw std::invalid_argument("QSA local projection layout mismatch");
+                const unsigned bytes_per_weight = view.format == DeviceWeightFormatV1::kPreserve
+                    ? (view.preserved_f32 ? 4u : 2u)
+                    : view.format == DeviceWeightFormatV1::kW8A16SymG128 ? 1u : 0u;
+                if (!bytes_per_weight) throw std::invalid_argument("unsupported QSA projection row view");
+                const std::size_t first_row = static_cast<std::size_t>(options.te_rank) * 6144;
+                view.data = static_cast<const unsigned char*>(view.data) + first_row * view.columns * bytes_per_weight;
+                if (view.scales) view.scales = static_cast<const std::uint16_t*>(view.scales) + first_row * (view.columns / view.group_size);
+                view.rows = 6144;
+                layer.sparse.q_gate_local = view;
+            }
+        }
+        // te bind stays active through embedding/output/mtp binds
+
         const bool retained_prefix_checkpoint =
             options.enable_speculative_checkpoint &&
             options.stage == Stage::kStage0;
@@ -1156,36 +1380,93 @@ struct CudaStageBackend::Impl {
                 options.device, retained_prefix_checkpoint);
             committed_ple_hash =
                 std::make_unique<PleHashState>(ple_store->layout().hash);
-            ple_reader = std::make_unique<PleAsyncReader>(ple_store);
+            ple_reader = std::make_unique<PleAsyncReader>(
+                ple_store, static_cast<std::size_t>(ple_io_tile_tokens()) * kQ38PleRowsPerToken);
             embedding = require_matrix(weights, "token_embd.weight", kVocabulary,
                                        kQ38HiddenWidth);
             small_boundary_ring = std::make_unique<CudaBoundaryRing>(
                 CudaBoundaryRingOptions{options.device, 3,
                                         kSmallBoundaryTokens,
-                                        kQ38HyperWidth});
+                                        kQ38HyperWidth,
+                                        profile_requested("Q38_CUDA_ASYNC_BOUNDARY"),
+                                        options.te_world_size == 2 && profile_requested("Q38_TP_DEVICE_BOUNDARY")});
             prefill_boundary_ring = std::make_unique<CudaBoundaryRing>(
                 CudaBoundaryRingOptions{options.device, 3,
                                         options.max_transaction_tokens,
-                                        kQ38HyperWidth});
+                                        kQ38HyperWidth,
+                                        profile_requested("Q38_CUDA_ASYNC_BOUNDARY"),
+                                        options.te_world_size == 2 && profile_requested("Q38_TP_DEVICE_BOUNDARY")});
         } else {
+            if (options.enable_compact_sampling)
+                compact_sampling = std::make_unique<CudaSamplingWorkspace>(
+                    options.device, kVocabulary);
             output = require_matrix(weights, "output.weight", kVocabulary,
                                     kQ38HiddenWidth);
+            if ((output.rows*2u==kVocabulary)!=profile_requested("Q38_TP_VOCAB_ROWS"))throw std::runtime_error("LM head layout policy mismatch");
             final_hyper = bind_hyper(weights, "hc_input", false);
             if (options.enable_mtp) {
                 mtp = std::make_unique<MtpWeights>(bind_mtp(weights));
                 mtp_qsa_state = std::make_unique<CudaQsaStateBank>(
                     options.device, 1, options.context_capacity);
+                if (profile_requested("Q38_CUDA_MTP_INPUT_CACHE")) {
+                    const auto count=std::uint64_t(mtp->embedding.rows)*mtp->embedding.columns;
+                    workspace.mtp_normalized_embedding=workspace.allocate<std::uint16_t>(count);
+                    cuda_dequantize_matrix_bf16(mtp->embedding,workspace.mtp_normalized_embedding,
+                        workspace.stream,options.device);
+                    cuda_qwen38_rmsnorm_bf16(workspace.mtp_normalized_embedding,mtp->embedding_norm,false,
+                        workspace.mtp_normalized_embedding,mtp->embedding.rows,mtp->embedding.columns,
+                        1e-6f,true,workspace.stream,options.device);
+                    check(cudaStreamSynchronize(workspace.stream),"MTP normalized embedding cache ready");
+                }
             }
         }
+        // Validate scheduling knobs before the first request or reader thread
+        // uses them. Cache prewarming is optional and bounded by the same cap.
+        (void)prefill_tile_tokens();
+        (void)ple_io_tile_tokens();
+        (void)prefill_sync_tiles();
+        if (profile_requested("Q38_CUDA_PREFILL_PREWARM")) {
+            auto warm = [&](const CudaMatrixViewV1& matrix) {
+                if (matrix.data) prefill_cache.warm(matrix, workspace.stream);
+            };
+            auto hyper = [&](const HyperWeights& weights) {
+                warm(weights.mix_down); warm(weights.mix_up); warm(weights.inject);
+            };
+            auto layer = [&](const LayerWeights& weights) {
+                hyper(weights.attention_hyper); hyper(weights.moe_hyper);
+                warm(weights.gdn.packed); warm(weights.gdn.qkv);
+                    if(weights.gdn.qkv_prefill_full.data)warm(weights.gdn.qkv_prefill_full); warm(weights.gdn.z);
+                warm(weights.gdn.a); warm(weights.gdn.b); warm(weights.gdn.output);
+                warm(weights.sparse.q_gate);
+                if(profile_requested("Q38_TP_QSA_LOCAL_PROJECTION"))warm(weights.sparse.q_gate_local); warm(weights.sparse.k);
+                warm(weights.sparse.v); warm(weights.sparse.index_qk);
+                warm(weights.sparse.output);
+                warm(weights.moe.router); warm(weights.moe.shared_gate);
+                warm(weights.moe.shared_up); warm(weights.moe.shared_down);
+                warm(weights.moe.shared_output_gate);
+                warm(weights.ple.key); warm(weights.ple.value);
+            };
+            for (const auto& weights : layers) layer(weights);
+            if (mtp) {
+                layer(mtp->layer); hyper(mtp->output_hyper);
+                warm(mtp->fc_hidden); warm(mtp->fc_embedding);
+            }
+            check(cudaStreamSynchronize(workspace.stream),
+                  "cudaStreamSynchronize(prefill prewarm)");
+            prefill_cache.seal();
+        }
+        g_te_bind_world_size = 1;
         if (profile_requested("Q38_CUDA_PROFILE_DECODE"))
             decode_profile = std::make_unique<CudaEventProfile>(
                 options.device, "decode");
-        if (profile_requested("Q38_CUDA_PROFILE_PREFILL"))
+        if (profile_requested("Q38_CUDA_PROFILE_PREFILL") ||
+            profile_requested("Q38_CUDA_PROFILE_GRAPHS"))
             prefill_profile = std::make_unique<CudaEventProfile>(
-                options.device, "prefill");
+                options.device, "prefill", profile_requested("Q38_CUDA_PROFILE_PREFILL_TIMELINE"));
     }
 
     void profile_mark(const char* label) {
+        if (capturing_profile_events) return;
         if (decode_profile && decode_profile->active())
             decode_profile->mark(label, workspace.stream);
         if (prefill_profile && prefill_profile->active())
@@ -1205,15 +1486,71 @@ struct CudaStageBackend::Impl {
                          int device,
                          float alpha = 1.0f,
                          bool accumulate = false) {
-        if (batch > 1 && alpha == 1.0f && !accumulate &&
+        // BF16 tensor-op GemmEx wants N multiple of 8; tiny prefill batches
+        // (e.g. TE smoke with 2 tokens) must use the regular GEMV path.
+        const bool small_gemm = options.te_world_size == 2 && batch >= 2 &&
+            profile_requested("Q38_TP_SMALL_GEMM");
+        if ((batch >= 8 || small_gemm) && alpha == 1.0f && !accumulate &&
             device == options.device &&
             stream == reinterpret_cast<void*>(workspace.stream)) {
+            const bool borrowed=batch<8 && profile_requested("Q38_CUDA_SMALL_GEMM_BORROWED") &&
+                workspace.borrowed_gemm_ranges(input,output,matrix.columns,matrix.rows);
             if (prefill_cache.gemm(matrix, input, output, batch,
-                                   workspace.stream))
+                                   workspace.stream,borrowed))
                 return;
         }
         q38::cuda_gemv_bf16(matrix, input, output, batch, stream, device,
                             alpha, accumulate);
+    }
+
+    void project(const std::uint16_t* input, std::uint32_t tokens,
+                 std::initializer_list<std::pair<CudaMatrixViewV1,
+                                                std::uint16_t*>> projections) {
+        if (tokens == 1 && profile_requested("Q38_CUDA_FUSED_PROJECTIONS")) {
+            CudaProjectionPackV1 pack;
+            for (const auto& item : projections) {
+                if (pack.count == 4)
+                    throw std::logic_error("projection pack exceeds four");
+                pack.matrices[pack.count] = item.first;
+                pack.outputs[pack.count++] = item.second;
+            }
+            cuda_multi_projection_decode_bf16(pack, input, workspace.stream,
+                                               options.device);
+            return;
+        }
+        for (const auto& item : projections)
+            cuda_gemv_bf16(item.first, input, item.second, tokens,
+                          workspace.stream, options.device);
+    }
+
+    void project_hc(const CudaMatrixViewV1& matrix,
+                    const std::uint16_t* input, std::uint16_t* output,
+                    std::uint32_t tokens, CudaHcActivation activation,
+                    float divisor, float output_scale) {
+        if(profile_requested("Q38_CUDA_HC_INJECT_BATCH") &&
+            cuda_try_hc_inject_batch_bf16(matrix,input,output,tokens,workspace.stream,
+                options.device,activation,divisor,output_scale))return;
+        static const bool enabled = profile_requested("Q38_CUDA_HC_GEMV");
+        static const bool fused = profile_requested("Q38_CUDA_HC_FUSED");
+        const bool specialized = (enabled || fused) && tokens == 1 &&
+            cuda_try_hc_gemv_bf16(matrix, input, output,
+                workspace.stream, options.device,
+                fused ? activation : CudaHcActivation::kNone,
+                divisor, output_scale);
+        if (specialized && fused) return;
+        if (!specialized)
+            cuda_gemv_bf16(matrix, input, output, tokens,
+                           workspace.stream, options.device);
+        if (activation == CudaHcActivation::kSilu)
+            cuda_hyper_silu_scaled_bf16(output, output, tokens, matrix.rows,
+                divisor, workspace.stream, options.device);
+        else if (activation == CudaHcActivation::kSigmoid)
+            cuda_hyper_sigmoid_bf16(output, output, tokens, matrix.rows,
+                divisor, output_scale, workspace.stream, options.device);
+    }
+
+    bool fuse_hyper_finish() const {
+        return options.te_world_size==2 && profile_requested("Q38_CUDA_HC_FINISH_FUSED");
     }
 
     void prepare_hyper(const HyperWeights& hyper, const std::uint16_t* input,
@@ -1221,34 +1558,110 @@ struct CudaStageBackend::Impl {
         auto stream = reinterpret_cast<void*>(workspace.stream);
         cuda_hyper_group_rmsnorm_bf16(input, hyper.norm, workspace.hyper_norm,
                                       tokens, stream, options.device);
-        cuda_gemv_bf16(hyper.mix_down, workspace.hyper_norm,
-                       workspace.low_rank, tokens, stream, options.device);
-        cuda_hyper_silu_scaled_bf16(
-            workspace.low_rank, workspace.low_rank, tokens,
-            kQ38HyperLowRank, kQ38HyperCount, stream, options.device);
-        cuda_gemv_bf16(hyper.mix_up, workspace.low_rank, workspace.mix_weights,
-                       tokens, stream, options.device);
-        cuda_hyper_sigmoid_bf16(workspace.mix_weights, workspace.mix_weights,
-                                tokens, kQ38HyperWidth, 1.0f, 1.0f, stream,
-                                options.device);
-        cuda_hyper_mix_bf16(workspace.hyper_norm, workspace.mix_weights,
-                            workspace.mixed, tokens, stream, options.device);
-        if (hyper.has_inject) {
-            cuda_gemv_bf16(hyper.inject, workspace.hyper_norm,
-                           workspace.injection, tokens, stream, options.device);
-            cuda_hyper_sigmoid_bf16(
-                workspace.injection, workspace.injection, tokens,
-                kQ38HyperCount, kQ38HyperCount, 2.0f, stream, options.device);
+        static const bool grouped_enabled = profile_requested("Q38_CUDA_HC_GROUPED");
+        // Grouped HC assumes full mix_down/inject rows; skip under TE.
+        const bool grouped = grouped_enabled && tokens == 1 && hyper.has_inject &&
+            options.te_world_size != 2 &&
+            cuda_try_hc_grouped_bf16(
+                {hyper.mix_down, workspace.low_rank, CudaHcActivation::kSilu,
+                 static_cast<float>(kQ38HyperCount), 1.0f},
+                {hyper.inject, workspace.injection, CudaHcActivation::kSigmoid,
+                 static_cast<float>(kQ38HyperCount), 2.0f},
+                workspace.hyper_norm, stream, options.device);
+        if (!grouped)
+            project_hc(hyper.mix_down, workspace.hyper_norm, workspace.low_rank,
+                       tokens, CudaHcActivation::kSilu, kQ38HyperCount, 1.0f);
+        if (options.te_world_size == 2 &&
+            hyper.mix_down.rows * 2u == kQ38HyperLowRank)
+            te_bridge_allgather_bf16(options.te_rank, workspace.low_rank,
+                                     workspace.low_rank, hyper.mix_down.rows,
+                                     tokens, te_bridge_group_for(options), workspace.stream);
+        const bool fused_mix=profile_requested("Q38_CUDA_HC_MIX_TENSOR") &&
+            cuda_try_hc_mix_tensor_bf16(hyper.mix_up,workspace.low_rank,workspace.hyper_norm,
+                workspace.mixed,tokens,workspace.stream,options.device);
+        if(!fused_mix){
+            project_hc(hyper.mix_up, workspace.low_rank, workspace.mix_weights,
+                       tokens, CudaHcActivation::kSigmoid, 1.0f, 1.0f);
+            if (options.te_world_size == 2 && hyper.mix_up.rows * 2u == kQ38HyperWidth)
+                te_bridge_allgather_bf16(options.te_rank,workspace.mix_weights,workspace.mix_weights,hyper.mix_up.rows,tokens,te_bridge_group_for(options),workspace.stream);
+            cuda_hyper_mix_bf16(workspace.hyper_norm, workspace.mix_weights,
+                                workspace.mixed,tokens,stream,options.device);
+        }
+        if (hyper.has_inject && !grouped) {
+            project_hc(hyper.inject, workspace.hyper_norm, workspace.injection,
+                       tokens, fuse_hyper_finish()?CudaHcActivation::kNone:CudaHcActivation::kSigmoid, kQ38HyperCount, 2.0f);
+            if (options.te_world_size == 2 &&
+                hyper.inject.rows * 2u == kQ38HyperCount)
+                te_bridge_allgather_bf16(options.te_rank, workspace.injection,
+                                         workspace.injection, hyper.inject.rows,
+                                         tokens, te_bridge_group_for(options), workspace.stream);
         }
     }
 
     std::uint16_t* finish_hyper(const std::uint16_t* original,
                                 std::uint16_t* destination,
                                 std::uint32_t tokens = 1) {
-        cuda_hyper_inject_bf16(
+        if(fuse_hyper_finish())
+            cuda_hyper_inject_from_projection_bf16(original,workspace.block_output,
+                workspace.injection,destination,tokens,workspace.stream,options.device);
+        else cuda_hyper_inject_bf16(
             original, workspace.block_output, workspace.injection, destination,
             tokens, reinterpret_cast<void*>(workspace.stream), options.device);
         return destination;
+    }
+
+    bool fuse_moe_finish(unsigned tokens) const {
+        return tokens > 1 && tokens <= 7 && fuse_hyper_finish() &&
+            profile_requested("Q38_CUDA_MOE_HC_FINISH_FUSED");
+    }
+    void finish_moe_hyper(const std::uint16_t* original,
+                          std::uint16_t* destination, unsigned tokens = 1) {
+        if (!fuse_moe_finish(tokens)) { finish_hyper(original,destination,tokens); return; }
+        cuda_hyper_moe_inject_bf16(original,workspace.proj6,workspace.proj5,
+            workspace.small1,workspace.injection,destination,tokens,workspace.stream,options.device);
+    }
+
+    void project_ple(const LayerWeights& layer, const std::uint16_t* input,
+                     std::uint16_t* key, std::uint16_t* value,
+                     std::uint32_t tokens) {
+        static const bool enabled = profile_requested("Q38_CUDA_PLE_FUSED");
+        if (enabled && tokens == 1) {
+            CudaProjectionPackV1 pack;
+            pack.count = 2;
+            pack.matrices[0] = layer.ple.key;
+            pack.matrices[1] = layer.ple.value;
+            pack.outputs[0] = key;
+            pack.outputs[1] = value;
+            cuda_multi_projection_decode_bf16(pack, input,
+                                               workspace.stream, options.device);
+            return;
+        }
+        cuda_gemv_bf16(layer.ple.key, input, key, tokens,
+                       workspace.stream, options.device);
+        cuda_gemv_bf16(layer.ple.value, input, value, tokens,
+                       workspace.stream, options.device);
+    }
+
+    void normalize_ple(const LayerWeights& layer, const std::uint16_t* key,
+                       const std::uint16_t* query, std::uint16_t* normalized_key,
+                       std::uint16_t* normalized_query, std::uint32_t tokens) {
+        static const bool paired = profile_requested("Q38_CUDA_PLE_NORM_PAIR");
+        if (paired) {
+            cuda_hyper_pair_group_rmsnorm_bf16(
+                {key, layer.ple.key_norm, normalized_key},
+                {query, layer.ple.query_norm, normalized_query},
+                tokens, workspace.stream, options.device);
+        } else {
+            cuda_hyper_group_rmsnorm_bf16(key, layer.ple.key_norm,
+                normalized_key, tokens, workspace.stream, options.device);
+            cuda_hyper_group_rmsnorm_bf16(query, layer.ple.query_norm,
+                normalized_query, tokens, workspace.stream, options.device);
+        }
+    }
+
+    bool ple_residual_fused() const {
+        static const bool enabled = profile_requested("Q38_CUDA_PLE_RESIDUAL");
+        return enabled;
     }
 
     void run_ple(const LayerWeights& layer, std::uint16_t* hyper,
@@ -1262,27 +1675,39 @@ struct CudaStageBackend::Impl {
                                  kQ38PleRowsPerToken;
         cuda_ple_fp8_rows_to_bf16(rows, scales, workspace.proj5, 1, stream,
                                   options.device);
-        cuda_gemv_bf16(layer.ple.key, workspace.proj5, workspace.proj1, 1,
-                       stream, options.device);
-        cuda_gemv_bf16(layer.ple.value, workspace.proj5, workspace.proj6, 1,
-                       stream, options.device);
-        cuda_hyper_group_rmsnorm_bf16(
-            workspace.proj1, layer.ple.key_norm, workspace.hyper_norm, 1,
-            stream, options.device);
-        cuda_hyper_group_rmsnorm_bf16(
-            hyper, layer.ple.query_norm, workspace.proj2, 1, stream,
-            options.device);
+        project_ple(layer, workspace.proj5, workspace.proj1, workspace.proj6, 1);
+        normalize_ple(layer, workspace.proj1, hyper, workspace.hyper_norm,
+                      workspace.proj2, 1);
         cuda_ple_gate_bf16(workspace.hyper_norm, workspace.proj2,
                            workspace.proj6, workspace.mix_weights, stream,
                            options.device);
         cuda_hyper_group_rmsnorm_bf16(
             workspace.mix_weights, layer.ple.conv_norm, workspace.proj1, 1,
             stream, options.device);
-        cuda_ple_conv_decode_bf16(
-            workspace.mix_weights, workspace.proj1, layer.ple.conv,
-            ple_state->working(), workspace.proj2, stream, options.device);
-        cuda_add_bf16(hyper, workspace.proj2, destination, kQ38HyperWidth,
-                      stream, options.device);
+        if (ple_residual_fused()) {
+            cuda_ple_conv_residual_bf16(workspace.mix_weights, workspace.proj1,
+                layer.ple.conv, ple_state->working(), hyper, destination,
+                1, stream, options.device);
+        } else {
+            cuda_ple_conv_decode_bf16(
+                workspace.mix_weights, workspace.proj1, layer.ple.conv,
+                ple_state->working(), workspace.proj2, stream, options.device);
+            cuda_add_bf16(hyper, workspace.proj2, destination, kQ38HyperWidth,
+                          stream, options.device);
+        }
+    }
+
+    CudaPrefixSnapshotView gdn_prefix_view(const LayerWeights& layer, bool recurrent) {
+        if (!capture_target_prefixes) return {};
+        const auto layer_bytes = gdn_state->bytes_per_bank() / gdn_state->layers();
+        const auto conv_bytes = std::uint64_t(kQ38GdnQkvWidth) * kQ38GdnConvWidth * 2;
+        return target_prefixes->view(layer.state_local * layer_bytes +
+            (recurrent ? conv_bytes : 0), target_prefix_count);
+    }
+    CudaPrefixSnapshotView ple_prefix_view() {
+        return capture_target_prefixes
+            ? target_prefixes->view(target_prefixes->gdn_bytes, target_prefix_count)
+            : CudaPrefixSnapshotView{};
     }
 
     void run_ple_prefill(const LayerWeights& layer,
@@ -1300,17 +1725,11 @@ struct CudaStageBackend::Impl {
         cuda_ple_fp8_rows_to_bf16(rows, scales, workspace.proj5, tokens,
                                   stream, options.device);
         if (detailed_prefill_profile()) profile_mark("ple_unpack");
-        cuda_gemv_bf16(layer.ple.key, workspace.proj5, workspace.hyper_norm,
-                       tokens, stream, options.device);
-        cuda_gemv_bf16(layer.ple.value, workspace.proj5, workspace.proj6,
-                       tokens, stream, options.device);
+        project_ple(layer, workspace.proj5, workspace.hyper_norm,
+                    workspace.proj6, tokens);
         if (detailed_prefill_profile()) profile_mark("ple_key_value");
-        cuda_hyper_group_rmsnorm_bf16(
-            workspace.hyper_norm, layer.ple.key_norm, workspace.proj1, tokens,
-            stream, options.device);
-        cuda_hyper_group_rmsnorm_bf16(
-            hyper, layer.ple.query_norm, workspace.proj2, tokens, stream,
-            options.device);
+        normalize_ple(layer, workspace.hyper_norm, hyper, workspace.proj1,
+                      workspace.proj2, tokens);
         if (detailed_prefill_profile()) profile_mark("ple_norms");
         cuda_ple_gate_prefill_bf16(
             workspace.proj1, workspace.proj2, workspace.proj6,
@@ -1320,27 +1739,91 @@ struct CudaStageBackend::Impl {
             workspace.mix_weights, layer.ple.conv_norm, workspace.hyper_norm,
             tokens, stream, options.device);
         if (detailed_prefill_profile()) profile_mark("ple_conv_norm");
-        cuda_ple_conv_prefill_bf16(
-            workspace.mix_weights, workspace.hyper_norm, layer.ple.conv,
-            ple_state->working(), workspace.proj2, tokens, stream,
-            options.device);
-        if (detailed_prefill_profile()) profile_mark("ple_conv");
-        cuda_add_bf16(hyper, workspace.proj2, destination,
-                      static_cast<std::size_t>(tokens) * kQ38HyperWidth,
-                      stream, options.device);
-        if (detailed_prefill_profile()) profile_mark("ple_residual");
+        if (ple_residual_fused()) {
+            cuda_ple_conv_residual_bf16(workspace.mix_weights, workspace.hyper_norm,
+                layer.ple.conv, ple_state->working(), hyper, destination,
+                tokens, stream, options.device, ple_prefix_view());
+            if (detailed_prefill_profile()) profile_mark("ple_conv_residual");
+        } else {
+            cuda_ple_conv_prefill_bf16(
+                workspace.mix_weights, workspace.hyper_norm, layer.ple.conv,
+                ple_state->working(), workspace.proj2, tokens, stream,
+                options.device, ple_prefix_view());
+            if (detailed_prefill_profile()) profile_mark("ple_conv");
+            cuda_add_bf16(hyper, workspace.proj2, destination,
+                          static_cast<std::size_t>(tokens) * kQ38HyperWidth,
+                          stream, options.device);
+            if (detailed_prefill_profile()) profile_mark("ple_residual");
+        }
+    }
+
+    bool run_gdn_local(const LayerWeights& layer, unsigned tokens, bool decode) {
+        if(!profile_requested("Q38_TP_GDN_LOCAL")) return false;
+        const bool packed=profile_requested("Q38_TP_GDN_PACKED");
+        if(options.te_world_size!=2 || layer.gdn.qkv.rows!=(packed?10240:5120) ||
+           layer.gdn.z.rows!=6144 || layer.gdn.b.rows!=48 || layer.gdn.a.rows!=48 ||
+           layer.gdn.output.columns!=3072 || (!decode && !precomputed_gdn_prefill_enabled()) ||
+           (packed && layer.gdn.packed.rows!=8192))
+            throw std::logic_error("head-local GDN profile/artifact mismatch");
+        auto stream=reinterpret_cast<void*>(workspace.stream);
+        const bool bulk=tokens>=8;
+        const bool fused=packed && !bulk;
+        const auto qkv=packed?layer.gdn.qkv:(bulk?layer.gdn.qkv_prefill_full:layer.gdn.qkv);
+        if(bulk && !qkv.data)throw std::logic_error("missing exact bulk QKV projection");
+        if(fused){
+            cuda_gemv_bf16(layer.gdn.packed,workspace.mixed,workspace.proj1,tokens,stream,options.device);
+            project(workspace.mixed,tokens,{{layer.gdn.b,workspace.small0},{layer.gdn.a,workspace.small1}});
+        } else project(workspace.mixed,tokens,{{qkv,workspace.proj1},{layer.gdn.z,workspace.proj3},{layer.gdn.b,workspace.small0},{layer.gdn.a,workspace.small1}});
+        if (detailed_prefill_profile()) profile_mark("gdn_local_projection");
+        const auto state=gdn_state->working(layer.state_local);
+        CudaGdnHeadLocalProjectionLayout projection_layout;
+        projection_layout.full_qkv = bulk;
+        projection_layout.qkv_stride = fused ? 8192 : qkv.rows;
+        projection_layout.control_heads = 48;
+        projection_layout.control_stride = 48;
+        projection_layout.z_heads = fused ? 24 : 48;
+        projection_layout.z_head_begin = fused ? 0 : options.te_rank * 24;
+        projection_layout.z_stride = fused ? 8192 : 6144;
+        cuda_gdn_head_local_bf16(workspace.proj1,workspace.small0,
+            workspace.small1,fused?workspace.proj1+5120:workspace.proj3,
+            layer.gdn.conv,layer.gdn.a_log,layer.gdn.dt_bias,layer.gdn.norm,
+            state,workspace.proj2,workspace.proj4,workspace.proj0,workspace.block_scores,
+            tokens,options.te_rank,decode,stream,options.device,
+            decode?CudaPrefixSnapshotView{}:gdn_prefix_view(layer,false),
+            decode?CudaPrefixSnapshotView{}:gdn_prefix_view(layer,true),projection_layout,
+            workspace.gdn_normalized_qk);
+        if (detailed_prefill_profile()) profile_mark("gdn_local_recurrent_norm");
+        cuda_gemv_bf16(layer.gdn.output,workspace.proj0,workspace.block_output,tokens,stream,options.device);
+        if (detailed_prefill_profile()) profile_mark("gdn_local_output");
+        te_bridge_allreduce_sum_bf16(options.te_rank,workspace.block_output,
+            static_cast<std::size_t>(tokens)*kQ38HiddenWidth,te_bridge_group_for(options),workspace.stream);
+        if (detailed_prefill_profile()) profile_mark("gdn_local_collective");
+        return true;
     }
 
     void run_gdn(const LayerWeights& layer) {
+        if(run_gdn_local(layer,1,true)) return;
         auto stream = reinterpret_cast<void*>(workspace.stream);
-        cuda_gemv_bf16(layer.gdn.qkv, workspace.mixed, workspace.proj1, 1,
-                       stream, options.device);
-        cuda_gemv_bf16(layer.gdn.z, workspace.mixed, workspace.proj3, 1,
-                       stream, options.device);
-        cuda_gemv_bf16(layer.gdn.b, workspace.mixed, workspace.small0, 1,
-                       stream, options.device);
-        cuda_gemv_bf16(layer.gdn.a, workspace.mixed, workspace.small1, 1,
-                       stream, options.device);
+        project(workspace.mixed, 1, {
+            {layer.gdn.qkv, workspace.proj1},
+            {layer.gdn.z, workspace.proj3},
+            {layer.gdn.b, workspace.small0},
+            {layer.gdn.a, workspace.small1}});
+        if (options.te_world_size == 2) {
+            // S3.4b: AllGather row-parallel projections before full GDN.
+            if (layer.gdn.qkv.rows * 2u == kQ38GdnQkvWidth)
+                te_bridge_allgather_bf16(options.te_rank, workspace.proj1,
+                                         workspace.proj1, layer.gdn.qkv.rows, /*tokens=*/1, te_bridge_group_for(options), workspace.stream);
+            if (layer.gdn.z.rows * 2u == kQ38GdnValueWidth)
+                te_bridge_allgather_bf16(options.te_rank, workspace.proj3,
+                                         workspace.proj3, layer.gdn.z.rows, /*tokens=*/1, te_bridge_group_for(options), workspace.stream);
+            if (layer.gdn.b.rows * 2u == kQ38GdnValueHeads)
+                te_bridge_allgather_bf16(options.te_rank, workspace.small0,
+                                         workspace.small0, layer.gdn.b.rows, /*tokens=*/1, te_bridge_group_for(options), workspace.stream);
+            if (layer.gdn.a.rows * 2u == kQ38GdnValueHeads)
+                te_bridge_allgather_bf16(options.te_rank, workspace.small1,
+                                         workspace.small1, layer.gdn.a.rows, /*tokens=*/1, te_bridge_group_for(options), workspace.stream);
+        }
         const auto state = gdn_state->working(layer.state_local);
         cuda_gdn_conv_decode_bf16(
             workspace.proj1, layer.gdn.conv, state.conv, workspace.proj2,
@@ -1352,32 +1835,58 @@ struct CudaStageBackend::Impl {
         cuda_gdn_output_norm_bf16(
             workspace.proj4, workspace.proj3, layer.gdn.norm, workspace.proj0,
             1.0e-6f, stream, options.device);
-        cuda_gemv_bf16(layer.gdn.output, workspace.proj0,
-                       workspace.block_output, 1, stream, options.device);
+        const std::uint16_t* out_in = workspace.proj0;
+        if (options.te_world_size == 2 &&
+            layer.gdn.output.columns * 2u == kQ38GdnValueWidth)
+            out_in = workspace.proj0 +
+                     static_cast<std::size_t>(options.te_rank) *
+                         layer.gdn.output.columns;
+        cuda_gemv_bf16(layer.gdn.output, out_in, workspace.block_output, 1,
+                       stream, options.device);
+        if (options.te_world_size == 2)
+            te_bridge_allreduce_sum_bf16(options.te_rank, workspace.block_output,
+                                         kQ38HiddenWidth, te_bridge_group_for(options), workspace.stream);
     }
 
     void run_gdn_prefill(const LayerWeights& layer, std::uint32_t tokens) {
+        if(run_gdn_local(layer,tokens,false)) return;
         auto stream = reinterpret_cast<void*>(workspace.stream);
-        cuda_gemv_bf16(layer.gdn.qkv, workspace.mixed, workspace.proj1,
-                       tokens, stream, options.device);
-        cuda_gemv_bf16(layer.gdn.z, workspace.mixed, workspace.proj3, tokens,
-                       stream, options.device);
-        cuda_gemv_bf16(layer.gdn.b, workspace.mixed, workspace.small0, tokens,
-                       stream, options.device);
-        cuda_gemv_bf16(layer.gdn.a, workspace.mixed, workspace.small1, tokens,
-                       stream, options.device);
+        project(workspace.mixed, tokens, {
+            {layer.gdn.qkv, workspace.proj1},
+            {layer.gdn.z, workspace.proj3},
+            {layer.gdn.b, workspace.small0},
+            {layer.gdn.a, workspace.small1}});
+        if (options.te_world_size == 2) {
+            // Prefill TE: token-major AllGather (per-token half -> full).
+            if (layer.gdn.qkv.rows * 2u == kQ38GdnQkvWidth)
+                te_bridge_allgather_bf16(options.te_rank, workspace.proj1,
+                                         workspace.proj1, layer.gdn.qkv.rows,
+                                         tokens, te_bridge_group_for(options), workspace.stream);
+            if (layer.gdn.z.rows * 2u == kQ38GdnValueWidth)
+                te_bridge_allgather_bf16(options.te_rank, workspace.proj3,
+                                         workspace.proj3, layer.gdn.z.rows,
+                                         tokens, te_bridge_group_for(options), workspace.stream);
+            if (layer.gdn.b.rows * 2u == kQ38GdnValueHeads)
+                te_bridge_allgather_bf16(options.te_rank, workspace.small0,
+                                         workspace.small0, layer.gdn.b.rows,
+                                         tokens, te_bridge_group_for(options), workspace.stream);
+            if (layer.gdn.a.rows * 2u == kQ38GdnValueHeads)
+                te_bridge_allgather_bf16(options.te_rank, workspace.small1,
+                                         workspace.small1, layer.gdn.a.rows,
+                                         tokens, te_bridge_group_for(options), workspace.stream);
+        }
         if (detailed_prefill_profile()) profile_mark("gdn_project");
         const auto state = gdn_state->working(layer.state_local);
         cuda_gdn_conv_prefill_bf16(
             workspace.proj1, layer.gdn.conv, state.conv, workspace.proj2,
-            tokens, stream, options.device);
+            tokens, stream, options.device, gdn_prefix_view(layer, false));
         if (detailed_prefill_profile()) profile_mark("gdn_conv");
         if (precomputed_gdn_prefill_enabled())
             cuda_gdn_recurrent_prefill_precomputed_bf16(
                 workspace.proj2, workspace.small0, workspace.small1,
                 layer.gdn.a_log, layer.gdn.dt_bias, state.recurrent,
                 workspace.block_scores, workspace.proj4, tokens, stream,
-                options.device);
+                options.device, gdn_prefix_view(layer, true));
         else if (partitioned_gdn_prefill_enabled())
             cuda_gdn_recurrent_prefill_partitioned_bf16(
                 workspace.proj2, workspace.small0, workspace.small1,
@@ -1393,24 +1902,65 @@ struct CudaStageBackend::Impl {
             workspace.proj4, workspace.proj3, layer.gdn.norm, workspace.proj0,
             tokens, 1.0e-6f, stream, options.device);
         if (detailed_prefill_profile()) profile_mark("gdn_output_norm");
-        cuda_gemv_bf16(layer.gdn.output, workspace.proj0,
-                       workspace.block_output, tokens, stream,
-                       options.device);
+        {
+            const std::uint16_t* out_in = workspace.proj0;
+            if (options.te_world_size == 2 &&
+                layer.gdn.output.columns * 2u == kQ38GdnValueWidth)
+            {
+                const auto width = layer.gdn.output.columns;
+                check(cudaMemcpy2DAsync(
+                    workspace.proj2, width * sizeof(std::uint16_t),
+                    workspace.proj0 + options.te_rank * width,
+                    width * 2 * sizeof(std::uint16_t),
+                    width * sizeof(std::uint16_t), tokens,
+                    cudaMemcpyDeviceToDevice, workspace.stream),
+                    "pack token-major TE column input");
+                out_in = workspace.proj2;
+            }
+            cuda_gemv_bf16(layer.gdn.output, out_in, workspace.block_output,
+                           tokens, stream, options.device);
+        }
+        if (options.te_world_size == 2)
+            te_bridge_allreduce_sum_bf16(
+                options.te_rank, workspace.block_output,
+                static_cast<std::size_t>(kQ38HiddenWidth) * tokens, te_bridge_group_for(options), workspace.stream);
         if (detailed_prefill_profile()) profile_mark("gdn_output");
     }
 
     void run_qsa(const LayerWeights& layer, std::uint32_t position,
                  CudaQsaStateBank& state_bank) {
+
+        const bool local = profile_requested("Q38_TP_QSA_LOCAL") &&
+            options.te_world_size == 2 && layer.sparse.output.columns == 3072;
+        const bool local_projection = local && 1 < 8 && profile_requested("Q38_TP_QSA_LOCAL_PROJECTION");
+        ScopedQsaHeadLayout head_scope(local
+            ? CudaQsaHeadLayout{unsigned(options.te_rank) * 12u,12u,
+                local_projection ? unsigned(options.te_rank) * 12u : 0u,
+                local_projection ? 12u : 24u}
+            : CudaQsaHeadLayout{});
         auto stream = reinterpret_cast<void*>(workspace.stream);
         const auto state = state_bank.working(layer.state_local);
-        cuda_gemv_bf16(layer.sparse.q_gate, workspace.mixed, workspace.proj0, 1,
-                       stream, options.device);
-        cuda_gemv_bf16(layer.sparse.k, workspace.mixed, workspace.small0, 1,
-                       stream, options.device);
-        cuda_gemv_bf16(layer.sparse.v, workspace.mixed, workspace.small1, 1,
-                       stream, options.device);
-        cuda_gemv_bf16(layer.sparse.index_qk, workspace.mixed,
-                       workspace.small2, 1, stream, options.device);
+        project(workspace.mixed, 1, {
+            {local_projection ? layer.sparse.q_gate_local : layer.sparse.q_gate, workspace.proj0},
+            {layer.sparse.k, workspace.small0},
+            {layer.sparse.v, workspace.small1},
+            {layer.sparse.index_qk, workspace.small2}});
+        if (options.te_world_size == 2) {
+            if (layer.sparse.q_gate.rows * 2u == 12288u)
+                te_bridge_allgather_bf16(options.te_rank, workspace.proj0,
+                                         workspace.proj0, layer.sparse.q_gate.rows, /*tokens=*/1, te_bridge_group_for(options), workspace.stream);
+            // k/v/index often replicated or smaller; AG when halved
+            if (layer.sparse.k.rows * 2u == 512u)
+                te_bridge_allgather_bf16(options.te_rank, workspace.small0,
+                                         workspace.small0, layer.sparse.k.rows, /*tokens=*/1, te_bridge_group_for(options), workspace.stream);
+            if (layer.sparse.v.rows * 2u == 512u)
+                te_bridge_allgather_bf16(options.te_rank, workspace.small1,
+                                         workspace.small1, layer.sparse.v.rows, /*tokens=*/1, te_bridge_group_for(options), workspace.stream);
+            if (layer.sparse.index_qk.rows * 2u == 640u)
+                te_bridge_allgather_bf16(options.te_rank, workspace.small2,
+                                         workspace.small2,
+                                         layer.sparse.index_qk.rows, /*tokens=*/1, te_bridge_group_for(options), workspace.stream);
+        }
         profile_mark("qsa_project");
         cuda_qsa_prepare_main_decode_bf16(
             workspace.proj0, workspace.small0, workspace.small1,
@@ -1434,25 +1984,63 @@ struct CudaStageBackend::Impl {
             workspace.proj0, workspace.proj4, workspace.proj3,
             kQ38GdnValueWidth, stream, options.device);
         profile_mark("qsa_gate");
-        cuda_gemv_bf16(layer.sparse.output, workspace.proj3,
-                       workspace.block_output, 1, stream, options.device);
+        {
+            const std::uint16_t* out_in = workspace.proj3;
+            if (options.te_world_size == 2 &&
+                layer.sparse.output.columns * 2u == 6144u)
+                out_in = workspace.proj3 +
+                         static_cast<std::size_t>(options.te_rank) *
+                             layer.sparse.output.columns;
+            cuda_gemv_bf16(layer.sparse.output, out_in, workspace.block_output,
+                           1, stream, options.device);
+        }
+        // Replicated MTP QSA already produced the full output on each rank.
+        if (options.te_world_size == 2 &&
+            layer.sparse.output.columns * 2u == 6144u)
+            te_bridge_allreduce_sum_bf16(options.te_rank, workspace.block_output,
+                                         kQ38HiddenWidth, te_bridge_group_for(options), workspace.stream);
         profile_mark("qsa_output");
     }
 
     void run_qsa_prefill(const LayerWeights& layer,
                          std::uint32_t first_position,
                          std::uint32_t tokens,
-                         CudaQsaStateBank& state_bank) {
+                         CudaQsaStateBank& state_bank,
+                         bool cache_only = false) {
+
+        const bool local = profile_requested("Q38_TP_QSA_LOCAL") &&
+            options.te_world_size == 2 && layer.sparse.output.columns == 3072;
+        const bool local_projection = local && tokens < 8 && profile_requested("Q38_TP_QSA_LOCAL_PROJECTION");
+        ScopedQsaHeadLayout head_scope(local
+            ? CudaQsaHeadLayout{unsigned(options.te_rank) * 12u,12u,
+                local_projection ? unsigned(options.te_rank) * 12u : 0u,
+                local_projection ? 12u : 24u}
+            : CudaQsaHeadLayout{});
         auto stream = reinterpret_cast<void*>(workspace.stream);
         const auto state = state_bank.working(layer.state_local);
-        cuda_gemv_bf16(layer.sparse.q_gate, workspace.mixed, workspace.proj0,
-                       tokens, stream, options.device);
-        cuda_gemv_bf16(layer.sparse.k, workspace.mixed, workspace.small0,
-                       tokens, stream, options.device);
-        cuda_gemv_bf16(layer.sparse.v, workspace.mixed, workspace.small1,
-                       tokens, stream, options.device);
-        cuda_gemv_bf16(layer.sparse.index_qk, workspace.mixed,
-                       workspace.small2, tokens, stream, options.device);
+        project(workspace.mixed, tokens, {
+            {local_projection ? layer.sparse.q_gate_local : layer.sparse.q_gate, workspace.proj0},
+            {layer.sparse.k, workspace.small0},
+            {layer.sparse.v, workspace.small1},
+            {layer.sparse.index_qk, workspace.small2}});
+        if (options.te_world_size == 2) {
+            if (layer.sparse.q_gate.rows * 2u == 12288u)
+                te_bridge_allgather_bf16(options.te_rank, workspace.proj0,
+                                         workspace.proj0,
+                                         layer.sparse.q_gate.rows, tokens, te_bridge_group_for(options), workspace.stream);
+            if (layer.sparse.k.rows * 2u == 512u)
+                te_bridge_allgather_bf16(options.te_rank, workspace.small0,
+                                         workspace.small0, layer.sparse.k.rows,
+                                         tokens, te_bridge_group_for(options), workspace.stream);
+            if (layer.sparse.v.rows * 2u == 512u)
+                te_bridge_allgather_bf16(options.te_rank, workspace.small1,
+                                         workspace.small1, layer.sparse.v.rows,
+                                         tokens, te_bridge_group_for(options), workspace.stream);
+            if (layer.sparse.index_qk.rows * 2u == 640u)
+                te_bridge_allgather_bf16(options.te_rank, workspace.small2,
+                                         workspace.small2,
+                                         layer.sparse.index_qk.rows, tokens, te_bridge_group_for(options), workspace.stream);
+        }
         if (detailed_prefill_profile()) profile_mark("qsa_project");
         cuda_qsa_prepare_prefill_bf16(
             workspace.proj0, workspace.small0, workspace.small1,
@@ -1461,13 +2049,18 @@ struct CudaStageBackend::Impl {
             workspace.proj3, workspace.proj4, workspace.proj1, state,
             first_position, tokens, stream, options.device);
         if (detailed_prefill_profile()) profile_mark("qsa_prepare");
+        // Preparation writes all persistent QSA state (K/V, raw index keys,
+        // pooled index keys). MTP commit repair only needs those writes; the
+        // attention result and following feed-forward output are discarded.
+        if (cache_only) return;
         cuda_qsa_select_prefill(
             workspace.proj1, state, first_position, tokens,
             workspace.block_scores,
             kQ38ContextLimit / kQ38QsaBlockTokens,
             workspace.selected_indices, stream, options.device);
         if (detailed_prefill_profile()) profile_mark("qsa_select");
-        const bool grouped_qsa = grouped_qsa_prefill_enabled();
+        const bool grouped_qsa = grouped_qsa_prefill_enabled() &&
+            !(tokens<=7 && profile_requested("Q38_CUDA_QSA_SMALL_UNGROUPED"));
         const bool fused_grouped_qsa =
             grouped_qsa && fused_grouped_qsa_prefill_enabled();
         if (fused_grouped_qsa) {
@@ -1507,13 +2100,83 @@ struct CudaStageBackend::Impl {
             static_cast<std::size_t>(tokens) * kQ38GdnValueWidth, stream,
             options.device);
         if (detailed_prefill_profile()) profile_mark("qsa_gate");
-        cuda_gemv_bf16(layer.sparse.output, workspace.proj3,
-                       workspace.block_output, tokens, stream,
-                       options.device);
+        {
+            const std::uint16_t* out_in = workspace.proj3;
+            if (options.te_world_size == 2 &&
+                layer.sparse.output.columns * 2u == 6144u)
+            {
+                const auto width = layer.sparse.output.columns;
+                check(cudaMemcpy2DAsync(
+                    workspace.proj2, width * sizeof(std::uint16_t),
+                    workspace.proj3 + options.te_rank * width,
+                    width * 2 * sizeof(std::uint16_t),
+                    width * sizeof(std::uint16_t), tokens,
+                    cudaMemcpyDeviceToDevice, workspace.stream),
+                    "pack token-major TE column input");
+                out_in = workspace.proj2;
+            }
+            cuda_gemv_bf16(layer.sparse.output, out_in, workspace.block_output,
+                           tokens, stream, options.device);
+        }
+        // Replicated MTP QSA already produced the full output on each rank.
+        if (options.te_world_size == 2 &&
+            layer.sparse.output.columns * 2u == 6144u)
+            te_bridge_allreduce_sum_bf16(
+                options.te_rank, workspace.block_output,
+                static_cast<std::size_t>(kQ38HiddenWidth) * tokens, te_bridge_group_for(options), workspace.stream);
         if (detailed_prefill_profile()) profile_mark("qsa_output");
     }
 
+    void run_moe_shared(const LayerWeights& layer, std::uint32_t tokens) {
+        auto stream = reinterpret_cast<void*>(workspace.stream);
+        project(workspace.mixed, tokens, {
+            {layer.moe.shared_gate, workspace.small2},
+            {layer.moe.shared_up, workspace.small1}});
+        if (detailed_prefill_profile())
+            profile_mark("moe_shared_projection");
+        if (options.te_world_size == 2 &&
+            layer.moe.shared_gate.rows * 2u == kQ38MoeIntermediate) {
+            // Shared expert is row-sharded on the intermediate dim; gather
+            // before SiLU so the replicated down proj sees full width 640.
+            te_bridge_allgather_bf16(options.te_rank, workspace.small2,
+                                     workspace.small2,
+                                     layer.moe.shared_gate.rows, tokens,
+                                     te_bridge_group_for(options), workspace.stream);
+            te_bridge_allgather_bf16(options.te_rank, workspace.small1,
+                                     workspace.small1,
+                                     layer.moe.shared_up.rows, tokens,
+                                     te_bridge_group_for(options), workspace.stream);
+            if (tokens == 1)
+                te_debug_probe_bf16("moe_shared_after_ag", options.te_rank,
+                                    workspace.small2, workspace.stream);
+        }
+        if (tokens == 1 ||
+            (prefill_profile && prefill_profile->active()))
+            profile_mark(detailed_prefill_profile() ? "moe_shared_gather"
+                                                 : "moe_shared_gate_up");
+        cuda_silu_multiply_bf16(
+            workspace.small2, workspace.small1, workspace.small0,
+            static_cast<std::size_t>(tokens) * kQ38MoeIntermediate, stream,
+            options.device);
+        if (options.te_world_size == 2 && tokens == 1)
+            te_debug_probe_bf16("moe_shared_after_silu", options.te_rank,
+                                workspace.small0, workspace.stream);
+        cuda_gemv_bf16(layer.moe.shared_down, workspace.small0,
+                       workspace.proj5, tokens, stream, options.device);
+        if (options.te_world_size == 2 && tokens == 1)
+            te_debug_probe_bf16("moe_shared_after_down", options.te_rank,
+                                workspace.proj5, workspace.stream);
+        if (tokens == 1 ||
+            (prefill_profile && prefill_profile->active()))
+            profile_mark("moe_shared_down");
+        cuda_gemv_bf16(layer.moe.shared_output_gate, workspace.mixed,
+                       workspace.small1, tokens, stream, options.device);
+    }
+
     void run_moe(const LayerWeights& layer, std::uint32_t tokens = 1) {
+        bool shared_complete = false;
+        const bool direct_reduce = options.te_world_size == 2 && tokens <= 7 &&
+            cuda_marlin_moe_enabled() && profile_requested("Q38_CUDA_MARLIN_DIRECT_REDUCE");
         auto stream = reinterpret_cast<void*>(workspace.stream);
         cuda_gemv_bf16(layer.moe.router, workspace.mixed, workspace.small0,
                        tokens, stream, options.device);
@@ -1523,72 +2186,186 @@ struct CudaStageBackend::Impl {
         cuda_topk_router_bf16(workspace.small0, workspace.expert_ids,
                               workspace.expert_weights, tokens, kQ38MoeExperts,
                               kQ38MoeTopK, true, stream, options.device);
+        if (options.te_world_size == 2) {
+            const auto local_experts = layer.moe.gate_up_experts.descriptor->shape[0];
+            te_remap_experts_kernel<<<(tokens * kQ38MoeTopK + 255) / 256, 256,
+                                      0, workspace.stream>>>(
+                workspace.expert_ids, workspace.expert_weights,
+                tokens * kQ38MoeTopK, options.te_rank * local_experts,
+                local_experts);
+            check(cudaPeekAtLastError(), "te_remap_experts_kernel");
+        }
         if (tokens == 1 ||
             (prefill_profile && prefill_profile->active()))
             profile_mark("moe_topk");
         const bool grouped_prefill =
-            tokens > 1 && workspace.moe_route_plan.header != nullptr;
+            (tokens > 1 || cuda_marlin_moe_enabled()) && (options.te_world_size != 2 ||
+                          profile_requested("Q38_TP_GROUPED_MOE")) &&
+            workspace.moe_route_plan.header != nullptr;
         const bool detailed_prefill_profile =
             grouped_prefill && prefill_profile && prefill_profile->active() &&
             (profile_requested("Q38_CUDA_PROFILE_PREFILL_DETAIL") ||
              profile_requested("Q38_CUDA_PROFILE_PREFILL_MOE_DETAIL"));
+        const auto grouped_mode = options.te_world_size == 2 &&
+            profile_requested("Q38_TP_MOE_FP32_SCALES")
+                ? Q38PrefillMoeModeV1::kGroupedFp32Scales : prefill_moe_mode();
         if (grouped_prefill) {
             cuda_moe_build_route_plan_v1(
                 workspace.expert_ids, tokens, workspace.moe_route_plan,
-                stream, options.device);
+                stream, options.device,
+                static_cast<std::uint32_t>(layer.moe.gate_up_experts.descriptor->shape[0]),
+                options.te_world_size == 2,
+                !profile_requested("Q38_CUDA_MOE_ROUTE_HASH_SKIP"));
             if (detailed_prefill_profile) profile_mark("moe_route_plan");
             cuda_moe_pack_hidden_v1(
                 workspace.mixed, workspace.moe_route_plan.packed_assignment,
                 tokens * kQ38MoeTopK, workspace.moe_packed_hidden, stream,
                 options.device);
             if (detailed_prefill_profile) profile_mark("moe_pack_hidden");
+            if (cuda_marlin_moe_enabled()) {
+                cuda_marlin_moe(layer.moe.gate_up_experts,layer.moe.down_experts,
+                    workspace.moe_packed_hidden,workspace.moe_route_plan.tasks,
+                    q38_moe_prefill_max_tasks_v1(tokens),tokens*kQ38MoeTopK,
+                    workspace.moe_weighted_mid,direct_reduce ? workspace.te_routed : workspace.moe_route_output,
+                    [&]{auto ws=workspace.marlin;
+                        ws.owned_routes=workspace.moe_route_plan.expert_offsets+kQ38RouteExperts;
+                        if (direct_reduce) {
+                            ws.reduce_assignment_to_packed = workspace.moe_route_plan.assignment_to_packed;
+                            ws.reduce_route_weights = workspace.expert_weights;
+                        }
+                        return ws;}(),stream);
+                if (detailed_prefill_profile) profile_mark("moe_marlin");
+            } else {
             cuda_moe_grouped_gate_up_v1(
                 layer.moe.gate_up_experts, workspace.moe_packed_hidden,
                 workspace.moe_route_plan.packed_assignment,
                 workspace.expert_weights, workspace.moe_route_plan.tasks,
                 q38_moe_prefill_max_tasks_v1(tokens),
-                workspace.moe_weighted_mid, prefill_moe_mode(), stream,
-                options.device);
+                workspace.moe_weighted_mid, grouped_mode, stream,
+                options.device, options.te_world_size != 2);
             if (detailed_prefill_profile) profile_mark("moe_gate_up");
             cuda_moe_grouped_down_v1(
                 layer.moe.down_experts, workspace.moe_weighted_mid,
                 workspace.moe_route_plan.tasks,
                 q38_moe_prefill_max_tasks_v1(tokens),
-                workspace.moe_route_output, prefill_moe_mode(), stream,
+                workspace.moe_route_output, grouped_mode, stream,
                 options.device);
             if (detailed_prefill_profile) profile_mark("moe_down");
+            }
+            if (options.te_world_size == 2 && !direct_reduce)
+                cuda_moe_reduce_top10_f32_v1(
+                    workspace.moe_route_output,
+                    workspace.moe_route_plan.assignment_to_packed,
+                    tokens, workspace.te_routed, stream, options.device,
+                    workspace.expert_weights);
         } else {
-            cuda_moe_routed_bf16(
-                layer.moe.gate_up_experts, layer.moe.down_experts,
-                workspace.mixed, workspace.expert_ids,
-                workspace.expert_weights, tokens, kQ38MoeTopK,
-                workspace.moe_gate_up, workspace.moe_activated,
-                workspace.moe_accumulation, workspace.proj6, stream,
-                options.device);
+            // The decode workspace has one route row. Iterate rows for TP
+            // prefill instead of passing a batch that overruns its scratch.
+            const auto batch = options.te_world_size == 2 ? 1u : tokens;
+            for (std::uint32_t first = 0; first < tokens; first += batch)
+                cuda_moe_routed_bf16(
+                    layer.moe.gate_up_experts, layer.moe.down_experts,
+                    workspace.mixed + first * kQ38HiddenWidth,
+                    workspace.expert_ids + first * kQ38MoeTopK,
+                    workspace.expert_weights + first * kQ38MoeTopK,
+                    batch, kQ38MoeTopK, workspace.moe_gate_up,
+                    workspace.moe_activated, workspace.moe_accumulation,
+                    workspace.proj6 + first * kQ38HiddenWidth,
+                    stream, options.device,
+                    options.te_world_size == 2 ? workspace.te_routed + first * kQ38HiddenWidth : nullptr);
+        }
+        if (options.te_world_size == 2) {
+            const auto count = static_cast<std::size_t>(kQ38HiddenWidth) * tokens;
+            if (grouped_prefill && profile_requested("Q38_TP_MOE_VALIDATE")) {
+                // Compare the two operators on the SAME layer input. Model
+                // logits alone conflate local arithmetic error with later
+                // router changes and recurrent-state propagation. Diagnostic
+                // only: preserve the grouped output used by this invocation.
+                std::vector<float> grouped(count), row(count);
+                check(cudaMemcpyAsync(grouped.data(), workspace.te_routed,
+                    count * sizeof(float), cudaMemcpyDeviceToHost, workspace.stream),
+                    "copy grouped MoE validation output");
+                check(cudaStreamSynchronize(workspace.stream),
+                    "grouped MoE validation ready");
+                for (std::uint32_t first = 0; first < tokens; ++first)
+                    cuda_moe_routed_bf16(
+                        layer.moe.gate_up_experts, layer.moe.down_experts,
+                        workspace.mixed + first * kQ38HiddenWidth,
+                        workspace.expert_ids + first * kQ38MoeTopK,
+                        workspace.expert_weights + first * kQ38MoeTopK,
+                        1, kQ38MoeTopK, workspace.moe_gate_up,
+                        workspace.moe_activated, workspace.moe_accumulation,
+                        workspace.proj6 + first * kQ38HiddenWidth,
+                        stream, options.device,
+                        workspace.te_routed + first * kQ38HiddenWidth);
+                check(cudaMemcpyAsync(row.data(), workspace.te_routed,
+                    count * sizeof(float), cudaMemcpyDeviceToHost, workspace.stream),
+                    "copy row MoE validation output");
+                check(cudaStreamSynchronize(workspace.stream),
+                    "row MoE validation ready");
+                double squared_error = 0, squared_reference = 0, maximum = 0;
+                std::size_t unequal = 0;
+                for (std::size_t i = 0; i < count; ++i) {
+                    if (!std::isfinite(grouped[i]) || !std::isfinite(row[i]))
+                        throw std::runtime_error("nonfinite TP MoE validation output");
+                    const double delta = static_cast<double>(grouped[i]) - row[i];
+                    squared_error += delta * delta;
+                    squared_reference += static_cast<double>(row[i]) * row[i];
+                    maximum = std::max(maximum, std::abs(delta));
+                    unequal += grouped[i] != row[i];
+                }
+                std::fprintf(stderr,
+                    "tp-moe-validation rank=%d tensor=%s tokens=%u max_abs=%.9g "
+                    "rmse=%.9g relative_l2=%.9g unequal=%zu count=%zu\n",
+                    options.te_rank, layer.moe.gate_up_experts.descriptor->name.c_str(),
+                    tokens, maximum, std::sqrt(squared_error / count),
+                    std::sqrt(squared_error / std::max(squared_reference, 1e-300)),
+                    unequal, count);
+                check(cudaMemcpyAsync(workspace.te_routed, grouped.data(),
+                    count * sizeof(float), cudaMemcpyHostToDevice, workspace.stream),
+                    "restore grouped MoE validation output");
+                // grouped owns pageable host storage and must outlive upload.
+                check(cudaStreamSynchronize(workspace.stream),
+                    "grouped MoE validation restore ready");
+            }
+            if (profile_requested("Q38_TP_MOE_BF16_REDUCE")) {
+                if (tokens > 1 && tokens <= 7 &&
+                    layer.moe.shared_gate.rows == kQ38MoeIntermediate &&
+                    profile_requested("Q38_TP_MOE_SHARED_OVERLAP")) {
+                    te_bridge_allreduce_f32_as_bf16(options.te_rank, workspace.te_routed,
+                        workspace.proj6, count, te_bridge_group_for(options), workspace.stream,
+                        [&] { run_moe_shared(layer, tokens); });
+                    shared_complete = true;
+                } else te_bridge_allreduce_f32_as_bf16(options.te_rank, workspace.te_routed,
+                    workspace.proj6, count, te_bridge_group_for(options), workspace.stream);
+            } else if (tokens >= 8 && profile_requested("Q38_TP_F32_BF16_RSAG") &&
+                te_bridge_f32_to_bf16_available()) {
+                te_bridge_allreduce_f32_to_bf16(options.te_rank, workspace.te_routed,
+                    workspace.proj6, count, te_bridge_group_for(options), workspace.stream);
+            } else {
+                if (tokens > 1 && tokens <= 7 &&
+                    layer.moe.shared_gate.rows == kQ38MoeIntermediate &&
+                    profile_requested("Q38_TP_MOE_SHARED_OVERLAP")) {
+                    te_bridge_allreduce_sum_f32_parallel(options.te_rank, workspace.te_routed,
+                        count, te_bridge_group_for(options), workspace.stream,
+                        [&] { run_moe_shared(layer, tokens); });
+                    shared_complete = true;
+                } else te_bridge_allreduce_sum_f32(options.te_rank, workspace.te_routed,
+                    count, te_bridge_group_for(options), workspace.stream);
+                te_round_f32_bf16_kernel<<<(count + 255) / 256, 256, 0, workspace.stream>>>(
+                    workspace.te_routed, workspace.proj6, count);
+                check(cudaPeekAtLastError(), "round TE routed FP32 sum");
+            }
+            if (detailed_prefill_profile)
+                profile_mark("moe_routed_reduce");
         }
         if (!detailed_prefill_profile &&
             (tokens == 1 ||
              (prefill_profile && prefill_profile->active())))
             profile_mark("moe_routed");
-        cuda_gemv_bf16(layer.moe.shared_gate, workspace.mixed,
-                       workspace.small2, tokens, stream, options.device);
-        cuda_gemv_bf16(layer.moe.shared_up, workspace.mixed,
-                       workspace.small1, tokens, stream, options.device);
-        if (tokens == 1 ||
-            (prefill_profile && prefill_profile->active()))
-            profile_mark("moe_shared_gate_up");
-        cuda_silu_multiply_bf16(
-            workspace.small2, workspace.small1, workspace.small0,
-            static_cast<std::size_t>(tokens) * kQ38MoeIntermediate, stream,
-            options.device);
-        cuda_gemv_bf16(layer.moe.shared_down, workspace.small0,
-                       workspace.proj5, tokens, stream, options.device);
-        if (tokens == 1 ||
-            (prefill_profile && prefill_profile->active()))
-            profile_mark("moe_shared_down");
-        cuda_gemv_bf16(layer.moe.shared_output_gate, workspace.mixed,
-                       workspace.small1, tokens, stream, options.device);
-        if (grouped_prefill) {
+        if (!shared_complete) run_moe_shared(layer, tokens);
+        if (fuse_moe_finish(tokens)) return;
+        if (grouped_prefill && options.te_world_size != 2) {
             cuda_moe_reduce_top10_and_combine_shared_v1(
                 workspace.moe_route_output,
                 workspace.moe_route_plan.assignment_to_packed,
@@ -1604,7 +2381,10 @@ struct CudaStageBackend::Impl {
             profile_mark("moe_shared_combine");
     }
 
-    void enqueue_decode_static_action(const DecodeStaticAction& action) {
+    void enqueue_decode_static_action(const DecodeStaticAction& action,
+                                      std::uint32_t data_index = 0,
+                                      std::uint32_t result_index = 0,
+                                      std::uint32_t tokens = 1) {
         auto stream = reinterpret_cast<void*>(workspace.stream);
         const auto require_layer = [&]() -> const LayerWeights& {
             if (action.layer >= layers.size())
@@ -1615,7 +2395,7 @@ struct CudaStageBackend::Impl {
         switch (action.kind) {
         case DecodeStaticActionKind::kInput:
             if (options.stage == Stage::kStage0) {
-                cuda_embedding_bf16(embedding, workspace.tokens,
+                cuda_embedding_bf16(embedding, workspace.tokens + data_index,
                                     workspace.proj5, 1, stream,
                                     options.device);
                 cuda_hyper_repeat_embedding_bf16(
@@ -1623,29 +2403,37 @@ struct CudaStageBackend::Impl {
                     options.device);
             } else {
                 check(cudaMemcpyAsync(
-                          workspace.hyper_a, workspace.boundary,
+                          workspace.hyper_a, workspace.boundary +
+                              static_cast<std::uint64_t>(data_index) * kQ38HyperWidth,
                           kQ38HyperWidth * sizeof(std::uint16_t),
                           cudaMemcpyDeviceToDevice, workspace.stream),
                       "cudaMemcpyAsync(graph stage boundary token)");
             }
             return;
         case DecodeStaticActionKind::kPle:
-            run_ple(require_layer(), action.first, action.second, 0);
+            if (tokens == 1) run_ple(require_layer(), action.first, action.second, 0);
+            else run_ple_prefill(require_layer(), action.first, action.second, 0, tokens);
             return;
         case DecodeStaticActionKind::kPrepareAttention:
-            prepare_hyper(require_layer().attention_hyper, action.first);
+            prepare_hyper(require_layer().attention_hyper, action.first, tokens);
             return;
+        case DecodeStaticActionKind::kQsa:
+            throw std::logic_error("QSA graph action requires a scoped device position");
         case DecodeStaticActionKind::kGdn:
-            run_gdn(require_layer());
+            if (tokens == 1) run_gdn(require_layer());
+            else run_gdn_prefill(require_layer(), tokens);
             return;
         case DecodeStaticActionKind::kFinish:
-            finish_hyper(action.first, action.second);
+            finish_hyper(action.first, action.second, tokens);
             return;
         case DecodeStaticActionKind::kPrepareMoe:
-            prepare_hyper(require_layer().moe_hyper, action.first);
+            prepare_hyper(require_layer().moe_hyper, action.first, tokens);
+            return;
+        case DecodeStaticActionKind::kMoeFinish:
+            finish_moe_hyper(action.first, action.second, tokens);
             return;
         case DecodeStaticActionKind::kMoe:
-            run_moe(require_layer());
+            run_moe(require_layer(), tokens);
             return;
         case DecodeStaticActionKind::kOutput:
             if (options.stage == Stage::kStage0) {
@@ -1657,16 +2445,24 @@ struct CudaStageBackend::Impl {
             } else {
                 if (mtp)
                     check(cudaMemcpyAsync(
-                              workspace.final_hc, action.first,
+                              workspace.final_hc +
+                                  static_cast<std::uint64_t>(result_index) * kQ38HyperWidth,
+                              action.first,
                               kQ38HyperWidth * sizeof(std::uint16_t),
                               cudaMemcpyDeviceToDevice, workspace.stream),
                           "cudaMemcpyAsync(graph final target HC)");
                 prepare_hyper(final_hyper, action.first);
-                cuda_gemv_bf16(output, workspace.mixed, workspace.logits, 1,
-                               stream, options.device);
-                cuda_argmax_bf16(workspace.logits, kVocabulary,
-                                 workspace.predictions, stream,
-                                 options.device);
+                {
+                    const std::uint16_t* lin = workspace.mixed;
+                    if (options.te_world_size == 2 &&
+                        output.columns * 2u == kQ38HiddenWidth)
+                        lin = workspace.mixed +
+                              static_cast<std::size_t>(options.te_rank) *
+                                  output.columns;
+                    cuda_gemv_bf16(output, lin, workspace.logits, 1, stream,
+                                   options.device);
+                }
+                select_head(workspace.logits,workspace.predictions + result_index);
             }
             return;
         }
@@ -1684,32 +2480,40 @@ struct CudaStageBackend::Impl {
     }
 
     DecodeGraphVariant* find_decode_graph_variant(
-        std::uintptr_t gdn_working, std::uintptr_t ple_working) const {
+        std::uintptr_t gdn_working, std::uintptr_t ple_working,
+        std::uint32_t tokens = 1, bool sparse_qsa = false) const {
+        const auto prefix = tokens > 1 && capture_target_prefixes
+            ? reinterpret_cast<std::uintptr_t>(target_prefixes->data) : 0;
         for (const auto& variant : decode_graphs) {
             if (variant->gdn_working == gdn_working &&
-                variant->ple_working == ple_working)
+                variant->ple_working == ple_working && variant->tokens == tokens &&
+                variant->prefix_storage == prefix && variant->sparse_qsa == sparse_qsa)
                 return variant.get();
         }
         return nullptr;
     }
 
     DecodeGraphVariant& build_decode_graph_variant(
-        std::uintptr_t gdn_working, std::uintptr_t ple_working) {
+        std::uintptr_t gdn_working, std::uintptr_t ple_working,
+        std::uint32_t tokens = 1, bool sparse_qsa = false) {
         // Each transaction alternates between two GDN/PLE working banks.  A
         // graph records raw kernel pointers, so keep one variant per pointer
         // pair rather than replaying a graph against the wrong bank.
-        if (decode_graphs.size() >= 2)
+        if (decode_graphs.size() >= (options.te_world_size == 2 ? 20u : 2u))
             throw std::runtime_error(
-                "piecewise decode observed more than two state-bank variants");
+                "piecewise graph exceeded bounded shape/bank variants");
 
         auto variant = std::make_unique<DecodeGraphVariant>();
         variant->gdn_working = gdn_working;
         variant->ple_working = ple_working;
+        variant->tokens = tokens;
+        variant->sparse_qsa = sparse_qsa;
+        const bool whole = tokens>1 && profile_requested("Q38_TP_WHOLE_TARGET_GRAPH");
+        variant->prefix_storage = tokens > 1 && capture_target_prefixes
+            ? reinterpret_cast<std::uintptr_t>(target_prefixes->data) : 0;
         std::vector<std::vector<DecodeStaticAction>> pieces(1);
         auto* current = workspace.hyper_a;
         auto* alternate = workspace.hyper_b;
-        pieces.back().push_back(
-            {DecodeStaticActionKind::kInput, 0, nullptr, nullptr});
 
         for (std::uint32_t layer_index = 0;
              layer_index < layers.size(); ++layer_index) {
@@ -1723,8 +2527,8 @@ struct CudaStageBackend::Impl {
                 {DecodeStaticActionKind::kPrepareAttention, layer_index,
                  current, nullptr});
             if (layer.qsa) {
-                variant->qsa_layers.push_back(layer_index);
-                pieces.emplace_back();
+                if(whole)pieces.back().push_back({DecodeStaticActionKind::kQsa,layer_index,nullptr,nullptr});
+                else {variant->qsa_layers.push_back(layer_index);pieces.emplace_back();}
             } else {
                 pieces.back().push_back(
                     {DecodeStaticActionKind::kGdn, layer_index, nullptr,
@@ -1739,12 +2543,11 @@ struct CudaStageBackend::Impl {
             pieces.back().push_back(
                 {DecodeStaticActionKind::kMoe, layer_index, nullptr,
                  nullptr});
-            pieces.back().push_back({DecodeStaticActionKind::kFinish,
+            pieces.back().push_back({DecodeStaticActionKind::kMoeFinish,
                                      layer_index, current, alternate});
             std::swap(current, alternate);
         }
-        pieces.back().push_back(
-            {DecodeStaticActionKind::kOutput, 0, current, nullptr});
+        variant->output_hc = current;
         if (pieces.size() != variant->qsa_layers.size() + 1)
             throw std::logic_error(
                 "piecewise decode fragment plan is inconsistent");
@@ -1754,22 +2557,45 @@ struct CudaStageBackend::Impl {
             if (piece.empty())
                 throw std::logic_error(
                     "piecewise decode produced an empty graph fragment");
+            auto profile = profile_requested("Q38_CUDA_PROFILE_GRAPHS") &&
+                profile_requested("Q38_CUDA_PROFILE_GRAPH_INTERNAL")
+                ? std::make_unique<CudaEventProfile>(options.device, "graph", true) : nullptr;
+            auto* event_profile = profile.get();
             auto graph = std::make_unique<CapturedCudaGraph>(
                 options.device, workspace.stream, [&]() {
-                    for (const auto& action : piece)
-                        enqueue_decode_static_action(action);
-                });
+                    capturing_profile_events = true;
+                    if(whole)cuda_qsa_set_graph_position(workspace.qsa_graph_position,tokens);
+                    try {
+                        if (event_profile) event_profile->begin(workspace.stream);
+                        for (const auto& action : piece) {
+                            if(action.kind==DecodeStaticActionKind::kQsa)
+                                run_qsa_prefill(layers[action.layer],sparse_qsa?4096u:0u,tokens,*qsa_state);
+                            else enqueue_decode_static_action(action, 0, 0, tokens);
+                            if (event_profile) {
+                                static constexpr const char* labels[] = {
+                                    "input", "ple", "attention_hyper", "gdn", "finish",
+                                    "moe_hyper", "moe", "output", "qsa", "finish"};
+                                event_profile->mark(labels[static_cast<unsigned>(action.kind)],
+                                                    workspace.stream);
+                            }
+                        }
+                    } catch (...) {cuda_qsa_set_graph_position(nullptr,0);capturing_profile_events = false; throw; }
+                    cuda_qsa_set_graph_position(nullptr,0);
+                    capturing_profile_events = false;
+                }, options.te_world_size == 2, std::move(profile));
             nodes += graph->nodes();
             variant->fragments.push_back(std::move(graph));
         }
-        metrics.cuda_graph_captures += variant->fragments.size();
+        for (const auto& fragment : variant->fragments)
+            metrics.cuda_graph_captures += fragment->graphs();
         metrics.cuda_graph_nodes += nodes;
         auto* result = variant.get();
         decode_graphs.push_back(std::move(variant));
         return *result;
     }
 
-    bool run_one_piecewise(std::uint32_t position) {
+    bool run_one_piecewise(std::uint32_t data_index, std::uint32_t ple_index,
+                           std::uint32_t result_index, std::uint32_t position) {
         if (decode_graph_failed) {
             ++metrics.cuda_graph_fallbacks;
             return false;
@@ -1777,7 +2603,8 @@ struct CudaStageBackend::Impl {
         check_cancelled();
         // PLE I/O and both H2D copies stay outside capture.  During capture
         // run_ple only records the GPU conversion/projection/convolution.
-        if (options.stage == Stage::kStage0) ensure_ple_ready(0, 0, 1);
+        if (options.stage == Stage::kStage0)
+            ensure_ple_ready(result_index, ple_index, 1);
 
         const auto [gdn_key, ple_key] = decode_graph_state_key();
         auto* variant = find_decode_graph_variant(gdn_key, ple_key);
@@ -1803,17 +2630,136 @@ struct CudaStageBackend::Impl {
             throw std::logic_error(
                 "piecewise decode graph variant is incomplete");
 
+        // Input/output offsets vary for retained target rows. Keep only these
+        // endpoints eager; every captured layer body retains stable pointers.
+        enqueue_decode_static_action(
+            {DecodeStaticActionKind::kInput, 0, nullptr, nullptr}, data_index);
         for (std::size_t index = 0; index < variant->qsa_layers.size();
              ++index) {
             check_cancelled();
-            variant->fragments[index]->launch(workspace.stream);
-            ++metrics.cuda_graph_replays;
+            variant->fragments[index]->launch(workspace.stream, [this] { check_cancelled(); });
+            metrics.cuda_graph_replays += variant->fragments[index]->graphs();
             run_qsa(layers[variant->qsa_layers[index]], position,
                     *qsa_state);
         }
         check_cancelled();
-        variant->fragments.back()->launch(workspace.stream);
-        ++metrics.cuda_graph_replays;
+        variant->fragments.back()->launch(workspace.stream, [this] { check_cancelled(); });
+        metrics.cuda_graph_replays += variant->fragments.back()->graphs();
+        enqueue_decode_static_action(
+            {DecodeStaticActionKind::kOutput, 0, variant->output_hc, nullptr},
+            data_index, result_index);
+        return true;
+    }
+
+    bool run_batch_piecewise(std::uint32_t tokens, std::uint32_t position,
+                             std::uint16_t*& output_hc) {
+        if (!batch_graph_warmed) return false;
+        if (batch_graph_failed) { ++metrics.cuda_graph_fallbacks; return false; }
+        const bool whole=profile_requested("Q38_TP_WHOLE_TARGET_GRAPH");
+        const bool sparse=whole && position+tokens>kQ38QsaTokenBudget;
+        if(whole)check(cudaMemcpyAsync(workspace.qsa_graph_position,&position,sizeof(position),
+            cudaMemcpyHostToDevice,workspace.stream),"upload target graph position");
+        const auto [gdn, ple] = decode_graph_state_key();
+        auto* variant = find_decode_graph_variant(gdn, ple, tokens, sparse);
+        if (!variant) {
+            try { variant = &build_decode_graph_variant(gdn, ple, tokens, sparse); }
+            catch (const std::exception& error) {
+                batch_graph_failed = true;
+                ++metrics.cuda_graph_fallbacks;
+                std::cerr << "{\"type\":\"q38_tp_batch_graph_fallback\",\"stage\":"
+                    << unsigned(options.stage) << ",\"tokens\":" << tokens
+                    << ",\"error\":\"" << error.what() << "\"}\n";
+                return false;
+            }
+        }
+        for (std::size_t index = 0; index < variant->qsa_layers.size(); ++index) {
+            variant->fragments[index]->launch(workspace.stream, [this] { check_cancelled(); });
+            metrics.cuda_graph_replays += variant->fragments[index]->graphs();
+            if (profile_requested("Q38_CUDA_PROFILE_GRAPHS")) profile_mark("graph_fragment");
+            run_qsa_prefill(layers[variant->qsa_layers[index]], position, tokens, *qsa_state);
+            if (profile_requested("Q38_CUDA_PROFILE_GRAPHS")) profile_mark("qsa");
+        }
+        variant->fragments.back()->launch(workspace.stream, [this] { check_cancelled(); });
+        metrics.cuda_graph_replays += variant->fragments.back()->graphs();
+        output_hc = variant->output_hc;
+        if (profile_requested("Q38_CUDA_PROFILE_GRAPHS")) {
+            profile_mark("graph_fragment");
+            profiled_batch_variant = variant;
+        }
+        if (profile_requested("Q38_TP_BATCH_GRAPH_DIAGNOSTICS"))
+            std::fprintf(stderr, "tp-batch-graph replay rank=%d stage=%u tokens=%u\n",
+                options.te_rank, unsigned(options.stage), tokens);
+        return true;
+    }
+
+    void select_head(const std::uint16_t* logits,std::int32_t* predictions,unsigned tokens=1) {
+        auto stream=reinterpret_cast<void*>(workspace.stream);
+        if(output.rows==kVocabulary){
+            if(options.te_world_size==2)te_bridge_allreduce_sum_bf16(options.te_rank,const_cast<std::uint16_t*>(logits),static_cast<std::size_t>(tokens)*kVocabulary,te_bridge_group_for(options),workspace.stream);
+            for(unsigned row=0;row<tokens;++row)cuda_argmax_bf16(logits+row*static_cast<std::uint64_t>(kVocabulary),kVocabulary,predictions+row,stream,options.device);
+            return;
+        }
+        if(tokens>7||output.rows*2u!=kVocabulary||output.columns!=kQ38HiddenWidth||options.te_world_size!=2)throw std::logic_error("invalid vocabulary-row head shape");
+        if(profile_requested("Q38_TP_HEAD_PARALLEL_ARGMAX"))
+            cuda_argmax_bf16_batch(logits,output.rows,tokens,workspace.head_partial_values,workspace.head_partial_ids,workspace.head_local_ids,stream,options.device);
+        else for(unsigned row=0;row<tokens;++row)cuda_argmax_bf16(logits+row*static_cast<std::uint64_t>(output.rows),output.rows,workspace.head_local_ids+row,stream,options.device);
+        head_candidate_kernel<<<1,32,0,workspace.stream>>>(logits,workspace.head_local_ids,workspace.head_candidates,output.rows,tokens,options.te_rank);
+        check(cudaPeekAtLastError(),"local complete-vocabulary maximum");
+        te_bridge_allgather_bf16(options.te_rank,workspace.head_candidates,workspace.head_candidates_full,4,tokens,te_bridge_group_for(options),workspace.stream);
+        head_choose_kernel<<<1,32,0,workspace.stream>>>(workspace.head_candidates_full,predictions,tokens);
+        check(cudaPeekAtLastError(),"global stable vocabulary maximum");
+    }
+    bool prepare_head_hyper_batch(const std::uint16_t* current,unsigned rows) {
+        if(!profile_requested("Q38_TP_HEAD_HYPER_BATCH") ||
+           (rows!=2 && rows!=3 && rows!=5 && rows!=7) ||
+           final_hyper.has_inject || final_hyper.mix_down.rows!=320 ||
+           final_hyper.mix_up.rows!=10240 || final_hyper.mix_down.columns!=10240 ||
+           final_hyper.mix_up.columns!=320)return false;
+        auto stream=reinterpret_cast<void*>(workspace.stream);
+        cuda_hyper_group_rmsnorm_bf16(current,final_hyper.norm,workspace.hyper_norm,rows,stream,options.device);
+        if(!cuda_try_hc_scalar_batch_bf16(final_hyper.mix_down,workspace.hyper_norm,workspace.low_rank,rows,stream,options.device,CudaHcActivation::kSilu,4.f,1.f))throw std::logic_error("head down batch layout");
+        if(!cuda_try_hc_scalar_batch_bf16(final_hyper.mix_up,workspace.low_rank,workspace.mix_weights,rows,stream,options.device,CudaHcActivation::kSigmoid,1.f,1.f))throw std::logic_error("head up batch layout");
+        cuda_hyper_mix_bf16(workspace.hyper_norm,workspace.mix_weights,workspace.mixed,rows,stream,options.device);
+        return true;
+    }
+
+    bool run_row_head_batch(const std::uint16_t* current,unsigned tokens,unsigned first,bool all_predictions){
+        if(output.rows==kVocabulary)return false;
+        auto stream=reinterpret_cast<void*>(workspace.stream);const unsigned rows=all_predictions?tokens:1;
+        if(rows>7)throw std::logic_error("row head publication exceeds verification width");
+        if(!capturing_head_graph && !head_graph_failed && all_predictions && first==0 &&
+           (rows==2 || rows==3 || rows==5 || rows==7) && profile_requested("Q38_TP_HEAD_GRAPH") &&
+           options.enable_piecewise_decode_graph && !std::getenv("Q38_TE_DEBUG")) {
+            const auto key=std::make_pair(reinterpret_cast<std::uintptr_t>(current),rows);
+            auto found=head_graphs.find(key);
+            if(found==head_graphs.end()) {
+                if(!head_graph_warmed){capturing_head_graph=true;try{run_row_head_batch(current,tokens,first,all_predictions);}catch(...){capturing_head_graph=false;throw;}capturing_head_graph=false;head_graph_warmed=true;return true;}
+                try {
+                    if(head_graphs.size()>=8)throw std::runtime_error("head graph cache bound exceeded");
+                    auto graph=std::make_unique<CapturedCudaGraph>(options.device,workspace.stream,[&]{
+                        capturing_head_graph=true;
+                        try{run_row_head_batch(current,tokens,first,all_predictions);}catch(...){capturing_head_graph=false;throw;}
+                        capturing_head_graph=false;
+                    },options.te_world_size==2);
+                    metrics.cuda_graph_captures+=graph->graphs();metrics.cuda_graph_nodes+=graph->nodes();
+                    found=head_graphs.emplace(key,std::move(graph)).first;
+                }catch(const std::exception& error){head_graph_failed=true;std::cerr<<"head graph fallback: "<<error.what()<<"\n";}
+            }
+            if(found!=head_graphs.end()){found->second->launch(workspace.stream,[this]{check_cancelled();});metrics.cuda_graph_replays+=found->second->graphs();return true;}
+        }
+        const bool batch_hyper=all_predictions && prepare_head_hyper_batch(current,rows);
+        if(batch_hyper)check(cudaMemcpyAsync(workspace.proj0,workspace.mixed,static_cast<std::uint64_t>(rows)*output.columns*2,cudaMemcpyDeviceToDevice,workspace.stream),"pack batched row head input");
+        else for(unsigned row=0;row<rows;++row){
+            const unsigned source_row=all_predictions?row:tokens-1;
+            prepare_hyper(final_hyper,current+static_cast<std::uint64_t>(source_row)*kQ38HyperWidth);
+            if(rows==1)cuda_gemv_bf16(output,workspace.mixed,workspace.head_batch_logits,1,stream,options.device);
+            else check(cudaMemcpyAsync(workspace.proj0+static_cast<std::uint64_t>(row)*output.columns,workspace.mixed,output.columns*2,cudaMemcpyDeviceToDevice,workspace.stream),"pack row head input");
+        }
+        if(rows>1&&!cuda_small_batch_gemv_bf16(output,workspace.proj0,workspace.head_batch_logits,rows,stream,options.device))
+            for(unsigned row=0;row<rows;++row)cuda_gemv_bf16(output,workspace.proj0+static_cast<std::uint64_t>(row)*output.columns,
+                workspace.head_batch_logits+static_cast<std::uint64_t>(row)*output.rows,1,stream,options.device);
+        select_head(workspace.head_batch_logits,workspace.predictions+first+(all_predictions?0:tokens-1),rows);
+        check(cudaMemcpyAsync(workspace.logits,workspace.head_batch_logits+(rows-1)*static_cast<std::uint64_t>(output.rows),output.rows*2,cudaMemcpyDeviceToDevice,workspace.stream),"retain local logits");
         return true;
     }
 
@@ -1863,13 +2809,19 @@ struct CudaStageBackend::Impl {
             finish_hyper(current, alternate);
             std::swap(current, alternate);
             profile_mark("attention_finish");
+            if (options.te_world_size == 2 && &layer == &layers.front())
+                te_debug_probe_bf16("after_attn0", options.te_rank, current,
+                                    workspace.stream);
 
             prepare_hyper(layer.moe_hyper, current);
             profile_mark("moe_hyper");
             run_moe(layer);
-            finish_hyper(current, alternate);
+            finish_moe_hyper(current, alternate);
             std::swap(current, alternate);
             profile_mark("moe_finish");
+            if (options.te_world_size == 2 && &layer == &layers.front())
+                te_debug_probe_bf16("after_moe0", options.te_rank, current,
+                                    workspace.stream);
         }
         if (options.stage == Stage::kStage0) {
             if (write_result)
@@ -1890,12 +2842,38 @@ struct CudaStageBackend::Impl {
                           cudaMemcpyDeviceToDevice, workspace.stream),
                       "cudaMemcpyAsync(final target HC)");
             if (write_result) {
+                if (options.te_world_size == 2)
+                    te_debug_probe_bf16("before_final_hyper", options.te_rank,
+                                        current, workspace.stream);
                 prepare_hyper(final_hyper, current);
-                cuda_gemv_bf16(output, workspace.mixed, workspace.logits, 1,
-                               stream, options.device);
-                cuda_argmax_bf16(workspace.logits, kVocabulary,
-                                 workspace.predictions + result_index, stream,
-                                 options.device);
+                if (options.te_world_size == 2)
+                    te_debug_probe_bf16("after_final_hyper_mixed", options.te_rank,
+                                        workspace.mixed, workspace.stream);
+                {
+                    const std::uint16_t* lin = workspace.mixed;
+                    if (options.te_world_size == 2 &&
+                        output.columns * 2u == kQ38HiddenWidth)
+                        lin = workspace.mixed +
+                              static_cast<std::size_t>(options.te_rank) *
+                                  output.columns;
+                    cuda_gemv_bf16(output, lin, workspace.logits, 1, stream,
+                                   options.device);
+                }
+                select_head(workspace.logits,workspace.predictions + result_index);
+                if (options.te_world_size == 2 &&
+                    (!profile_requested("Q38_TP_DEFER_HEAD_SYNC") ||
+                     std::getenv("Q38_TE_DEBUG"))) {
+                    check(cudaStreamSynchronize(workspace.stream),
+                          "sync te-run-one-head");
+                    std::int32_t pred = -7;
+                    check(cudaMemcpy(&pred, workspace.predictions + result_index,
+                                     sizeof(pred), cudaMemcpyDeviceToHost),
+                          "D2H te-run-one-head");
+                    if (std::getenv("Q38_TE_DEBUG")) std::fprintf(stderr,
+                        "te-run-one-head done rank=%d pred=%d\n",
+                        options.te_rank, pred);
+                    std::fflush(stderr);
+                }
             }
         }
         profile_mark(options.stage == Stage::kStage0 ? "stage_output"
@@ -1905,17 +2883,31 @@ struct CudaStageBackend::Impl {
     void run_prefill(std::uint32_t count, std::uint32_t chunk_offset,
                      bool write_result) {
         auto stream = reinterpret_cast<void*>(workspace.stream);
+        const bool all_predictions = provisional_kind == TxnKind::kSpeculative;
+        capture_target_prefixes = all_predictions && chunk_offset == 0 &&
+            count == provisional_expected && count > 1 && count <= 7 &&
+            options.te_world_size == 2 && precomputed_gdn_prefill_enabled() &&
+            profile_requested("Q38_TP_PREFIX_SNAPSHOTS");
+        if (capture_target_prefixes) {
+            if (!target_prefixes)
+                target_prefixes = std::make_unique<TargetPrefixStorage>(
+                    options.device, gdn_state->bytes_per_bank(), ple_state ?
+                    std::uint64_t(kQ38HyperWidth) * kQ38PleConvState * 2 : 0);
+            target_prefix_count = count - 1;
+        }
         for (std::uint32_t first = 0; first < count;
-             first += kPrefillTile) {
+             first += prefill_tile_tokens()) {
             check_cancelled();
             const auto tokens =
-                std::min<std::uint32_t>(kPrefillTile, count - first);
+                std::min<std::uint32_t>(prefill_tile_tokens(), count - first);
             // Profile two representative full tiles per chunk: one after the
             // lazy matrix-cache warmup and one at the largest context in the
-            // chunk.  Tail tiles have different occupancy and are excluded.
+            // chunk. Also profile speculative verification and short prompts;
+            // their small row counts are separate shapes in the JSON records.
             const bool profile_prefill =
-                prefill_profile && tokens == kPrefillTile &&
-                (first == kPrefillTile || first + tokens == count);
+                prefill_profile && (all_predictions || count < prefill_tile_tokens() ||
+                    (tokens == prefill_tile_tokens() &&
+                     (first == prefill_tile_tokens() || first + tokens == count)));
             if (profile_prefill)
                 prefill_profile->begin(workspace.stream);
             if (options.stage == Stage::kStage0) {
@@ -1939,7 +2931,16 @@ struct CudaStageBackend::Impl {
             if (profile_prefill) profile_mark("input");
             std::uint16_t* current = workspace.hyper_a;
             std::uint16_t* alternate = workspace.hyper_b;
-            for (const auto& layer : layers) {
+            const bool graph_eligible = options.te_world_size == 2 && all_predictions &&
+                write_result && chunk_offset == 0 && first == 0 && count == provisional_expected &&
+                (tokens == 2 || tokens == 3 || tokens == 5 || tokens == 7) &&
+                options.enable_piecewise_decode_graph && profile_requested("Q38_TP_BATCHED_GRAPH") &&
+                !decode_profile && (!prefill_profile || profile_requested("Q38_CUDA_PROFILE_GRAPHS"));
+            if (graph_eligible && options.stage == Stage::kStage0)
+                ensure_ple_ready(0, 0, tokens);
+            const bool graphed = graph_eligible && run_batch_piecewise(tokens,
+                static_cast<std::uint32_t>(provisional_base), current);
+            if (!graphed) for (const auto& layer : layers) {
                 check_cancelled();
                 if (layer.has_ple) {
                     ensure_ple_ready(chunk_offset + first, first, tokens);
@@ -1967,9 +2968,15 @@ struct CudaStageBackend::Impl {
                 prepare_hyper(layer.moe_hyper, current, tokens);
                 if (profile_prefill) profile_mark("moe_hyper");
                 run_moe(layer, tokens);
-                finish_hyper(current, alternate, tokens);
+                finish_moe_hyper(current, alternate, tokens);
                 std::swap(current, alternate);
                 if (profile_prefill) profile_mark("moe_finish");
+            }
+            // First eligible eager batch warms every matrix/handle and the
+            // largest padded GEMM scratch. Freeze addresses before recording.
+            if (graph_eligible && !batch_graph_warmed) {
+                prefill_cache.seal();
+                batch_graph_warmed = true;
             }
             if (options.stage == Stage::kStage0) {
                 if (write_result)
@@ -1993,17 +3000,97 @@ struct CudaStageBackend::Impl {
                                   kQ38HyperWidth * sizeof(std::uint16_t),
                               cudaMemcpyDeviceToDevice, workspace.stream),
                           "cudaMemcpyAsync(final target HC tile)");
-                if (write_result && first + tokens == count) {
+                if (write_result && (all_predictions || first + tokens == count) &&
+                    !run_row_head_batch(current,tokens,first,all_predictions)) {
+                  // Keep the original per-row projection and BF16 rounding.
+                  // Only coalesce independent vocabulary reductions; debug
+                  // readbacks retain the original row-by-row execution path.
+                  const bool packed_head = all_predictions && tokens <= 7 &&
+                      options.te_world_size == 2 && workspace.head_batch_logits &&
+                      !std::getenv("Q38_TE_DEBUG");
+                  const bool batched_projection = packed_head && tokens > 1 &&
+                      profile_requested("Q38_TP_COMPACT_HEAD_BATCH") &&
+                      (tokens == 2 || tokens == 3 || tokens == 5 || tokens == 7) &&
+                      output.group_size == 128 && output.columns * tokens * 2 <= 48 * 1024;
+                  for (std::uint32_t head_row = all_predictions ? 0u : tokens - 1;
+                       head_row < tokens; ++head_row) {
+                    auto* head_logits = packed_head
+                        ? workspace.head_batch_logits +
+                              static_cast<std::uint64_t>(head_row) * kVocabulary
+                        : workspace.logits;
                     const auto* last =
-                        current + static_cast<std::uint64_t>(tokens - 1) *
+                        current + static_cast<std::uint64_t>(head_row) *
                                       kQ38HyperWidth;
                     prepare_hyper(final_hyper, last);
-                    cuda_gemv_bf16(output, workspace.mixed, workspace.logits,
-                                   1, stream, options.device);
+                    {
+                        const std::uint16_t* lin = workspace.mixed;
+                        if (options.te_world_size == 2 &&
+                            output.columns * 2u == kQ38HiddenWidth)
+                            lin = workspace.mixed +
+                                  static_cast<std::size_t>(options.te_rank) *
+                                      output.columns;
+                        if (batched_projection)
+                            check(cudaMemcpyAsync(workspace.proj0 + static_cast<std::size_t>(head_row)*output.columns,
+                                lin,output.columns*sizeof(std::uint16_t),cudaMemcpyDeviceToDevice,workspace.stream),
+                                "pack compact head inputs");
+                        else cuda_gemv_bf16(output, lin, head_logits, 1, stream,
+                                       options.device);
+                    }
+                    if (packed_head) continue;
+                    if (options.te_world_size == 2)
+                        te_bridge_allreduce_sum_bf16(
+                            options.te_rank, workspace.logits, kVocabulary,
+                            te_bridge_group_for(options), workspace.stream);
                     cuda_argmax_bf16(
                         workspace.logits, kVocabulary,
-                        workspace.predictions + count - 1, stream,
+                        workspace.predictions + first + head_row, stream,
                         options.device);
+                    if (options.te_world_size == 2 &&
+                        (!profile_requested("Q38_TP_DEFER_HEAD_SYNC") ||
+                         std::getenv("Q38_TE_DEBUG"))) {
+                        check(cudaStreamSynchronize(workspace.stream),
+                              "sync te pred");
+                        std::int32_t pred = -999;
+                        check(cudaMemcpy(&pred,
+                                         workspace.predictions + first + head_row,
+                                         sizeof(pred),
+                                         cudaMemcpyDeviceToHost),
+                              "D2H te pred");
+                        // Peek a few logits for finiteness
+                        std::uint16_t logit0 = 0;
+                        check(cudaMemcpy(&logit0, workspace.logits, 2,
+                                         cudaMemcpyDeviceToHost),
+                              "D2H logit0");
+                        if (std::getenv("Q38_TE_DEBUG")) std::fprintf(stderr,
+                            "te-prefill-head rank=%d group=%d pred=%d "
+                            "logit0_bf16=0x%04x out_cols=%u\n",
+                            options.te_rank, te_bridge_group_for(options),
+                            pred, logit0, output.columns);
+                        std::fflush(stderr);
+                    }
+                  }
+                  if (batched_projection && !cuda_small_batch_gemv_bf16(output, workspace.proj0,
+                        workspace.head_batch_logits, tokens, stream, options.device))
+                      throw std::logic_error("compact head batch dispatch rejected validated shape");
+                  if (packed_head) {
+                    te_bridge_allreduce_sum_bf16(
+                        options.te_rank, workspace.head_batch_logits,
+                        static_cast<std::size_t>(tokens) * kVocabulary,
+                        te_bridge_group_for(options), workspace.stream);
+                    for (std::uint32_t row = 0; row < tokens; ++row)
+                        cuda_argmax_bf16(
+                            workspace.head_batch_logits +
+                                static_cast<std::uint64_t>(row) * kVocabulary,
+                            kVocabulary, workspace.predictions + first + row,
+                            stream, options.device);
+                    // Preserve the existing last-row workspace contract.
+                    check(cudaMemcpyAsync(workspace.logits,
+                              workspace.head_batch_logits +
+                                  static_cast<std::uint64_t>(tokens - 1) * kVocabulary,
+                              kVocabulary * sizeof(std::uint16_t),
+                              cudaMemcpyDeviceToDevice, workspace.stream),
+                          "cudaMemcpyAsync(packed head last logits)");
+                  }
                 }
             }
             if (profile_prefill) {
@@ -2012,26 +3099,45 @@ struct CudaStageBackend::Impl {
                                  : "final_head");
                 prefill_profile->finish(
                     options.stage, provisional_base + chunk_offset + first,
-                    workspace.stream);
+                    workspace.stream, tokens);
+                if (graphed && profiled_batch_variant)
+                    for (const auto& fragment : profiled_batch_variant->fragments)
+                        fragment->profile_finish(options.stage, provisional_base + chunk_offset + first,
+                                                 workspace.stream, tokens);
             }
-            check(cudaStreamSynchronize(workspace.stream),
-                  "cudaStreamSynchronize(prefill cancellation tile)");
+            if (first + tokens == count ||
+                ((first / prefill_tile_tokens() + 1) % prefill_sync_tiles()) == 0)
+                check(cudaStreamSynchronize(workspace.stream),
+                      "cudaStreamSynchronize(prefill cancellation window)");
             check_cancelled();
         }
         qsa_state->mark_evaluated(provisional_epoch, chunk_offset + count);
+        target_prefixes_valid = capture_target_prefixes;
+        if (target_prefixes_valid && profile_requested("Q38_TP_PREFIX_DIAGNOSTICS"))
+            std::fprintf(stderr, "tp-prefix capture rank=%d stage=%u epoch=%llu count=%u bytes=%llu\n",
+                options.te_rank, unsigned(options.stage), (unsigned long long)provisional_epoch,
+                target_prefix_count, (unsigned long long)(target_prefixes->stride * TargetPrefixStorage::capacity));
+        capture_target_prefixes = false;
     }
 
     void run_tokens(std::uint32_t count, std::uint32_t chunk_offset,
                     bool write_result) {
-        if (provisional_kind == TxnKind::kAppendKnown && count > 1) {
+        const bool batched_target = options.te_world_size == 2 &&
+            provisional_kind == TxnKind::kSpeculative && chunk_offset == 0 &&
+            count <= prefill_tile_tokens() && profile_requested("Q38_TP_BATCHED_TARGET");
+        if ((provisional_kind == TxnKind::kAppendKnown || batched_target) && count > 1) {
             run_prefill(count, chunk_offset, write_result);
             return;
         }
-        if (options.enable_piecewise_decode_graph && !decode_profile &&
-            provisional_kind == TxnKind::kDecode && count == 1 &&
-            chunk_offset == 0 && write_result &&
-            run_one_piecewise(static_cast<std::uint32_t>(provisional_base))) {
-            qsa_state->mark_evaluated(provisional_epoch, 1);
+        const bool graph_row = count == 1 && write_result &&
+            (provisional_kind == TxnKind::kDecode ||
+             provisional_kind == TxnKind::kSpeculative);
+        const auto data_index = provisional_kind == TxnKind::kSpeculative
+                                    ? chunk_offset : 0u;
+        if (options.enable_piecewise_decode_graph && !decode_profile && graph_row &&
+            run_one_piecewise(data_index, 0, chunk_offset,
+                static_cast<std::uint32_t>(provisional_base + chunk_offset))) {
+            qsa_state->mark_evaluated(provisional_epoch, chunk_offset + 1);
             return;
         }
         for (std::uint32_t token = 0; token < count; ++token) {
@@ -2047,6 +3153,31 @@ struct CudaStageBackend::Impl {
         qsa_state->mark_evaluated(provisional_epoch, chunk_offset + count);
     }
 
+    template <class Enqueue>
+    void run_mtp_fragment(std::size_t index, bool enabled, Enqueue enqueue) {
+        if (!enabled || mtp_graph_failed) {
+            enqueue();
+            return;
+        }
+        if (!mtp_graphs[index]) {
+            try {
+                mtp_graphs[index] = std::make_unique<CapturedCudaGraph>(
+                    options.device, workspace.stream, enqueue, options.te_world_size == 2);
+                ++metrics.cuda_graph_captures;
+                metrics.cuda_graph_nodes += mtp_graphs[index]->nodes();
+            } catch (const std::exception& error) {
+                mtp_graph_failed = true;
+                ++metrics.cuda_graph_fallbacks;
+                std::fprintf(stderr, "MTP graph fallback rank=%d fragment=%zu: %s\n",
+                             options.te_rank, index, error.what());
+                enqueue();
+                return;
+            }
+        }
+        mtp_graphs[index]->launch(workspace.stream);
+        ++metrics.cuda_graph_replays;
+    }
+
     void run_mtp_step(const std::uint16_t* target_hc,
                       const std::int32_t* token_device,
                       std::uint32_t position, bool produce_prediction,
@@ -2057,48 +3188,120 @@ struct CudaStageBackend::Impl {
         if (produce_prediction && !prediction_output)
             throw std::logic_error("MTP prediction output is unavailable");
         auto stream = reinterpret_cast<void*>(workspace.stream);
+        const bool graph = workspace.mtp_graph_hc && !decode_profile;
+        auto* requested_prediction = prediction_output;
+        if (graph) {
+            check(cudaMemcpyAsync(workspace.mtp_graph_hc, target_hc,
+                kQ38HyperWidth * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice,
+                workspace.stream), "cudaMemcpyAsync(MTP graph HC)");
+            check(cudaMemcpyAsync(workspace.mtp_graph_token, token_device,
+                sizeof(std::int32_t), cudaMemcpyDeviceToDevice,
+                workspace.stream), "cudaMemcpyAsync(MTP graph token)");
+            target_hc = workspace.mtp_graph_hc;
+            token_device = workspace.mtp_graph_token;
+            prediction_output = workspace.mtp_graph_prediction;
+            if (!mtp_graphs[0] && !mtp_graph_failed)
+                prefill_cache.warm_small(mtp->fc_hidden, workspace.stream);
+        }
+        auto input_fragment = [&] {
+            // Official Qwen MTP fusion: project the normalized current-token
+            // embedding once, project each of the four normalized target HC
+            // streams with the shared hidden projection, broadcast the embedding
+            // projection, then add the two 4H tensors.
+            if(workspace.mtp_normalized_embedding) {
+                auto normalized=mtp->embedding;
+                normalized.data=workspace.mtp_normalized_embedding;
+                normalized.format=DeviceWeightFormatV1::kPreserve;
+                normalized.preserved_f32=false; normalized.scales=nullptr;
+                cuda_embedding_bf16(normalized,token_device,workspace.proj6,1,stream,options.device);
+            } else {
+            cuda_embedding_bf16(mtp->embedding, token_device, workspace.proj5, 1,
+                                stream, options.device);
+            cuda_qwen38_rmsnorm_bf16(
+                workspace.proj5, mtp->embedding_norm, false, workspace.proj6, 1,
+                kQ38HiddenWidth, 1.0e-6f, true, stream, options.device);
+            }
+            cuda_gemv_bf16(mtp->fc_embedding, workspace.proj6, workspace.proj5, 1,
+                           stream, options.device);
+            cuda_qwen38_rmsnorm_bf16(
+                target_hc, mtp->hidden_norm, false, workspace.hyper_norm, 1,
+                kQ38HyperWidth, 1.0e-6f, true, stream, options.device);
+            cuda_gemv_bf16(mtp->fc_hidden, workspace.hyper_norm,
+                           workspace.hyper_a, kQ38HyperCount, stream,
+                           options.device);
+            if(profile_requested("Q38_CUDA_MTP_INPUT_CACHE"))
+                cuda_hyper_add_embedding_bf16(workspace.hyper_a,workspace.proj5,workspace.hyper_a,1,stream,options.device);
+            else {
+            cuda_hyper_repeat_embedding_bf16(
+                workspace.proj5, workspace.hyper_b, 1, stream, options.device);
+            cuda_add_bf16(workspace.hyper_a, workspace.hyper_b,
+                          workspace.hyper_a, kQ38HyperWidth, stream,
+                          options.device);
+            }
 
-        // Official Qwen MTP fusion: project the normalized current-token
-        // embedding once, project each of the four normalized target HC
-        // streams with the shared hidden projection, broadcast the embedding
-        // projection, then add the two 4H tensors.
-        cuda_embedding_bf16(mtp->embedding, token_device, workspace.proj5, 1,
-                            stream, options.device);
-        cuda_qwen38_rmsnorm_bf16(
-            workspace.proj5, mtp->embedding_norm, false, workspace.proj6, 1,
-            kQ38HiddenWidth, 1.0e-6f, true, stream, options.device);
-        cuda_gemv_bf16(mtp->fc_embedding, workspace.proj6, workspace.proj5, 1,
-                       stream, options.device);
-        cuda_qwen38_rmsnorm_bf16(
-            target_hc, mtp->hidden_norm, false, workspace.hyper_norm, 1,
-            kQ38HyperWidth, 1.0e-6f, true, stream, options.device);
-        cuda_gemv_bf16(mtp->fc_hidden, workspace.hyper_norm,
-                       workspace.hyper_a, kQ38HyperCount, stream,
-                       options.device);
-        cuda_hyper_repeat_embedding_bf16(
-            workspace.proj5, workspace.hyper_b, 1, stream, options.device);
-        cuda_add_bf16(workspace.hyper_a, workspace.hyper_b,
-                      workspace.hyper_a, kQ38HyperWidth, stream,
-                      options.device);
-
+            prepare_hyper(mtp->layer.attention_hyper, workspace.hyper_a);
+        };
         std::uint16_t* current = workspace.hyper_a;
         std::uint16_t* alternate = workspace.hyper_b;
-        prepare_hyper(mtp->layer.attention_hyper, current);
-        run_qsa(mtp->layer, position, *mtp_qsa_state);
-        finish_hyper(current, alternate);
-        std::swap(current, alternate);
-        prepare_hyper(mtp->layer.moe_hyper, current);
-        run_moe(mtp->layer);
-        finish_hyper(current, alternate);
-        std::swap(current, alternate);
+        auto output_fragment = [&] {
+            finish_hyper(current, alternate);
+            std::swap(current, alternate);
+            prepare_hyper(mtp->layer.moe_hyper, current);
+            run_moe(mtp->layer);
+            finish_moe_hyper(current, alternate);
+            std::swap(current, alternate);
 
-        if (produce_prediction) {
-            prepare_hyper(mtp->output_hyper, current);
-            cuda_gemv_bf16(output, workspace.mixed, workspace.logits, 1,
-                           stream, options.device);
-            cuda_argmax_bf16(workspace.logits, kVocabulary,
-                             prediction_output, stream, options.device);
+            if (produce_prediction) {
+                prepare_hyper(mtp->output_hyper, current);
+                {
+                    const std::uint16_t* lin = workspace.mixed;
+                    if (options.te_world_size == 2 &&
+                        output.columns * 2u == kQ38HiddenWidth)
+                        lin = workspace.mixed +
+                              static_cast<std::size_t>(options.te_rank) *
+                                  output.columns;
+                    cuda_gemv_bf16(output, lin, workspace.logits, 1, stream,
+                                   options.device);
+                }
+                select_head(workspace.logits,prediction_output);
+            }
+        };
+        const bool whole=graph && profile_requested("Q38_TP_WHOLE_MTP_GRAPH") && !mtp_whole_graph_failed;
+        if(whole) {
+            check(cudaMemcpyAsync(workspace.qsa_graph_position,&position,sizeof(position),cudaMemcpyHostToDevice,
+                workspace.stream),"upload MTP graph position");
+            const bool sparse=position+1>kQ38QsaTokenBudget;
+            auto& captured=mtp_whole_graphs[(sparse?2:0)+(produce_prediction?1:0)];
+            if(!captured) {
+                try {
+                    captured=std::make_unique<CapturedCudaGraph>(options.device,workspace.stream,[&]{
+                        capturing_profile_events=true;
+                        try {
+                            input_fragment();
+                            cuda_qsa_set_graph_position(workspace.qsa_graph_position,1);
+                            run_qsa_prefill(mtp->layer,sparse?4096u:0u,1,*mtp_qsa_state);
+                            cuda_qsa_set_graph_position(nullptr,0);
+                            output_fragment();
+                        }catch(...){cuda_qsa_set_graph_position(nullptr,0);capturing_profile_events=false;throw;}
+                        capturing_profile_events=false;
+                    },options.te_world_size==2);
+                    ++metrics.cuda_graph_captures;metrics.cuda_graph_nodes+=captured->nodes();
+                }catch(const std::exception& error){mtp_whole_graph_failed=true;++metrics.cuda_graph_fallbacks;
+                    std::fprintf(stderr,"MTP whole graph fallback rank=%d: %s\n",options.te_rank,error.what());}
+            }
+            if(captured){captured->launch(workspace.stream);++metrics.cuda_graph_replays;}
+            else{run_mtp_fragment(0,graph,input_fragment);run_qsa(mtp->layer,position,*mtp_qsa_state);
+                run_mtp_fragment(produce_prediction?1:2,graph,output_fragment);}
+        }else {
+            run_mtp_fragment(0,graph,input_fragment);run_qsa(mtp->layer,position,*mtp_qsa_state);
+            run_mtp_fragment(produce_prediction?1:2,graph,output_fragment);
         }
+        // There are two HC swaps in the output fragment, so current returns
+        // to hyper_a on eager execution and on every replay.
+        if (graph && produce_prediction)
+            check(cudaMemcpyAsync(requested_prediction, workspace.mtp_graph_prediction,
+                sizeof(std::int32_t), cudaMemcpyDeviceToDevice, workspace.stream),
+                "cudaMemcpyAsync(MTP graph prediction)");
         if (output_hc)
             check(cudaMemcpyAsync(output_hc, current,
                                   kQ38HyperWidth * sizeof(std::uint16_t),
@@ -2177,6 +3380,17 @@ struct CudaStageBackend::Impl {
                 mtp_qsa_state->rollback(epoch);
                 active = false;
             }
+            if (options.te_rank == 0 && profile_requested("Q38_MTP_DRAFT_DIAGNOSTICS")) {
+                std::string record = "{\"event\":\"mtp_draft\",\"position\":" +
+                    std::to_string(position) + ",\"tokens\":[";
+                for (std::uint32_t i = 0; i < max_draft; ++i) {
+                    if (i) record += ',';
+                    record += std::to_string(workspace.host_predictions[i]);
+                }
+                record += "]}\n";
+                std::fputs(record.c_str(), stderr);
+                std::fflush(stderr);
+            }
             return std::vector<std::int32_t>(workspace.host_predictions,
                                              workspace.host_predictions +
                                                  max_draft);
@@ -2192,6 +3406,8 @@ struct CudaStageBackend::Impl {
         if (!mtp || !mtp_qsa_state || evaluated == 0)
             throw std::logic_error("invalid MTP prefill extent");
         auto stream = reinterpret_cast<void*>(workspace.stream);
+        const bool cache_only = options.te_world_size == 2 &&
+            profile_requested("Q38_TP_MTP_KV_ONLY_COMMIT");
         for (std::uint32_t first = 0; first < evaluated;
              first += kPrefillTile) {
             check_cancelled();
@@ -2257,12 +3473,14 @@ struct CudaStageBackend::Impl {
             run_qsa_prefill(
                 mtp->layer,
                 static_cast<std::uint32_t>(first_position + first), tokens,
-                *mtp_qsa_state);
-            finish_hyper(current, alternate, tokens);
-            std::swap(current, alternate);
-            prepare_hyper(mtp->layer.moe_hyper, current, tokens);
-            run_moe(mtp->layer, tokens);
-            finish_hyper(current, alternate, tokens);
+                *mtp_qsa_state, cache_only);
+            if (!cache_only) {
+                finish_hyper(current, alternate, tokens);
+                std::swap(current, alternate);
+                prepare_hyper(mtp->layer.moe_hyper, current, tokens);
+                run_moe(mtp->layer, tokens);
+                finish_moe_hyper(current, alternate, tokens);
+            }
             check(cudaStreamSynchronize(workspace.stream),
                   "cudaStreamSynchronize(MTP cancellation tile)");
             check_cancelled();
@@ -2419,9 +3637,9 @@ struct CudaStageBackend::Impl {
                              : candidate_ple_hashes.back();
         std::vector<std::uint64_t> chunk_rows;
         chunk_rows.reserve(token_ids.size() * kQ38PleRowsPerToken);
+        candidate_ple_hashes.reserve(candidate_ple_hashes.size() + token_ids.size());
         for (const auto token : token_ids) {
-            const auto rows = candidate.rows({token});
-            chunk_rows.insert(chunk_rows.end(), rows.begin(), rows.end());
+            candidate.append_rows(token, chunk_rows);
             candidate_ple_hashes.push_back(candidate);
         }
         if (ple_read_active) {
@@ -2470,6 +3688,15 @@ struct CudaStageBackend::Impl {
             kQ38PleRowsPerToken;
         const auto byte_offset = workspace_first_row * kQ38PleRowWidth;
         const auto byte_count = row_count * kQ38PleRowWidth;
+        if (workspace.ple_copy_stream && workspace.ple_copy_pending) {
+            // The reader may overwrite pinned staging only after its prior
+            // H2D completes. Device staging also waits for prior GPU consumers.
+            check(cudaEventSynchronize(workspace.ple_copy_ready), "wait PLE host staging reuse");
+            check(cudaEventRecord(workspace.ple_consumer_done, workspace.stream),
+                  "record PLE device staging consumer");
+            check(cudaStreamWaitEvent(workspace.ple_copy_stream, workspace.ple_consumer_done, 0),
+                  "wait PLE device staging reuse");
+        }
         try {
             ple_reader->take(
                 first_row, row_count,
@@ -2480,17 +3707,26 @@ struct CudaStageBackend::Impl {
             ple_read_rows.reset();
             throw;
         }
+        const auto copy_stream = workspace.ple_copy_stream
+                                     ? workspace.ple_copy_stream : workspace.stream;
         check(cudaMemcpyAsync(workspace.ple_rows + byte_offset,
                               workspace.host_ple_rows + byte_offset,
                               byte_count, cudaMemcpyHostToDevice,
-                              workspace.stream),
+                              copy_stream),
               "cudaMemcpyAsync(PLE row tile)");
         check(cudaMemcpyAsync(
                   workspace.ple_scales + workspace_first_row,
                   workspace.host_ple_scales + workspace_first_row,
                   row_count * sizeof(std::uint16_t),
-                  cudaMemcpyHostToDevice, workspace.stream),
+                  cudaMemcpyHostToDevice, copy_stream),
               "cudaMemcpyAsync(PLE scale tile)");
+        if (workspace.ple_copy_stream) {
+            check(cudaEventRecord(workspace.ple_copy_ready, copy_stream),
+                  "cudaEventRecord(PLE upload)");
+            check(cudaStreamWaitEvent(workspace.stream, workspace.ple_copy_ready, 0),
+                  "cudaStreamWaitEvent(PLE upload)");
+            workspace.ple_copy_pending = true;
+        }
         if (required_rows == ple_read_rows->size()) {
             ple_read_active = false;
             ple_read_rows.reset();
@@ -2528,6 +3764,10 @@ struct CudaStageBackend::Impl {
     Workspace workspace;
     std::vector<LayerWeights> layers;
     std::unique_ptr<CudaGdnStateBank> gdn_state;
+    std::unique_ptr<TargetPrefixStorage> target_prefixes;
+    bool capture_target_prefixes = false;
+    bool target_prefixes_valid = false;
+    std::uint32_t target_prefix_count = 0;
     std::unique_ptr<CudaQsaStateBank> qsa_state;
     std::unique_ptr<CudaPleStateBank> ple_state;
     std::unique_ptr<PleAsyncReader> ple_reader;
@@ -2541,6 +3781,7 @@ struct CudaStageBackend::Impl {
     CudaMatrixViewV1 output;
     HyperWeights final_hyper;
     std::unique_ptr<MtpWeights> mtp;
+    std::unique_ptr<CudaSamplingWorkspace> compact_sampling;
     std::vector<std::int32_t> provisional_tokens;
     std::shared_ptr<CancellationToken> provisional_cancellation;
     std::uint64_t committed_frontier = 0;
@@ -2562,11 +3803,21 @@ struct CudaStageBackend::Impl {
     std::shared_ptr<const std::vector<std::uint64_t>> ple_read_rows;
     std::uint32_t ple_read_token_base = 0;
     std::uint64_t ple_read_epoch = 0;
+    std::map<std::pair<std::uintptr_t,unsigned>,std::unique_ptr<CapturedCudaGraph>> head_graphs;
+    bool capturing_head_graph=false,head_graph_warmed=false,head_graph_failed=false;
+    bool capturing_profile_events = false;
+    DecodeGraphVariant* profiled_batch_variant = nullptr;
     std::unique_ptr<CudaEventProfile> decode_profile;
     std::unique_ptr<CudaEventProfile> prefill_profile;
     mutable std::uint64_t tracked_peak_bytes = 0;
     StageBackendMetricsV1 metrics{};
     bool decode_graph_failed = false;
+    bool batch_graph_failed = false;
+    bool batch_graph_warmed = false;
+    bool mtp_graph_failed = false;
+    std::unique_ptr<CapturedCudaGraph> mtp_graphs[3];
+    std::unique_ptr<CapturedCudaGraph> mtp_whole_graphs[4];
+    bool mtp_whole_graph_failed=false;
     std::vector<std::unique_ptr<DecodeGraphVariant>> decode_graphs;
 };
 
@@ -2626,6 +3877,9 @@ StageOutput CudaStageBackend::execute(StageInput input) {
         state.provisional_expected = input.txn.evaluated_count;
         state.provisional_processed = 0;
         state.speculative_checkpoint_count = 0;
+        state.target_prefixes_valid = false;
+        state.capture_target_prefixes = false;
+        state.target_prefix_count = 0;
         state.provisional_kind = input.txn.kind;
         state.provisional_tokens.clear();
         state.provisional_tokens.reserve(input.txn.evaluated_count);
@@ -2763,17 +4017,34 @@ StageOutput CudaStageBackend::execute(StageInput input) {
                   cudaMemcpyDeviceToHost, state.workspace.stream),
               "cudaMemcpyAsync(predictions)");
         if (input.need_logits) {
+            if(state.output.rows*2u==kVocabulary)te_bridge_allgather_bf16(state.options.te_rank,state.workspace.logits,state.workspace.logits,state.output.rows,1,te_bridge_group_for(state.options),state.workspace.stream);
             if (!input.final_chunk ||
                 input.txn.kind == TxnKind::kSpeculative)
                 throw std::runtime_error(
                     "CUDA logits requested for an invalid execution lane");
-            result.logits_bf16.resize(kVocabulary);
-            check(cudaMemcpyAsync(result.logits_bf16.data(),
-                                  state.workspace.logits,
-                                  kVocabulary * sizeof(std::uint16_t),
-                                  cudaMemcpyDeviceToHost,
-                                  state.workspace.stream),
-                  "cudaMemcpyAsync(final logits)");
+            if (input.compact_top_k != 0 && state.compact_sampling) {
+                state.compact_sampling->select(state.workspace.logits,
+                    input.compact_top_k, input.sampling_temperature,
+                    state.workspace.stream);
+                result.logits_bf16.resize(input.compact_top_k);
+                result.logit_token_ids.resize(input.compact_top_k);
+                check(cudaMemcpyAsync(result.logits_bf16.data(),
+                    state.compact_sampling->logits(),
+                    input.compact_top_k * sizeof(std::uint16_t),
+                    cudaMemcpyDeviceToHost, state.workspace.stream),
+                    "cudaMemcpyAsync(compact logits)");
+                check(cudaMemcpyAsync(result.logit_token_ids.data(),
+                    state.compact_sampling->ids(),
+                    input.compact_top_k * sizeof(std::int32_t),
+                    cudaMemcpyDeviceToHost, state.workspace.stream),
+                    "cudaMemcpyAsync(compact logit IDs)");
+            } else {
+                result.logits_bf16.resize(kVocabulary);
+                check(cudaMemcpyAsync(result.logits_bf16.data(),
+                    state.workspace.logits, kVocabulary * sizeof(std::uint16_t),
+                    cudaMemcpyDeviceToHost, state.workspace.stream),
+                    "cudaMemcpyAsync(final logits)");
+            }
         }
         if (profile_decode) state.profile_mark("result_copy");
         check(cudaStreamSynchronize(state.workspace.stream),
@@ -2785,6 +4056,9 @@ StageOutput CudaStageBackend::execute(StageInput input) {
                 state.workspace.stream);
         std::uint32_t accepted = count;
         if (input.txn.kind == TxnKind::kSpeculative) {
+            result.target_predictions.assign(
+                state.workspace.host_predictions + prediction_offset,
+                state.workspace.host_predictions + prediction_offset + count);
             if (!input.final_chunk) {
                 result.state_commit_count = state.provisional_processed;
                 result.next_token = state.workspace.host_predictions[
@@ -2804,8 +4078,20 @@ StageOutput CudaStageBackend::execute(StageInput input) {
         result.next_token = state.workspace.host_predictions[
             input.txn.kind == TxnKind::kSpeculative ? accepted - 1
                                                      : count - 1];
+        if (state.options.te_world_size == 2 &&
+            state.options.stage == Stage::kStage1) {
+            if (std::getenv("Q38_TE_DEBUG")) std::fprintf(stderr,
+                "te-debug rank=%d next_token=%d count=%d pred0=%d vocab=%u "
+                "output_cols=%u mixed_te=%d\n",
+                state.options.te_rank, result.next_token, count,
+                state.workspace.host_predictions[0], kVocabulary,
+                state.output.columns,
+                state.output.columns * 2u == kQ38HiddenWidth ? 1 : 0);
+            std::fflush(stderr);
+        }
         return result;
     } catch (...) {
+        if (state.options.te_world_size == 2) te_bridge_abort();
         state.drain_ple_read();
         throw;
     }
@@ -2911,7 +4197,26 @@ void CudaStageBackend::commit(std::uint64_t epoch,
         (!complete && !online_exact && !online_lookahead))
         throw std::runtime_error("CUDA backend commit does not match transaction");
     if (state_commit_count < state.provisional_processed) {
-        if (online_lookahead) {
+        if (state.target_prefixes_valid && state_commit_count <= state.target_prefix_count) {
+            const auto* prefix = state.target_prefixes->data +
+                (state_commit_count - 1) * state.target_prefixes->stride;
+            const auto layer_bytes = state.gdn_state->bytes_per_bank() / state.gdn_state->layers();
+            for (std::uint32_t layer = 0; layer < state.gdn_state->layers(); ++layer)
+                check(cudaMemcpyAsync(state.gdn_state->working(layer).conv,
+                    prefix + layer * layer_bytes, layer_bytes,
+                    cudaMemcpyDeviceToDevice, state.workspace.stream),
+                    "restore evaluated GDN prefix");
+            if (state.ple_state)
+                check(cudaMemcpyAsync(state.ple_state->working(),
+                    prefix + state.target_prefixes->gdn_bytes, state.target_prefixes->ple_bytes,
+                    cudaMemcpyDeviceToDevice, state.workspace.stream),
+                    "restore evaluated PLE prefix");
+            check(cudaStreamSynchronize(state.workspace.stream), "target prefix restore ready");
+            if (profile_requested("Q38_TP_PREFIX_DIAGNOSTICS"))
+                std::fprintf(stderr, "tp-prefix restore rank=%d stage=%u epoch=%llu count=%u\n",
+                    state.options.te_rank, unsigned(state.options.stage),
+                    (unsigned long long)epoch, state_commit_count);
+        } else if (online_lookahead) {
             // Stage0 may be exactly one row ahead when stage1 observes the
             // first mismatch. Restore the prefix captured before that row;
             // QSA is append-only and commits the shorter extent directly.
@@ -3087,14 +4392,25 @@ StageBackendMetricsV1 CudaStageBackend::metrics() const {
     result.weight_preserved_other_bytes =
         weight_stats.preserved_other_bytes;
     result.qsa_state_bytes = state.qsa_state->allocated_bytes();
-    result.gdn_state_bytes = state.gdn_state->allocated_bytes();
+    result.gdn_state_bytes = state.gdn_state->allocated_bytes() +
+        (state.target_prefixes ? state.target_prefixes->gdn_bytes * TargetPrefixStorage::capacity : 0);
     result.ple_state_bytes =
-        state.ple_state ? state.ple_state->allocated_bytes() : 0;
+        (state.ple_state ? state.ple_state->allocated_bytes() : 0) +
+        (state.target_prefixes ? state.target_prefixes->ple_bytes * TargetPrefixStorage::capacity : 0);
     result.mtp_state_bytes = state.workspace.mtp_state_bytes +
         (state.mtp_qsa_state ? state.mtp_qsa_state->allocated_bytes() : 0);
     result.workspace_device_bytes =
-        state.workspace.device_bytes - state.workspace.mtp_state_bytes;
+        state.workspace.device_bytes - state.workspace.mtp_state_bytes +
+        (state.compact_sampling ? state.compact_sampling->bytes() : 0);
     result.prefill_cache_device_bytes = state.prefill_cache.resident_bytes();
+    result.cuda_graph_held_bytes = 0;
+    for (const auto& variant : state.decode_graphs)
+        for (const auto& fragment : variant->fragments)
+            result.cuda_graph_held_bytes += fragment->held_bytes();
+    for (const auto& graph : state.mtp_graphs)
+        if (graph) result.cuda_graph_held_bytes += graph->held_bytes();
+    for (const auto& graph : state.mtp_whole_graphs)
+        if (graph) result.cuda_graph_held_bytes += graph->held_bytes();
     result.workspace_pinned_bytes = state.workspace.pinned_bytes;
     result.cuda_allocation_failures =
         state.prefill_cache.allocation_failures();
@@ -3134,6 +4450,8 @@ StageBackendMetricsV1 CudaStageBackend::metrics() const {
             result.ple_read_latency_p99_ns = cache.read_latency_p99_ns;
             result.ple_io_uring_enabled = cache.io_uring_enabled;
             result.ple_direct_io_enabled = cache.direct_io_enabled;
+            result.ple_ram_enabled = cache.ram_enabled;
+            result.ple_ram_resident_bytes = cache.ram_resident_bytes;
         }
     }
     result.cuda_tracked_allocated_bytes =
@@ -3162,7 +4480,8 @@ std::unique_ptr<DualStageExecutor> make_cuda_executor(
     const std::string& ple_path, const ExecutorOptions& executor_options,
     int stage0_device, int stage1_device, std::uint64_t ple_cache_bytes,
     PleIoModeV1 ple_io_mode, std::uint32_t ple_queue_depth,
-    bool enable_mtp, bool enable_piecewise_decode_graph) {
+    bool enable_mtp, bool enable_piecewise_decode_graph,
+    int te_world_size, int te_rank, std::uint64_t ple_ram_budget_bytes) {
     std::string identity_error;
     if (!validate_session_identity(executor_options.identity,
                                    &identity_error) ||
@@ -3178,6 +4497,7 @@ std::unique_ptr<DualStageExecutor> make_cuda_executor(
     ple_options.cache_bytes = ple_cache_bytes;
     ple_options.io_mode = ple_io_mode;
     ple_options.queue_depth = ple_queue_depth;
+    ple_options.ram_budget_bytes = ple_ram_budget_bytes;
     auto ple = std::make_shared<PleStore>(load_ple_layout(ple_path),
                                           ple_options);
     CudaStageBackendOptions options0;
@@ -3187,11 +4507,16 @@ std::unique_ptr<DualStageExecutor> make_cuda_executor(
     options0.context_capacity = executor_options.context_limit;
     options0.enable_speculative_checkpoint = enable_mtp;
     options0.enable_piecewise_decode_graph = enable_piecewise_decode_graph;
+    options0.enable_compact_sampling = executor_options.enable_compact_sampling;
+    options0.te_world_size = te_world_size;
+    options0.te_rank = te_rank;
     CudaStageBackendOptions options1 = options0;
     options1.stage = Stage::kStage1;
     options1.device = stage1_device;
     options1.enable_mtp = enable_mtp;
     options1.enable_speculative_checkpoint = false;
+    options1.te_world_size = te_world_size;
+    options1.te_rank = te_rank;
     auto production_executor_options = executor_options;
     production_executor_options.backend_failure_is_fatal = true;
     return std::make_unique<DualStageExecutor>(

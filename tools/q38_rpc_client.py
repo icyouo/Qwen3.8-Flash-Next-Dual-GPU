@@ -28,6 +28,8 @@ OPCODES = {
     "cancel": 8,
     "reset": 9,
     "logits": 10,
+    "verify": 11,
+    "replace_pending_terminal": 12,
 }
 
 STATUSES = {
@@ -197,6 +199,8 @@ def main() -> int:
     )
     append = subcommands.add_parser("append")
     append.add_argument("tokens", nargs="+", type=parse_integer)
+    verify = subcommands.add_parser("verify")
+    verify.add_argument("tokens", nargs="*", type=parse_integer)
     subcommands.add_parser("seed")
     decode = subcommands.add_parser("decode")
     decode.add_argument("steps", nargs="?", type=int, default=1)
@@ -209,7 +213,7 @@ def main() -> int:
     call_arguments: dict[str, object] = {}
     if arguments.timeout_ms:
         call_arguments["timeout_ms"] = arguments.timeout_ms
-    if arguments.command == "append":
+    if arguments.command in ("append", "verify"):
         call_arguments["tokens"] = arguments.tokens
     elif arguments.command == "decode":
         call_arguments["argument0"] = arguments.steps

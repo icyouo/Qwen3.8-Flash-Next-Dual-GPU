@@ -1,0 +1,19 @@
+loaded W [O=10240, I=320] from /home/icy/models/Qwen3.8-Flash-Next-q38-cut25/stage0/segments/model-00001-of-00131.q38w+6656000 (6.25 MiB)
+  peer 0->1 can=1
+  EnablePeerAccess 0->1: ok
+  peer 1->0 can=1
+  EnablePeerAccess 1->0: ok
+[Test 1 ColumnParallel] max_abs=0.000e+00  mean_abs=0.000e+00  ref_mean=2.810e-01  PASS
+  DEBUG b=0 o=0..3:
+    Y0=-0.027244  Y1=-0.079221  Y0+Y1=-0.106465  ref=-0.106465  diff=0.000000
+    Y0=0.003581  Y1=0.011856  Y0+Y1=0.015437  ref=0.015437  diff=-0.000000
+    Y0=-0.025023  Y1=-0.078347  Y0+Y1=-0.103369  ref=-0.103369  diff=0.000000
+    Y0=0.004834  Y1=-0.024509  Y0+Y1=-0.019675  ref=-0.019675  diff=0.000000
+  host-staged Y1[0..3]: -0.079221 0.011856 -0.078347 -0.024509
+  host-staged scratch0[0..3]: -0.079221 0.011856 -0.078347 -0.024509
+  After P2P scratch0[0..3]: -0.079221 0.011856 -0.078347 -0.024509 (should == rank1 Y1)
+  After AR Y_rp[0..3]: -0.106465 0.015437 -0.103369 -0.019675
+  Y_ref[0..3]:         -0.106465 0.015437 -0.103369 -0.019675
+  Y_rp[10000..10003]:  -0.078811 -0.136683 0.000889 -0.049928
+  Y_ref[10000..10003]: -0.078811 -0.136683 0.000889 -0.049928
+[Test 2 RowParallel+AR] max_abs=2.861e-06  mean_abs=5.871e-08  ref_mean=2.810e-01  PASS
