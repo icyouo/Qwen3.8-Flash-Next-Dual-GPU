@@ -2,6 +2,9 @@ English | [简体中文](README.zh-CN.md)
 
 # Qwen3.8-Flash-Next-Dual-GPU
 
+<details>
+<summary>Optimization history (September–October 2026)</summary>
+
 > **2026-10-12 GDN cache update:** The opt-in `mtp4-native-bf16-gdn-qk-candidate` precomputes normalized Q/K into FP32 storage while preserving the existing BF16 results and recurrent accumulation order, adding about 16 MiB/GPU. Two reversed-order rounds, six real 4K requests per binary, measure **3.071→3.035s TTFT (−1.19%)**, with identical complete 409-token answers; an installed three-request confirmation remains **1.62% faster**. The gap to the previous-round 2.771s vLLM reference is about **9.53%**; vLLM was not rerun this round. See [implementation, checks, numerical limits, launch and rollback](docs/gdn-normalized-prefill-20261012.md). Earlier BF16/FP24 binaries and profiles are retained. The 27B service and mining remain stopped; the two ComfyUI services were restored after testing.
 
 > **2026-10-12 prefill repeat:** With background GPU workloads stopped, six cold-prefix 4K requests per engine measure **3.071s** for the installed BF16 runtime and **2.771s** for vLLM: a **300ms / 10.84% TTFT gap**. Two shared-expert overlap variants show no stable gain. The actual 1024-token slab passes same-BF16 full-logit checks but is **2.83% slower** in reversed-order A/B, so none of these candidates was installed. The 512-token BF16 runtime is retained. See [experiments, scope windows and evidence](docs/prefill-optimization-20261012.md).
@@ -37,10 +40,14 @@ English | [简体中文](README.zh-CN.md)
 
 > **2026-09-06 local changes:** Additional prefill/decode optimizations are implemented but await GPU validation. Historical results below do not measure this source revision. See [implementation and validation plan](docs/optimization-20260906.md).
 
+</details>
 
 A purpose-built, standalone runtime for running **Qwen3.8-Flash-Next** on two
-Ampere GPUs. The current hardware target is 2 × 64 GiB CMP 170HX (SM80), with
-no CUDA P2P requirement and as little as PCIe 2.0 x4 per card.
+Ampere GPUs. The current hardware target is 2 × 64 GiB CMP 170HX (SM80).
+**Bidirectional CUDA P2P is verified and the latest optimized profile selects
+asynchronous P2P.** Host transport remains available for hardware without P2P.
+The measured PCIe 2.0 ×4 link sustains about 1.40 GB/s per direction under
+bidirectional load; see the [P2P measurements](docs/p2p-diagnostic-20261011.md).
 
 The runtime owns the complete inference path: official-checkpoint conversion,
 mixed W4/W8 quantization, two-stage execution, QSA/GDN/PLE state, SSD-backed
@@ -64,7 +71,44 @@ and chat template.
 
 ## Results at a glance
 
-All q38 results below were measured on Ubuntu `p3-ultra` with two 64 GiB CMP
+### Latest real-text measurements (2026-10-12)
+
+HP Z4, dual 64 GiB CMP 170HX (SM80), 200W/GPU, CUDA 13.3; frozen 4096-token
+real-text input, one request at a time, greedy/no-thinking, cold prefix, MTP4,
+chunk512, and RAM PLE with a 64GiB budget. Native uses W4/W8 weights,
+asynchronous P2P and BF16 MoE communication, with profiling disabled.
+TTFT includes HTTP, tokenization, reset, prefill and the first token;
+**it is not pure kernel prefill time**.
+
+| Metric | Native BF16 baseline | Latest native BF16 + GDN Q/K cache | Previous-round vLLM reference |
+|---|---:|---:|---:|
+| Measured requests | 6 | 6 | 6 |
+| Input tokens | 4096 | 4096 | 4096 |
+| Median TTFT | 3.071s | **3.035s** | 2.771s |
+| Input tokens / TTFT | 1333.66 tok/s | **1349.67 tok/s** | 1478.28 tok/s |
+| Decode (N−1) | 92.90 tok/s | **92.86 tok/s** | No equal-answer comparison |
+| Output tokens | 409, complete | 409, complete | 512, capped |
+
+The current opt-in profile is `mtp4-native-bf16-gdn-qk-candidate`, using
+`build/native-bf16-gdn-qk/q38-cuda-runtime`. Two reversed-order A/B rounds
+improve TTFT by **1.19%**, with identical answers. A separate post-install
+confirmation improves 1.62% and is not pooled into this table. Latest native
+TTFT remains **264.02ms / 9.53%** above the previous-round vLLM reference.
+vLLM was not rerun in the GDN round and answers differ across engines;
+this is not a new synchronized cross-engine A/B or equal-answer decode test.
+
+See the [GDN report](docs/gdn-normalized-prefill-20261012.md) for complete
+measurements, numerical limits, and the current launch/rollback commands;
+the [previous report](docs/prefill-optimization-20261012.md) contains the vLLM
+reference. Same-path full BF16 logits, answers and recovery checks pass;
+scalar/MTP logits differences and long-term stability remain open. Historical
+short web/code rates around 173–179 tok/s do not represent this 4K workload.
+
+<details>
+<summary>Historical synthetic, ordinary-mode and long-context measurements (different builds and methods)</summary>
+
+
+The historical q38 results below were measured on Ubuntu `p3-ultra` with two 64 GiB CMP
 170HX GPUs, driver 610.43.02, CUDA 13.1, `sm_80`, the verified cut-25
 `Q38_AMPERE_QUANT_POLICY_V5` artifact, and batch size 1. MTP is disabled unless
 the table explicitly labels an MTP run.
@@ -81,16 +125,16 @@ across both GPUs.
 | Grouped MMQ; internal tile 32 | 4,096 | 22.36 s | 183.15 tok/s |
 | Grouped MMQ; 512-token slabs; serialized stages | 4,096 | 8.62 s | 475.15 tok/s |
 | **Grouped MMQ; 512-token slabs; pipelined stages** | **512** | **5.02 s** | **815.78 tok/s** |
-| **Current: + resident GDN state + tiled QSA reuse** | **512** | **2.74 s** | **1,497.04 tok/s** |
+| Historical: resident GDN state + tiled QSA reuse | **512** | **2.74 s** | **1,497.04 tok/s** |
 | Historical DS4 reference | n/a | 5.27 s for 4,102 tokens | 777.9 tok/s |
 
 The final row is a historical measurement from the same machine, not a strict
-artifact-for-artifact comparison. The current q38 result is **20.0×** the
+artifact-for-artifact comparison. That historical q38 result is **20.0×** the
 original native prefill baseline and exceeds the prior DS4 performance class.
 The input was a repeated synthetic token sequence, so this is a real CUDA and
 state-machine benchmark, not a text-quality result.
 
-The latest ordinary-mode checkpoint (MTP disabled) measured prefill and decode
+That historical ordinary-mode checkpoint (MTP disabled) measured prefill and decode
 together with the same runtime binary. Profiling was disabled for every row;
 decode is five real GPU steps immediately after the listed cold prefill.
 
@@ -124,7 +168,7 @@ radix-cache or prompt-cache simulations.
 
 ### Decode
 
-Prefill and decode deliberately use different kernel families. The current
+Prefill and decode deliberately use different kernel families. The historical
 same-build, same-run figures are in the combined table above. The table below
 is retained as a historical operating-mode comparison from the earlier decode
 optimization milestone; it is not the current release checkpoint.
@@ -147,7 +191,7 @@ durability mode.
 The exact parallel selector and tiled attention path removed the earlier decode
 collapse without changing the 512-block selection budget or tie semantics.
 These rows record that optimization milestone; use the combined table above
-for the current binary's release checkpoint.
+for that historical binary's measurements.
 
 | Context | Previous decode | Exact-QSA R2 | Speedup | ITL p50, before → R2 |
 |---:|---:|---:|---:|---:|
@@ -249,6 +293,8 @@ Acceptance differed from the older trace, so this is a directional end-to-end
 result rather than a fixed-work kernel A/B. It validates the repaired control
 path at 32K; it does not replace the remaining 128K/256K, logit-golden,
 cancellation, long-generation, or width-2/3 comparison gates.
+
+</details>
 
 ## Architecture
 

@@ -2,6 +2,9 @@
 
 # Qwen3.8-Flash-Next-Dual-GPU
 
+<details>
+<summary>历次优化记录（2026-09 至 2026-10）</summary>
+
 > **2026-10-12 GDN 缓存更新：** 已安装显式 `mtp4-native-bf16-gdn-qk-candidate`，保持原 BF16 数值与递推累加顺序，将规范化 Q/K 提前存为 FP32 缓存，增加约 16 MiB/GPU。两轮反向 A/B、每版本六次真实 4K 请求为 **TTFT 3.071→3.035 秒（−1.19%）**，完整 409-token 回答一致；安装后独立三次对照仍快 **1.62%**。相对上一轮 vLLM 2.771 秒参考仍差约 **9.53%**，本轮未重测 vLLM。见[实现、验证、数值限制与启动回退](docs/gdn-normalized-prefill-20261012.md)。原 BF16/FP24 和旧 profiles 保留，27B、挖矿维持停止，测试后恢复了两个 ComfyUI。
 
 > **2026-10-12 Prefill 复测：** 停止后台 GPU 负载后，各六次冷前缀 4K 请求测得已安装 BF16 **3.071 秒**、vLLM **2.771 秒**，TTFT 仍慢 **300 ms / 10.84%**。两种共享专家重叠方案无稳定收益；实际 1024-token 分块虽通过完整 BF16 一致性验证，反向 A/B 仍慢 **2.83%**，均未安装。当前保留 512-token BF16 版本。见[实验、耗时窗口与原始证据](docs/prefill-optimization-20261012.md)。
@@ -35,10 +38,12 @@
 
 > **2026-09-06 本地更新：** 新一批 prefill/decode 优化已实现，尚待真机验证。下方历史性能数据不代表当前源码。详见[实现清单与验证计划](docs/optimization-20260906.md)。
 
+</details>
 
 一个为双 Ampere GPU 定制、完全独立的 **Qwen3.8-Flash-Next** 长上下文推理运行时。
-当前验证硬件为 2 × 64 GiB CMP 170HX（SM80）；不要求 CUDA P2P，即使每张卡只有
-PCIe 2.0 x4 也可以运行。
+当前验证硬件为 2 × 64 GiB CMP 170HX（SM80）。**双向 CUDA P2P 已实测打通，
+最新优化配置默认选择异步 P2P**；保留 host transport 供不具备 P2P 的环境使用。
+当前链路为 PCIe 2.0 ×4，大块双向传输约 1.40 GB/s／方向，见[P2P 实测](docs/p2p-diagnostic-20261011.md)。
 
 本项目自己负责完整推理路径：官方权重转换、W4/W8 混合量化、双 stage 执行、
 QSA/GDN/PLE 状态、SSD-PLE、CUDA kernels、事务与恢复，以及 HTTP/SSE 服务。它不是
@@ -56,7 +61,38 @@ vLLM、SGLang、llama.cpp 或 DS4 的 fork，运行时也不依赖它们。`tran
 
 ## 实测结果
 
-以下 q38 数据均来自 Ubuntu 主机 `p3-ultra`：2 × 64 GiB CMP 170HX、driver
+### 最新真实文本测速（2026-10-12）
+
+HP Z4、双 64 GiB CMP 170HX（SM80）、每卡 200W、CUDA 13.3；冻结真实文本
+4096-token 输入，单并发、greedy、no-thinking、冷前缀、MTP4、chunk512、RAM PLE
+预算 64GiB。原生使用 W4/W8 权重、异步 P2P 和 BF16 MoE 通信；关闭 profiling。
+TTFT 包含 HTTP、tokenizer、reset、prefill 和首 token，**不是纯 kernel prefill**。
+
+| 指标 | 原生 BF16 基线 | 最新原生 BF16 + GDN Q/K 缓存 | vLLM 上一轮参考 |
+|---|---:|---:|---:|
+| 正式请求数 | 6 | 6 | 6 |
+| 输入 tokens | 4096 | 4096 | 4096 |
+| TTFT 中位数 | 3.071 秒 | **3.035 秒** | 2.771 秒 |
+| 输入 tokens / TTFT | 1333.66 tok/s | **1349.67 tok/s** | 1478.28 tok/s |
+| Decode（N−1） | 92.90 tok/s | **92.86 tok/s** | 未作同回答对照 |
+| 输出 tokens | 409，完整结束 | 409，完整结束 | 512，上限结束 |
+
+最新配置为 `mtp4-native-bf16-gdn-qk-candidate`，二进制位于
+`build/native-bf16-gdn-qk/q38-cuda-runtime`。两轮反向 A/B 的 TTFT 改善 **1.19%**，
+回答完全一致；另一次安装后独立对照改善 1.62%，未混入主表。相对上一轮 vLLM 参考，
+最新原生 TTFT 仍慢 **264.02ms / 9.53%**。本轮没有重测 vLLM，跨运行时回答也不同，
+不能把该参考视为同步严格 A/B 或比较相同回答的 decode 速度。
+
+完整数据、数值限制及当前配置的启动/回退命令见[GDN 缓存报告](docs/gdn-normalized-prefill-20261012.md)；
+vLLM 原始对照见[前一轮报告](docs/prefill-optimization-20261012.md)。同路径完整 BF16 logits、
+回答与恢复检查通过；scalar/MTP logits 差异和长期稳定性仍待解决。短 web/code 的
+约 173–179 tok/s 属于其他历史负载，不代表当前 4K 输入的 decode 性能。
+
+<details>
+<summary>历史合成输入、普通模式与长上下文测速（不同版本和口径）</summary>
+
+
+以下历史 q38 数据均来自 Ubuntu 主机 `p3-ultra`：2 × 64 GiB CMP 170HX、driver
 610.43.02、CUDA 13.1、`sm_80`、已校验的 cut-25
 `Q38_AMPERE_QUANT_POLICY_V5` artifact、batch size 1。除非表格明确标注 MTP，否则均关闭
 MTP。
@@ -72,14 +108,14 @@ MTP。
 | Grouped MMQ；内部 tile 32 | 4,096 | 22.36 s | 183.15 tok/s |
 | Grouped MMQ；512-token slab；双 stage 串行 | 4,096 | 8.62 s | 475.15 tok/s |
 | **Grouped MMQ；512-token slab；双 stage 流水** | **512** | **5.02 s** | **815.78 tok/s** |
-| **当前版：+ GDN 状态驻留 + QSA 分块复用** | **512** | **2.74 s** | **1,497.04 tok/s** |
+| 历史版本：GDN 状态驻留 + QSA 分块复用 | **512** | **2.74 s** | **1,497.04 tok/s** |
 | 旧 DS4 参考 | 不适用 | 4,102 tokens 用时 5.27 s | 777.9 tok/s |
 
-最后一行是同一机器上的历史数据，并非相同 artifact 的严格 A/B。当前 q38 路径相对最初
+最后一行是同一机器上的历史数据，并非相同 artifact 的严格 A/B。该历史 q38 路径相对最初
 native prefill 提升 **20.0×**，超过了此前 DS4 的性能级别。输入为重复的合成 token，
 因此它是真实 CUDA 与状态机性能测试，不是文本质量结论。
 
-最新版普通模式（关闭 MTP）使用同一个 runtime binary 连续测量 prefill 与 decode。所有行
+该历史普通模式版本（关闭 MTP）使用同一个 runtime binary 连续测量 prefill 与 decode。所有行
 都关闭 profiling；Decode 是相应冷启动 prefill 完成后紧接着执行的五步真实 GPU 计算。
 
 | 实际上下文 | Append 时间 | Prefill | Decode | ITL p50 |
@@ -109,7 +145,7 @@ incremental hit，不是 radix cache 或 prompt cache 模拟。
 
 ### Decode
 
-Prefill 和 decode 有意使用两套不同 kernel family。当前同一 build、同一轮测试的数据见
+Prefill 和 decode 有意使用两套不同 kernel family。该历史同一 build、同一轮测试的数据见
 上面的联合表。下表仅保留为早期 decode 优化节点的历史运行模式对照，不代表当前版本
 checkpoint。
 
@@ -128,7 +164,7 @@ durability mode。
 #### 历史长上下文 exact-QSA 优化
 
 精确并行 selector 与 tiled attention 消除了此前的长上下文 decode 崩塌，同时没有修改
-512-block 选择预算或 tie 语义。下表记录的是该优化节点；当前 binary 的发布基线以上面的
+512-block 选择预算或 tie 语义。下表记录的是该优化节点；该历史 binary 的测量以上面的
 Prefill/Decode 联合表为准。
 
 | Context | 优化前 decode | Exact-QSA R2 | 加速 | ITL p50，优化前 → R2 |
@@ -212,6 +248,8 @@ retained-row fast path 和吞吐有效，不能代表一般 acceptance rate 或�
 旧 trace 的 acceptance 数量不同，所以这是一组方向性的端到端结果，不是固定工作量 kernel
 A/B。它验证了 32K 修复路径，但不能替代剩余的 128K/256K、logit golden、cancellation、
 长生成以及 width-2/3 对比门禁。
+
+</details>
 
 ## 架构
 
