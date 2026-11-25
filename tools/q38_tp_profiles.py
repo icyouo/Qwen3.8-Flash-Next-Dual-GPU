@@ -3,6 +3,33 @@ from __future__ import annotations
 
 
 def execution_profile(name: str) -> dict:
+    if name == 'mtp4-native-bf16-bulk-pack-candidate':
+        profile = execution_profile('mtp4-native-bf16-prefill-decode-candidate')
+        profile['name'] = name
+        profile['environment']['Q38_TP_BF16_BULK_PACK'] = '1'
+        return profile
+    prefill_experiments = {
+        'mtp4-native-bf16-qsa-compact-gate-candidate': 'Q38_CUDA_QSA_PREFILL_COMPACT_GATE',
+        'mtp4-native-bf16-gdn-packed-qkvz-candidate': 'Q38_CUDA_GDN_PREFILL_PACKED_QKVZ',
+        'mtp4-native-bf16-prefill-graph-candidate': 'Q38_TP_PREFILL_GRAPH',
+        'mtp4-native-bf16-mtp-kv-only-candidate': 'Q38_CUDA_MTP_KV_ONLY',
+        'mtp4-native-bf16-qsa-index-tile-candidate': 'Q38_CUDA_QSA_TILE_MTP_INDEX',
+    }
+    if name in prefill_experiments:
+        profile = execution_profile('mtp4-native-bf16-gdn-qk-candidate')
+        profile['name'] = name
+        profile['environment'][prefill_experiments[name]] = '1'
+        return profile
+    if name == 'mtp4-native-bf16-mtp-decode-candidate':
+        profile = execution_profile('mtp4-native-bf16-mtp-kv-only-candidate')
+        profile['name'] = name
+        profile['environment']['Q38_CUDA_QSA_TILE_MTP_INDEX'] = '1'
+        return profile
+    if name == 'mtp4-native-bf16-prefill-decode-candidate':
+        profile = execution_profile('mtp4-native-bf16-prefill-graph-candidate')
+        profile['name'] = name
+        profile['environment'].update(Q38_CUDA_MTP_KV_ONLY='1', Q38_CUDA_QSA_TILE_MTP_INDEX='1')
+        return profile
     if name == 'mtp4-native-bf16-gdn-qk-candidate':
         profile = execution_profile('mtp4-native-bf16-candidate')
         profile['name'] = name

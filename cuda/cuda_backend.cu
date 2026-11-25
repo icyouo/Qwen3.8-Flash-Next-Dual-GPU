@@ -352,10 +352,11 @@ class CapturedCudaGraph {
 public:
     CapturedCudaGraph(int value_device, cudaStream_t stream,
                       const std::function<void()>& enqueue, bool tp = false,
-                      std::unique_ptr<CudaEventProfile> profile = {})
+                      std::unique_ptr<CudaEventProfile> profile = {},
+                      bool bulk_prefill = false)
         : device_(value_device), profile_(std::move(profile)) {
         if (tp) {
-            tape_ = std::make_unique<CudaTeGraphTape>(value_device, stream, enqueue);
+            tape_ = std::make_unique<CudaTeGraphTape>(value_device, stream, enqueue, bulk_prefill);
             nodes_ = tape_->nodes();
             return;
         }
@@ -784,6 +785,8 @@ public:
     }
 
     void seal() { sealed_ = true; }
+
+    bool sealed() const { return sealed_; }
 
     void warm(const CudaMatrixViewV1& matrix, cudaStream_t stream) {
         (void)require(matrix, stream);
@@ -1767,9 +1770,14 @@ struct CudaStageBackend::Impl {
             throw std::logic_error("head-local GDN profile/artifact mismatch");
         auto stream=reinterpret_cast<void*>(workspace.stream);
         const bool bulk=tokens>=8;
-        const bool fused=packed && !bulk;
+        // Changing the GEMM shape can change BF16 rounding on a short final
+        // tile. Qualify the 512-token shape separately and keep the tail path.
+        const bool packed_bulk = tokens == 512 &&
+            profile_requested("Q38_CUDA_GDN_PREFILL_PACKED_QKVZ");
+        const bool fused = packed && (!bulk || packed_bulk);
         const auto qkv=packed?layer.gdn.qkv:(bulk?layer.gdn.qkv_prefill_full:layer.gdn.qkv);
-        if(bulk && !qkv.data)throw std::logic_error("missing exact bulk QKV projection");
+        if (bulk && !fused && !qkv.data)
+            throw std::logic_error("missing exact bulk QKV projection");
         if(fused){
             cuda_gemv_bf16(layer.gdn.packed,workspace.mixed,workspace.proj1,tokens,stream,options.device);
             project(workspace.mixed,tokens,{{layer.gdn.b,workspace.small0},{layer.gdn.a,workspace.small1}});
@@ -1777,7 +1785,7 @@ struct CudaStageBackend::Impl {
         if (detailed_prefill_profile()) profile_mark("gdn_local_projection");
         const auto state=gdn_state->working(layer.state_local);
         CudaGdnHeadLocalProjectionLayout projection_layout;
-        projection_layout.full_qkv = bulk;
+        projection_layout.full_qkv = bulk && !fused;
         projection_layout.qkv_stride = fused ? 8192 : qkv.rows;
         projection_layout.control_heads = 48;
         projection_layout.control_stride = 48;
@@ -2018,13 +2026,21 @@ struct CudaStageBackend::Impl {
             : CudaQsaHeadLayout{});
         auto stream = reinterpret_cast<void*>(workspace.stream);
         const auto state = state_bank.working(layer.state_local);
-        project(workspace.mixed, tokens, {
-            {local_projection ? layer.sparse.q_gate_local : layer.sparse.q_gate, workspace.proj0},
-            {layer.sparse.k, workspace.small0},
-            {layer.sparse.v, workspace.small1},
-            {layer.sparse.index_qk, workspace.small2}});
+        const bool omit_query = cache_only && profile_requested("Q38_CUDA_MTP_KV_ONLY");
+        if (omit_query) {
+            project(workspace.mixed, tokens, {
+                {layer.sparse.k, workspace.small0},
+                {layer.sparse.v, workspace.small1},
+                {layer.sparse.index_qk, workspace.small2}});
+        } else {
+            project(workspace.mixed, tokens, {
+                {local_projection ? layer.sparse.q_gate_local : layer.sparse.q_gate, workspace.proj0},
+                {layer.sparse.k, workspace.small0},
+                {layer.sparse.v, workspace.small1},
+                {layer.sparse.index_qk, workspace.small2}});
+        }
         if (options.te_world_size == 2) {
-            if (layer.sparse.q_gate.rows * 2u == 12288u)
+            if (!omit_query && layer.sparse.q_gate.rows * 2u == 12288u)
                 te_bridge_allgather_bf16(options.te_rank, workspace.proj0,
                                          workspace.proj0,
                                          layer.sparse.q_gate.rows, tokens, te_bridge_group_for(options), workspace.stream);
@@ -2047,7 +2063,7 @@ struct CudaStageBackend::Impl {
             workspace.small2, layer.sparse.q_norm, layer.sparse.k_norm,
             layer.sparse.index_q_norm, layer.sparse.index_k_norm,
             workspace.proj3, workspace.proj4, workspace.proj1, state,
-            first_position, tokens, stream, options.device);
+            first_position, tokens, stream, options.device, omit_query);
         if (detailed_prefill_profile()) profile_mark("qsa_prepare");
         // Preparation writes all persistent QSA state (K/V, raw index keys,
         // pooled index keys). MTP commit repair only needs those writes; the
@@ -2095,32 +2111,41 @@ struct CudaStageBackend::Impl {
                     workspace.proj0, stream, options.device);
             if (detailed_prefill_profile()) profile_mark("qsa_value");
         }
-        cuda_sigmoid_multiply_bf16(
-            workspace.proj0, workspace.proj4, workspace.proj3,
-            static_cast<std::size_t>(tokens) * kQ38GdnValueWidth, stream,
-            options.device);
-        if (detailed_prefill_profile()) profile_mark("qsa_gate");
-        {
-            const std::uint16_t* out_in = workspace.proj3;
-            if (options.te_world_size == 2 &&
-                layer.sparse.output.columns * 2u == 6144u)
-            {
-                const auto width = layer.sparse.output.columns;
+        constexpr auto qsa_width = kQ38QsaHeads * kQ38QsaHeadWidth;
+        const auto width = layer.sparse.output.columns;
+        const bool sharded_output = options.te_world_size == 2 &&
+            width * 2u == qsa_width;
+        const bool compact_gate = sharded_output && tokens >= 8 &&
+            profile_requested("Q38_CUDA_QSA_PREFILL_COMPACT_GATE");
+        const std::uint16_t* out_in = workspace.proj3;
+        if (compact_gate) {
+            cuda_sigmoid_multiply_slice_bf16(
+                workspace.proj0, workspace.proj4, workspace.proj2,
+                tokens, qsa_width, options.te_rank * width, width, stream,
+                options.device);
+            if (detailed_prefill_profile()) profile_mark("qsa_gate");
+            out_in = workspace.proj2;
+        } else {
+            cuda_sigmoid_multiply_bf16(
+                workspace.proj0, workspace.proj4, workspace.proj3,
+                static_cast<std::size_t>(tokens) * qsa_width, stream,
+                options.device);
+            if (detailed_prefill_profile()) profile_mark("qsa_gate");
+            if (sharded_output) {
                 check(cudaMemcpy2DAsync(
                     workspace.proj2, width * sizeof(std::uint16_t),
                     workspace.proj3 + options.te_rank * width,
-                    width * 2 * sizeof(std::uint16_t),
+                    qsa_width * sizeof(std::uint16_t),
                     width * sizeof(std::uint16_t), tokens,
                     cudaMemcpyDeviceToDevice, workspace.stream),
                     "pack token-major TE column input");
                 out_in = workspace.proj2;
             }
-            cuda_gemv_bf16(layer.sparse.output, out_in, workspace.block_output,
-                           tokens, stream, options.device);
         }
+        cuda_gemv_bf16(layer.sparse.output, out_in, workspace.block_output,
+                       tokens, stream, options.device);
         // Replicated MTP QSA already produced the full output on each rank.
-        if (options.te_world_size == 2 &&
-            layer.sparse.output.columns * 2u == 6144u)
+        if (sharded_output)
             te_bridge_allreduce_sum_bf16(
                 options.te_rank, workspace.block_output,
                 static_cast<std::size_t>(kQ38HiddenWidth) * tokens, te_bridge_group_for(options), workspace.stream);
@@ -2495,11 +2520,14 @@ struct CudaStageBackend::Impl {
 
     DecodeGraphVariant& build_decode_graph_variant(
         std::uintptr_t gdn_working, std::uintptr_t ple_working,
-        std::uint32_t tokens = 1, bool sparse_qsa = false) {
+        std::uint32_t tokens = 1, bool sparse_qsa = false,
+        bool bulk_prefill = false) {
         // Each transaction alternates between two GDN/PLE working banks.  A
         // graph records raw kernel pointers, so keep one variant per pointer
         // pair rather than replaying a graph against the wrong bank.
-        if (decode_graphs.size() >= (options.te_world_size == 2 ? 20u : 2u))
+        const auto variant_limit = options.te_world_size == 1 ? 2u :
+            profile_requested("Q38_TP_PREFILL_GRAPH") ? 24u : 20u;
+        if (decode_graphs.size() >= variant_limit)
             throw std::runtime_error(
                 "piecewise graph exceeded bounded shape/bank variants");
 
@@ -2508,7 +2536,8 @@ struct CudaStageBackend::Impl {
         variant->ple_working = ple_working;
         variant->tokens = tokens;
         variant->sparse_qsa = sparse_qsa;
-        const bool whole = tokens>1 && profile_requested("Q38_TP_WHOLE_TARGET_GRAPH");
+        const bool whole = bulk_prefill ||
+            (tokens > 1 && profile_requested("Q38_TP_WHOLE_TARGET_GRAPH"));
         variant->prefix_storage = tokens > 1 && capture_target_prefixes
             ? reinterpret_cast<std::uintptr_t>(target_prefixes->data) : 0;
         std::vector<std::vector<DecodeStaticAction>> pieces(1);
@@ -2582,7 +2611,7 @@ struct CudaStageBackend::Impl {
                     } catch (...) {cuda_qsa_set_graph_position(nullptr,0);capturing_profile_events = false; throw; }
                     cuda_qsa_set_graph_position(nullptr,0);
                     capturing_profile_events = false;
-                }, options.te_world_size == 2, std::move(profile));
+                }, options.te_world_size == 2, std::move(profile), bulk_prefill);
             nodes += graph->nodes();
             variant->fragments.push_back(std::move(graph));
         }
@@ -2652,25 +2681,39 @@ struct CudaStageBackend::Impl {
     }
 
     bool run_batch_piecewise(std::uint32_t tokens, std::uint32_t position,
-                             std::uint16_t*& output_hc) {
-        if (!batch_graph_warmed) return false;
-        if (batch_graph_failed) { ++metrics.cuda_graph_fallbacks; return false; }
-        const bool whole=profile_requested("Q38_TP_WHOLE_TARGET_GRAPH");
-        const bool sparse=whole && position+tokens>kQ38QsaTokenBudget;
+                             std::uint16_t*& output_hc,
+                             bool bulk_prefill = false) {
+        if (!(bulk_prefill ? prefill_cache.sealed() : batch_graph_warmed))
+            return false;
+        auto& failed = bulk_prefill ? prefill_graph_failed : batch_graph_failed;
+        if (failed) { ++metrics.cuda_graph_fallbacks; return false; }
+        const bool whole = bulk_prefill || profile_requested("Q38_TP_WHOLE_TARGET_GRAPH");
+        const bool sparse = whole && position + tokens > kQ38QsaTokenBudget;
         if(whole)check(cudaMemcpyAsync(workspace.qsa_graph_position,&position,sizeof(position),
             cudaMemcpyHostToDevice,workspace.stream),"upload target graph position");
         const auto [gdn, ple] = decode_graph_state_key();
         auto* variant = find_decode_graph_variant(gdn, ple, tokens, sparse);
         if (!variant) {
-            try { variant = &build_decode_graph_variant(gdn, ple, tokens, sparse); }
+            try { variant = &build_decode_graph_variant(gdn, ple, tokens, sparse, bulk_prefill); }
             catch (const std::exception& error) {
-                batch_graph_failed = true;
-                ++metrics.cuda_graph_fallbacks;
-                std::cerr << "{\"type\":\"q38_tp_batch_graph_fallback\",\"stage\":"
+                std::cerr << "{\"type\":\""
+                    << (bulk_prefill ? "q38_tp_prefill_graph_fallback" : "q38_tp_batch_graph_fallback")
+                    << "\",\"stage\":"
                     << unsigned(options.stage) << ",\"tokens\":" << tokens
                     << ",\"error\":\"" << error.what() << "\"}\n";
-                return false;
             }
+        }
+        bool captured = variant != nullptr;
+        if (bulk_prefill) {
+            // Capture records no GPU work. Agree before either rank can
+            // enter a paired replay or queue its eager collectives.
+            captured = te_bridge_pair_prefill_ready(te_bridge_group_for(options),
+                                                    options.te_rank, captured);
+        }
+        if (!captured) {
+            failed = true;
+            ++metrics.cuda_graph_fallbacks;
+            return false;
         }
         for (std::size_t index = 0; index < variant->qsa_layers.size(); ++index) {
             variant->fragments[index]->launch(workspace.stream, [this] { check_cancelled(); });
@@ -2936,10 +2979,18 @@ struct CudaStageBackend::Impl {
                 (tokens == 2 || tokens == 3 || tokens == 5 || tokens == 7) &&
                 options.enable_piecewise_decode_graph && profile_requested("Q38_TP_BATCHED_GRAPH") &&
                 !decode_profile && (!prefill_profile || profile_requested("Q38_CUDA_PROFILE_GRAPHS"));
-            if (graph_eligible && options.stage == Stage::kStage0)
-                ensure_ple_ready(0, 0, tokens);
-            const bool graphed = graph_eligible && run_batch_piecewise(tokens,
-                static_cast<std::uint32_t>(provisional_base), current);
+            const bool bulk_graph_eligible = provisional_kind == TxnKind::kAppendKnown &&
+                tokens == kQ38QsaPrefillGraphTokens && options.te_world_size == 2 && te_bridge_p2p_enabled() &&
+                prefill_cache.sealed() && !prefill_graph_failed &&
+                options.enable_piecewise_decode_graph && !decode_profile && !prefill_profile &&
+                profile_requested("Q38_TP_PAIRED_GRAPH") &&
+                profile_requested("Q38_TP_PREFILL_GRAPH");
+            if ((graph_eligible || bulk_graph_eligible) && options.stage == Stage::kStage0)
+                ensure_ple_ready(chunk_offset + first, first, tokens);
+            const bool graphed = (graph_eligible || bulk_graph_eligible) &&
+                run_batch_piecewise(tokens,
+                    static_cast<std::uint32_t>(provisional_base + chunk_offset + first),
+                    current, bulk_graph_eligible);
             if (!graphed) for (const auto& layer : layers) {
                 check_cancelled();
                 if (layer.has_ple) {
@@ -3271,7 +3322,11 @@ struct CudaStageBackend::Impl {
             check(cudaMemcpyAsync(workspace.qsa_graph_position,&position,sizeof(position),cudaMemcpyHostToDevice,
                 workspace.stream),"upload MTP graph position");
             const bool sparse=position+1>kQ38QsaTokenBudget;
-            auto& captured=mtp_whole_graphs[(sparse?2:0)+(produce_prediction?1:0)];
+            // Reconciliation only consumes this row's QSA cache writes.
+            const bool repair_cache_only = !produce_prediction && !output_hc &&
+                profile_requested("Q38_CUDA_MTP_KV_ONLY");
+            auto& captured = mtp_whole_graphs[(sparse ? 3 : 0) +
+                (repair_cache_only ? 2 : static_cast<unsigned>(produce_prediction))];
             if(!captured) {
                 try {
                     captured=std::make_unique<CapturedCudaGraph>(options.device,workspace.stream,[&]{
@@ -3279,9 +3334,10 @@ struct CudaStageBackend::Impl {
                         try {
                             input_fragment();
                             cuda_qsa_set_graph_position(workspace.qsa_graph_position,1);
-                            run_qsa_prefill(mtp->layer,sparse?4096u:0u,1,*mtp_qsa_state);
+                            run_qsa_prefill(mtp->layer, sparse ? 4096u : 0u, 1,
+                                            *mtp_qsa_state, repair_cache_only);
                             cuda_qsa_set_graph_position(nullptr,0);
-                            output_fragment();
+                            if (!repair_cache_only) output_fragment();
                         }catch(...){cuda_qsa_set_graph_position(nullptr,0);capturing_profile_events=false;throw;}
                         capturing_profile_events=false;
                     },options.te_world_size==2);
@@ -3814,9 +3870,10 @@ struct CudaStageBackend::Impl {
     bool decode_graph_failed = false;
     bool batch_graph_failed = false;
     bool batch_graph_warmed = false;
+    bool prefill_graph_failed = false;
     bool mtp_graph_failed = false;
     std::unique_ptr<CapturedCudaGraph> mtp_graphs[3];
-    std::unique_ptr<CapturedCudaGraph> mtp_whole_graphs[4];
+    std::unique_ptr<CapturedCudaGraph> mtp_whole_graphs[6];
     bool mtp_whole_graph_failed=false;
     std::vector<std::unique_ptr<DecodeGraphVariant>> decode_graphs;
 };

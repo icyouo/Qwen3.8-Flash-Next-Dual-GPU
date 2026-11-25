@@ -326,8 +326,8 @@ __global__ void qsa_attention_output_kernel(
     bf16_store(output, head * kQ38QsaHeadWidth + element, value);
 }
 
-// Prefill assigns one cooperative block to each query token.  The token block
-// walks its causal pooled history so hundreds of queries can run concurrently.
+// Bulk prefill schedules one CTA per query. For the narrow MTP batches,
+// independent CTAs can scan disjoint index blocks of the same query.
 __global__ void qsa_index_scores_prefill_kernel(
     const std::uint16_t* query, const std::uint16_t* pooled_keys,
     std::uint32_t first_position, float* scores,
@@ -353,7 +353,9 @@ __global__ void qsa_index_scores_prefill_kernel(
                 query,
                 query_base + head * kQ38QsaIndexerWidth + item * 32 + lane);
     }
-    for (std::uint32_t block = warp; block < complete_blocks; block += 8) {
+    constexpr std::uint32_t warps_per_cta = 8;
+    for (std::uint32_t block = blockIdx.y * warps_per_cta + warp;
+         block < complete_blocks; block += gridDim.y * warps_per_cta) {
         float dots[kQ38QsaIndexerHeads] = {};
 #pragma unroll
         for (std::uint32_t item = 0; item < kQ38QsaIndexerWidth / 32;
@@ -1630,17 +1632,18 @@ void cuda_qsa_prepare_prefill_bf16(
     std::uint32_t first_position,
     std::uint32_t tokens,
     void* stream,
-    int device) {
+    int device,
+    bool cache_only) {
     validate_cache(cache);
-    if (!projected_q_gate || !projected_k || !projected_v ||
-        !projected_index_qk || !q_norm_weight || !k_norm_weight ||
-        !index_q_norm_weight || !index_k_norm_weight || !query || !gate ||
-        !index_query || !stream || tokens == 0 ||
+    if ((!cache_only && (!projected_q_gate || !q_norm_weight || !index_q_norm_weight ||
+                         !query || !gate || !index_query)) ||
+        !projected_k || !projected_v || !projected_index_qk || !k_norm_weight ||
+        !index_k_norm_weight || !stream || tokens == 0 ||
         first_position >= kQ38ContextLimit ||
         tokens > kQ38ContextLimit - first_position)
         throw std::invalid_argument("invalid QSA prefill preparation buffers");
     select_device(device);
-    qsa_prepare_query_kernel<<<dim3(qsa_head_layout.head_count, tokens),
+    if (!cache_only) qsa_prepare_query_kernel<<<dim3(qsa_head_layout.head_count, tokens),
                                kQ38QsaHeadWidth, 0,
                                reinterpret_cast<cudaStream_t>(stream)>>>(
         projected_q_gate, q_norm_weight, query, gate, first_position, qsa_capture_position, qsa_head_layout);
@@ -1649,7 +1652,7 @@ void cuda_qsa_prepare_prefill_bf16(
                             reinterpret_cast<cudaStream_t>(stream)>>>(
         projected_k, projected_v, k_norm_weight, cache.main_keys,
         cache.main_values, first_position, qsa_capture_position);
-    qsa_prepare_index_query_kernel<<<
+    if (!cache_only) qsa_prepare_index_query_kernel<<<
         dim3(kQ38QsaIndexerHeads, tokens), kQ38QsaIndexerWidth, 0,
         reinterpret_cast<cudaStream_t>(stream)>>>(
         projected_index_qk, index_q_norm_weight, index_query,
@@ -1717,7 +1720,10 @@ void cuda_qsa_select_prefill(
     const auto maximum_complete_blocks =
         (first_position + tokens) / kQ38QsaBlockTokens;
     if (maximum_complete_blocks > kQ38QsaBlockBudget) {
-        qsa_index_scores_prefill_kernel<<<tokens, 256, 0, stream_value>>>(
+        const auto* tile_index = std::getenv("Q38_CUDA_QSA_TILE_MTP_INDEX");
+        const unsigned tiles = tokens <= 7 && tile_index && std::strcmp(tile_index, "1") == 0
+            ? 8u : 1u;
+        qsa_index_scores_prefill_kernel<<<dim3(tokens, tiles), 256, 0, stream_value>>>(
             index_query, cache.pooled_index_keys, first_position,
             scratch_block_scores, block_score_stride, qsa_capture_position);
         qsa_radix8_init_prefill_kernel<<<tokens, 256, 0, stream_value>>>(
@@ -1962,7 +1968,8 @@ CudaQsaHeadLayout cuda_qsa_set_head_layout(CudaQsaHeadLayout layout) {
 }
 
 void cuda_qsa_set_graph_position(const std::uint32_t* position, unsigned tokens) {
-    if(position && (tokens<1 || tokens>7)) throw std::invalid_argument("invalid QSA graph shape");
+    if (position && ((tokens < 1 || tokens > 7) && tokens != kQ38QsaPrefillGraphTokens))
+        throw std::invalid_argument("invalid QSA graph shape");
     qsa_capture_position=position;qsa_capture_tokens=position?tokens:0;
 }
 

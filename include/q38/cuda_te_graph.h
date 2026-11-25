@@ -11,7 +11,8 @@ namespace q38 {
 // QSA/dynamic metadata boundaries stay outside either path.
 class CudaTeGraphTape {
 public:
-    CudaTeGraphTape(int device, void* stream, const std::function<void()>& enqueue);
+    CudaTeGraphTape(int device, void* stream, const std::function<void()>& enqueue,
+                    bool bulk_prefill = false);
     ~CudaTeGraphTape();
     CudaTeGraphTape(const CudaTeGraphTape&) = delete;
     CudaTeGraphTape& operator=(const CudaTeGraphTape&) = delete;

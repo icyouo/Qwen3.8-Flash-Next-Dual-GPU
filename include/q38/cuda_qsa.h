@@ -14,6 +14,7 @@ constexpr std::uint32_t kQ38QsaIndexerHeads = 4;
 constexpr std::uint32_t kQ38QsaIndexerWidth = 128;
 constexpr std::uint32_t kQ38QsaBlockTokens = 4;
 constexpr std::uint32_t kQ38QsaTokenBudget = 2048;
+constexpr std::uint32_t kQ38QsaPrefillGraphTokens = 512;
 constexpr std::uint32_t kQ38QsaBlockBudget = 512;
 constexpr std::uint32_t kQ38ContextLimit = 262144;
 constexpr std::uint32_t kQ38QsaMaximumSelected = 2051;
@@ -106,7 +107,8 @@ void cuda_qsa_attention_decode_bf16(
 
 // Tile-prefill path. Scratch score stride is ceil(context capacity / 4),
 // selected stride is kQ38QsaMaximumSelected, and attention stride is
-// kQ38QsaHeads*kQ38QsaMaximumSelected per token.
+// kQ38QsaHeads*kQ38QsaMaximumSelected per token. Cache-only preparation
+// does not read query projections or write to query/gate outputs.
 void cuda_qsa_prepare_prefill_bf16(
     const std::uint16_t* projected_q_gate,
     const std::uint16_t* projected_k,
@@ -123,7 +125,8 @@ void cuda_qsa_prepare_prefill_bf16(
     std::uint32_t first_position,
     std::uint32_t tokens,
     void* stream,
-    int device);
+    int device,
+    bool cache_only = false);
 
 void cuda_qsa_attention_prefill_bf16(
     const std::uint16_t* query,

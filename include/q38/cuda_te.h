@@ -57,13 +57,23 @@ void te_bridge_replay(const TeCollectiveCall& call);
 // Uses the same poison/reset contract as ordinary collectives.
 using TePairedAction = void (*)(void*, void*);
 void te_bridge_pair_graph(int group, int rank, void* context, TePairedAction action);
+bool te_bridge_pair_prefill_ready(int group, int rank, bool captured);
 bool te_bridge_p2p_enabled();
 
 // CUDA handles are opaque here to keep the public runtime header CUDA-free.
 // Add exact peer-read and commit nodes; both reads precede either overwrite.
+struct TeBf16BulkPackStorage {
+    static constexpr std::size_t kBlockWords = 64;
+    static constexpr std::size_t kPayloadBytes = 96;
+    static constexpr std::size_t kStoredBytes = kPayloadBytes + 2;
+    static constexpr std::size_t kFallbackTailBytes = 32;
+    void* source[2] = {};
+    void* fallback_tail[2] = {};
+};
 void te_graph_add_collective(void* graph, const TeCollectiveCall calls[2],
                              void* scratch[2], void* dependencies[2],
-                             void* completed[2]);
+                             void* completed[2], bool bulk_prefill = false,
+                             const TeBf16BulkPackStorage* packed = nullptr);
 // Rank-local graphs with GPU-side generation fences. Each flags allocation
 // contains two uint32 words, initially zero, and is unique to this collective.
 void te_graph_add_device_collective(void* graphs[2], const TeCollectiveCall calls[2],

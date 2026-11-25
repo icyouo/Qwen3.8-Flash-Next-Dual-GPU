@@ -50,6 +50,36 @@ class FixedMtp4ProfileTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             execution_profile('mtp6')
 
+    def test_prefill_experiments_each_enable_one_flag(self):
+        base_name = 'mtp4-native-bf16-gdn-qk-candidate'
+        base = execution_profile(base_name)
+        flags_by_profile = {
+            'mtp4-native-bf16-qsa-compact-gate-candidate': 'Q38_CUDA_QSA_PREFILL_COMPACT_GATE',
+            'mtp4-native-bf16-gdn-packed-qkvz-candidate': 'Q38_CUDA_GDN_PREFILL_PACKED_QKVZ',
+            'mtp4-native-bf16-prefill-graph-candidate': 'Q38_TP_PREFILL_GRAPH',
+            'mtp4-native-bf16-mtp-kv-only-candidate': 'Q38_CUDA_MTP_KV_ONLY',
+            'mtp4-native-bf16-qsa-index-tile-candidate': 'Q38_CUDA_QSA_TILE_MTP_INDEX',
+        }
+        inherited = {flag: '1' for flag in flags_by_profile.values()}
+        self.assertEqual(controlled_environment(base, inherited), base['environment'])
+        for name, flag in flags_by_profile.items():
+            with self.subTest(name=name):
+                candidate = execution_profile(name)
+                self.assertEqual(candidate['name'], name)
+                self.assertEqual(candidate['options'], base['options'])
+                self.assertEqual(controlled_environment(candidate, inherited),
+                                 {**base['environment'], flag: '1'})
+
+    def test_mtp_decode_experiment_keeps_bulk_prefill_graph_disabled(self):
+        base = execution_profile('mtp4-native-bf16-gdn-qk-candidate')
+        candidate = execution_profile('mtp4-native-bf16-mtp-decode-candidate')
+        self.assertEqual(candidate['options'], base['options'])
+        self.assertEqual(controlled_environment(candidate, {'Q38_TP_PREFILL_GRAPH': '1'}), {
+            **base['environment'],
+            'Q38_CUDA_MTP_KV_ONLY': '1',
+            'Q38_CUDA_QSA_TILE_MTP_INDEX': '1',
+        })
+
     def test_prefill_candidate_keeps_qualified_numerics_and_mtp_width(self):
         old = execution_profile('mtp4-native-longinput')
         new = execution_profile('mtp4-native-prefill-candidate')

@@ -152,7 +152,21 @@ def main():
     p.add_argument('--tp-adaptive-mtp',action='store_true',help='measure batch cost per published token to choose width')
     p.add_argument('--tp-batched-mtp',action='store_true',help='experimental paired draft and batched target MTP')
     p.add_argument('--mtp-max-draft',type=int,default=4)
-    p.add_argument('--execution-profile',choices=('manual','mtp4-baseline','mtp4-candidate','mtp4-route-candidate','mtp4-register-candidate','mtp4-native-fast','mtp4-native-longinput','mtp4-native-prefill-candidate','mtp4-native-prefill-rsag-candidate','mtp4-native-prefill-fp24-candidate','mtp4-native-bf16-candidate','mtp4-native-bf16-gdn-qk-candidate'),default='manual')
+    p.add_argument('--execution-profile', choices=(
+        'manual', 'mtp4-baseline', 'mtp4-candidate', 'mtp4-route-candidate',
+        'mtp4-register-candidate', 'mtp4-native-fast', 'mtp4-native-longinput',
+        'mtp4-native-prefill-candidate', 'mtp4-native-prefill-rsag-candidate',
+        'mtp4-native-prefill-fp24-candidate', 'mtp4-native-bf16-candidate',
+        'mtp4-native-bf16-gdn-qk-candidate',
+        'mtp4-native-bf16-qsa-compact-gate-candidate',
+        'mtp4-native-bf16-gdn-packed-qkvz-candidate',
+        'mtp4-native-bf16-prefill-graph-candidate',
+        'mtp4-native-bf16-mtp-kv-only-candidate',
+        'mtp4-native-bf16-qsa-index-tile-candidate',
+        'mtp4-native-bf16-mtp-decode-candidate',
+        'mtp4-native-bf16-prefill-decode-candidate',
+        'mtp4-native-bf16-bulk-pack-candidate',
+    ), default='manual')
     p.add_argument('--tp-batched-graph',action='store_true',help='experimental 2/3/5/7-row target graph fragments')
     p.add_argument('--tp-piecewise-graph',action='store_true',help='experimental TP GPU graph fragments with eager collectives')
     p.add_argument('--tp-prefix-snapshots',action='store_true',help='capture evaluated prefix states for target batches up to 7 rows')

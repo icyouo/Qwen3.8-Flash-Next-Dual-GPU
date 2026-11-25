@@ -12,6 +12,7 @@
 #include <vector>
 #include <cstdlib>
 #include <chrono>
+#include <cstring>
 
 namespace {
 void check(cudaError_t status) {
@@ -92,6 +93,133 @@ template<class F> void pair(F fn) {
     std::thread peer([&]{try{fn(1);}catch(...){errors[1]=std::current_exception();q38::te_bridge_abort();}});
     try{fn(0);}catch(...){errors[0]=std::current_exception();q38::te_bridge_abort();}
     peer.join();for(auto error:errors)if(error)std::rethrow_exception(error);
+}
+
+__global__ void fill_bulk(float* fp32, std::uint16_t* bf16, std::size_t count,
+                          int generation, int rank) {
+    for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+        const auto value = static_cast<float>(i % 53 + generation + rank * 8) / 8.f;
+        fp32[i] = value;
+        bf16[i] = __bfloat16_as_ushort(__float2bfloat16_rn(value));
+    }
+}
+
+__global__ void set_bulk_packet_edges(std::uint16_t* partial, std::size_t count, int rank) {
+    const unsigned lane = threadIdx.x;
+    if (lane == 0) {
+        partial[64] = 0x8000u; // Both ranks send negative zero.
+        if (rank == 0) {
+            partial[128] = 0x7f80u; // Infinity and NaN in a raw packet.
+            partial[191] = 0x7fc1u;
+        } else {
+            partial[0] = 0x0080u;   // Forces the raw packet in the opposite direction.
+            partial[63] = 0xc480u;  // Exercises its fallback tail transfer.
+        }
+    }
+    partial[count - 64 + lane] = (rank == 0 ? 0x8000u : 0u) | (lane + rank);
+}
+
+using BulkReference = std::array<std::array<std::vector<std::uint16_t>, 2>, 2>;
+
+void test_prefill_graph_bulk_copy(bool packed, BulkReference& reference) {
+    setenv("Q38_TP_PAIRED_GRAPH", "1", 1);
+    setenv("Q38_TP_GPU_HANDSHAKE", "1", 1);
+    setenv("Q38_TP_BULK_COPY", "1", 1);
+    if (packed) setenv("Q38_TP_BF16_BULK_PACK", "1", 1);
+    else unsetenv("Q38_TP_BF16_BULK_PACK");
+    q38::te_bridge_reset();
+    q38::te_bridge_use_p2p(true, true);
+    constexpr std::size_t tokens = 512;
+    constexpr std::size_t count = tokens * 2560;
+    constexpr std::size_t half_width = 256;
+    constexpr std::size_t half_words = tokens * half_width;
+    Rank stage0_first(0), stage0_second(1), stage1_first(0), stage1_second(1);
+    Rank* ranks[2][2] = {{&stage0_first, &stage0_second}, {&stage1_first, &stage1_second}};
+    for (int group : {0, 1}) for (auto* rank : ranks[group]) {
+        check(cudaSetDevice(rank->device));
+        check(cudaFree(rank->values));
+        check(cudaFree(rank->partial));
+        check(cudaFree(rank->half));
+        check(cudaFree(rank->full));
+        check(cudaMalloc(&rank->values, count * sizeof(float)));
+        check(cudaMalloc(&rank->partial, count * sizeof(std::uint16_t)));
+        check(cudaMalloc(&rank->half, half_words * sizeof(std::uint16_t)));
+        check(cudaMalloc(&rank->full, 2 * half_words * sizeof(std::uint16_t)));
+        rank->tape = std::make_unique<q38::CudaTeGraphTape>(rank->device, rank->stream, [&] {
+            q38::te_bridge_allgather_bf16(rank->device, rank->half, rank->full,
+                                        half_width, tokens, group, rank->stream);
+            q38::te_bridge_allreduce_sum_f32(rank->device, rank->values, count, group, rank->stream);
+            q38::te_bridge_allreduce_sum_bf16(rank->device, rank->partial, count, group, rank->stream);
+        }, true);
+    }
+    const auto before = q38::te_bridge_stats();
+    pair([&](int rank) {
+        if (q38::te_bridge_pair_prefill_ready(0, rank, rank == 0))
+            throw std::runtime_error("half-captured prefill graph did not fall back");
+        if (!q38::te_bridge_pair_prefill_ready(0, rank, true))
+            throw std::runtime_error("complete prefill graph did not enter replay");
+    });
+    constexpr int generations = 4;
+    pair([&](int device) {
+        check(cudaSetDevice(device));
+        for (int generation = 0; generation < generations; ++generation) {
+            // Enqueue both stages on the same GPUs without a device-wide
+            // synchronization or sharing their collective scratch.
+            for (int group : {0, 1}) {
+                auto& rank = *ranks[group][device];
+                const int seed = generation + group * 9;
+                fill_bulk<<<256, 256, 0, rank.stream>>>(rank.values, rank.partial, count, seed, device);
+                fill_bulk<<<256, 256, 0, rank.stream>>>(rank.values, rank.half, half_words, seed, device);
+                set_bulk_packet_edges<<<1, 64, 0, rank.stream>>>(rank.partial, count, device);
+                check(cudaPeekAtLastError());
+                rank.tape->launch(rank.stream);
+            }
+        }
+        std::vector<float> fp32(count);
+        std::vector<__nv_bfloat16> bf16(count);
+        std::vector<__nv_bfloat16> gathered(2 * half_words);
+        for (int group : {0, 1}) {
+            auto& rank = *ranks[group][device];
+            check(cudaMemcpyAsync(fp32.data(), rank.values, count * sizeof(float), cudaMemcpyDeviceToHost, rank.stream));
+            check(cudaMemcpyAsync(bf16.data(), rank.partial, count * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, rank.stream));
+            check(cudaMemcpyAsync(gathered.data(), rank.full, 2 * half_words * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, rank.stream));
+            check(cudaStreamSynchronize(rank.stream));
+            auto& oracle = reference[group][device];
+            const auto bytes = count * sizeof(std::uint16_t);
+            if (packed) {
+                if (oracle.size() != count || std::memcmp(oracle.data(), bf16.data(), bytes) != 0)
+                    throw std::runtime_error("packed wide BF16 reduction changed original rank sum bits");
+            } else {
+                oracle.resize(count);
+                std::memcpy(oracle.data(), bf16.data(), bytes);
+            }
+            const int seed = generations - 1 + group * 9;
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto expected = static_cast<float>(2 * (i % 53 + seed) + 8) / 8.f;
+                const bool packet_edge = i == 0 || i == 63 || i == 64 ||
+                    i == 128 || i == 191 || i >= count - 64;
+                if (fp32[i] != expected || (!packet_edge && __bfloat162float(bf16[i]) != expected))
+                    throw std::runtime_error("bulk graph copy/reduction differs");
+            }
+            for (std::size_t i = 0; i < gathered.size(); ++i) {
+                const auto token = i / (2 * half_width);
+                const auto rank = (i / half_width) % 2;
+                const auto position = token * half_width + i % half_width;
+                const auto expected = static_cast<float>(position % 53 + seed + rank * 8) / 8.f;
+                if (__bfloat162float(gathered[i]) != expected)
+                    throw std::runtime_error("bulk graph all-gather differs");
+            }
+        }
+    });
+    const auto after = q38::te_bridge_stats();
+    if (after.paired_graph_calls - before.paired_graph_calls != 2 * generations ||
+        after.allreduce_calls != before.allreduce_calls || after.allgather_calls != before.allgather_calls)
+        throw std::runtime_error("bulk prefill graph collective census differs");
+    unsetenv("Q38_TP_BULK_COPY");
+    unsetenv("Q38_TP_BF16_BULK_PACK");
+    std::cout << "two-stage bulk prefill DAG, copy engine, all-gather and capture agreement passed"
+              << (packed ? " (lossless BF16 packets)" : "") << '\n';
 }
 
 struct GemmRank {
@@ -294,6 +422,9 @@ int main() {
         setenv("Q38_TP_GPU_HANDSHAKE",mode,1);
         test_gemm_collective_graph();
     }
+    BulkReference bulk_reference;
+    test_prefill_graph_bulk_copy(false, bulk_reference);
+    test_prefill_graph_bulk_copy(true, bulk_reference);
     if(std::getenv("Q38_TE_GRAPH_BENCH"))profile_collective_graph();
     q38::te_bridge_reset();
     unsetenv("Q38_TP_PAIRED_GRAPH");

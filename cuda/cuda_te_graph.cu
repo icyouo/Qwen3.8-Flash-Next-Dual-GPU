@@ -35,6 +35,7 @@ struct CudaTeGraphTape::Impl final : TeCollectiveRecorder {
     std::vector<std::unique_ptr<Piece>> pieces;
     std::size_t graph_count = 0, node_count = 0, collective_count = 0;
     bool paired = false;
+    const bool bulk_prefill;
     int group = -1;
     struct Joint {
         cudaGraphExec_t exec = nullptr;
@@ -48,6 +49,8 @@ struct CudaTeGraphTape::Impl final : TeCollectiveRecorder {
         std::size_t flag_bytes = 0;
         void* scratch[2] = {};
         std::size_t scratch_bytes = 0;
+        TeBf16BulkPackStorage packed_bf16;
+        std::size_t packed_bf16_bytes = 0;
         cudaStream_t streams[2] = {};
         cudaEvent_t incoming = nullptr, done = nullptr;
         bool pending = false;
@@ -87,30 +90,52 @@ struct CudaTeGraphTape::Impl final : TeCollectiveRecorder {
                 if (rank_done[r]) (void)cudaEventDestroy(rank_done[r]);
                 if (flags[r]) (void)cudaFree(flags[r]);
                 if (scratch[r]) (void)cudaFree(scratch[r]);
+                if (packed_bf16.source[r]) (void)cudaFree(packed_bf16.source[r]);
+                if (packed_bf16.fallback_tail[r]) (void)cudaFree(packed_bf16.fallback_tail[r]);
             }
             if (incoming) (void)cudaEventDestroy(incoming);
             (void)cudaSetDevice(previous);
         }
         void build(Impl& a, Impl& b) {
             if (a.device != 0 || b.device != 1 || a.group != b.group ||
+                a.bulk_prefill != b.bulk_prefill ||
                 a.collective_count != b.collective_count || !a.collective_count)
                 throw std::logic_error("paired TE tape identity differs");
             Impl* ranks[] = {&a, &b};
             const auto* fence_mode = std::getenv("Q38_TP_GPU_HANDSHAKE");
-            device_fences = fence_mode && std::strcmp(fence_mode, "1") == 0;
+            const auto* pack_mode = std::getenv("Q38_TP_BF16_BULK_PACK");
+            // Both logical stages can issue wide prefill at once on the same
+            // physical pair. Use graph edges so neither stage spins for SMs.
+            device_fences = !a.bulk_prefill && fence_mode && std::strcmp(fence_mode, "1") == 0;
             std::size_t bytes = 0;
+            std::size_t packed_words = 0;
             for (const auto& piece : a.pieces) if (!piece->source) {
                 const auto& call = piece->call;
                 const std::size_t unit = call.kind == TeCollectiveCall::Kind::kSumF32 ? 4 : 2;
                 if (call.elements > std::numeric_limits<std::size_t>::max() / call.tokens / unit / 2)
                     throw std::overflow_error("paired TE graph scratch overflow");
-                bytes = std::max(bytes, call.elements * call.tokens * unit *
+                const auto words = call.elements * call.tokens;
+                bytes = std::max(bytes, words * unit *
                     (call.kind == TeCollectiveCall::Kind::kGatherBf16 ? 2 : 1));
+                if (a.bulk_prefill && pack_mode && std::strcmp(pack_mode, "1") == 0 &&
+                    call.kind == TeCollectiveCall::Kind::kSumBf16 &&
+                    words >= 131072 && words % TeBf16BulkPackStorage::kBlockWords == 0)
+                    packed_words = std::max(packed_words, words);
             }
             for (int r = 0; r < 2; ++r) {
                 check(cudaSetDevice(r), "select paired TE allocation device");
                 streams[r] = ranks[r]->stream;
                 check(cudaMalloc(&scratch[r], bytes), "allocate paired TE graph scratch");
+                if (packed_words) {
+                    const auto blocks = packed_words / TeBf16BulkPackStorage::kBlockWords;
+                    const auto source_bytes = blocks * TeBf16BulkPackStorage::kStoredBytes;
+                    const auto tail_bytes = blocks * TeBf16BulkPackStorage::kFallbackTailBytes;
+                    check(cudaMalloc(&packed_bf16.source[r], source_bytes),
+                          "allocate bulk BF16 packets");
+                    check(cudaMalloc(&packed_bf16.fallback_tail[r], tail_bytes),
+                          "allocate bulk BF16 fallback tails");
+                    packed_bf16_bytes = source_bytes + tail_bytes;
+                }
                 if (device_fences) {
                     flag_bytes = a.collective_count * 2 * sizeof(unsigned);
                     check(cudaMalloc(&flags[r], flag_bytes), "allocate TE graph generations");
@@ -166,7 +191,8 @@ struct CudaTeGraphTape::Impl final : TeCollectiveRecorder {
                         void* graphs[] = {rank_graph[0], rank_graph[1]};
                         void* signals[] = {flags[0] + index * 2, flags[1] + index * 2};
                         te_graph_add_device_collective(graphs, calls, scratch, signals, tails, tails);
-                    } else te_graph_add_collective(graph, calls, scratch, tails, tails);
+                    } else te_graph_add_collective(graph, calls, scratch, tails, tails, a.bulk_prefill,
+                                                   packed_bf16_bytes ? &packed_bf16 : nullptr);
                     for (int r = 0; r < 2; ++r) if (branches[r]) {
                         check(cudaSetDevice(r), "select parallel TE join device");
                         cudaGraphNode_t dependencies[] = {static_cast<cudaGraphNode_t>(tails[r]),
@@ -238,8 +264,8 @@ struct CudaTeGraphTape::Impl final : TeCollectiveRecorder {
         } catch (...) { (void)cudaSetDevice(previous); throw; }
         check(cudaSetDevice(previous), "restore paired TE current device");
     }
-    Impl(int d, void* s, const std::function<void()>& enqueue)
-        : device(d), stream(reinterpret_cast<cudaStream_t>(s)) {
+    Impl(int d, void* s, const std::function<void()>& enqueue, bool bulk)
+        : device(d), stream(reinterpret_cast<cudaStream_t>(s)), bulk_prefill(bulk) {
         if (device < 0 || !stream || !enqueue)
             throw std::invalid_argument("invalid TE graph tape construction");
         const auto* mode = std::getenv("Q38_TP_PAIRED_GRAPH");
@@ -350,8 +376,8 @@ struct CudaTeGraphTape::Impl final : TeCollectiveRecorder {
     }
 };
 CudaTeGraphTape::CudaTeGraphTape(int device, void* stream,
-                               const std::function<void()>& enqueue)
-    : impl_(std::make_unique<Impl>(device, stream, enqueue)) {}
+                               const std::function<void()>& enqueue, bool bulk_prefill)
+    : impl_(std::make_unique<Impl>(device, stream, enqueue, bulk_prefill)) {}
 CudaTeGraphTape::~CudaTeGraphTape() = default;
 void CudaTeGraphTape::launch(void* stream, const std::function<void()>& cancel) const {
     if (stream != impl_->stream) throw std::logic_error("TE graph replay stream differs");
@@ -373,6 +399,7 @@ std::size_t CudaTeGraphTape::graphs() const { return impl_->graph_count; }
 std::size_t CudaTeGraphTape::collectives() const { return impl_->collective_count; }
 std::size_t CudaTeGraphTape::held_bytes() const {
     // Each rank reports its own device's share of the shared paired plan.
-    return impl_->joint ? impl_->joint->scratch_bytes + impl_->joint->flag_bytes : 0;
+    return impl_->joint ? impl_->joint->scratch_bytes + impl_->joint->flag_bytes +
+        impl_->joint->packed_bf16_bytes : 0;
 }
 }

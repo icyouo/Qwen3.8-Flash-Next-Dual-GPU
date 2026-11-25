@@ -454,15 +454,33 @@ __global__ void silu_multiply_bf16_kernel(const std::uint16_t* gate,
                value / (1.0f + expf(-value)) * bf16_load(up, index));
 }
 
+__device__ __forceinline__ void sigmoid_multiply(
+    const std::uint16_t* values, const std::uint16_t* gates,
+    std::uint16_t* output, std::size_t source, std::size_t target) {
+    const float value = bf16_load(values, source);
+    const float gate = bf16_load(gates, source);
+    bf16_store(output, target, value / (1.0f + expf(-gate)));
+}
+
 __global__ void sigmoid_multiply_bf16_kernel(
     const std::uint16_t* values, const std::uint16_t* gates,
     std::uint16_t* output, std::size_t elements) {
     const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
                        threadIdx.x;
     if (index >= elements) return;
-    const float value = bf16_load(values, index);
-    const float gate = bf16_load(gates, index);
-    bf16_store(output, index, value / (1.0f + expf(-gate)));
+    sigmoid_multiply(values, gates, output, index, index);
+}
+
+__global__ void sigmoid_multiply_slice_bf16_kernel(
+    const std::uint16_t* values, const std::uint16_t* gates,
+    std::uint16_t* output, std::uint32_t input_width,
+    std::uint32_t first_column, std::uint32_t output_width) {
+    const auto column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= output_width) return;
+    const auto token = static_cast<std::size_t>(blockIdx.y);
+    sigmoid_multiply(values, gates, output,
+                     token * input_width + first_column + column,
+                     token * output_width + column);
 }
 
 __global__ void add_bf16_kernel(const std::uint16_t* left,
@@ -1011,6 +1029,23 @@ void cuda_sigmoid_multiply_bf16(const std::uint16_t* values,
                                    reinterpret_cast<cudaStream_t>(stream)>>>(
         values, gates, output, elements);
     check(cudaPeekAtLastError(), "sigmoid_multiply_bf16_kernel");
+}
+
+void cuda_sigmoid_multiply_slice_bf16(
+    const std::uint16_t* values, const std::uint16_t* gates,
+    std::uint16_t* output, std::uint32_t tokens, std::uint32_t input_width,
+    std::uint32_t first_column, std::uint32_t output_width, void* stream,
+    int device) {
+    validate_stream(stream, device);
+    if (!values || !gates || !output || tokens == 0 || tokens > 65535 ||
+        output_width == 0 || first_column >= input_width ||
+        output_width > input_width - first_column)
+        throw std::invalid_argument("invalid sigmoid multiply slice");
+    const dim3 grid((output_width - 1) / kThreads + 1, tokens);
+    sigmoid_multiply_slice_bf16_kernel<<<grid, kThreads, 0,
+        reinterpret_cast<cudaStream_t>(stream)>>>(
+            values, gates, output, input_width, first_column, output_width);
+    check(cudaPeekAtLastError(), "sigmoid_multiply_slice_bf16_kernel");
 }
 
 void cuda_add_bf16(const std::uint16_t* left, const std::uint16_t* right,

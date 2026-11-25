@@ -79,6 +79,46 @@ void require_device_bits(const std::uint16_t* actual,
         throw std::runtime_error(std::string(label) + " bitwise/guard mismatch");
 }
 
+void test_sigmoid_multiply_slice(cudaStream_t stream) {
+    constexpr std::uint32_t width = 3072;
+    constexpr std::uint32_t full_width = 2 * width;
+    constexpr std::uint32_t max_tokens = 512;
+    constexpr std::size_t guard = 16;
+    std::vector<std::uint16_t> values(max_tokens * full_width);
+    std::vector<std::uint16_t> gates(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        values[i] = bf16(float(int(i % 37) - 18) * .125f);
+        gates[i] = bf16(float(int(i % 71) - 35) * .5f);
+    }
+    auto* device_values = upload(values);
+    auto* device_gates = upload(gates);
+    auto* full = allocate<std::uint16_t>(values.size());
+    auto* expected = allocate<std::uint16_t>(max_tokens * width);
+    for (const std::uint32_t tokens : {1u, 7u, 8u, 511u, max_tokens}) {
+        const std::size_t elements = tokens * width;
+        auto* output = upload(std::vector<std::uint16_t>(elements + guard, 0x1234));
+        q38::cuda_sigmoid_multiply_bf16(
+            device_values, device_gates, full, tokens * full_width, stream, 0);
+        for (const std::uint32_t rank : {0u, 1u}) {
+            check(cudaMemcpy2DAsync(expected, width * sizeof(std::uint16_t),
+                                    full + rank * width, full_width * sizeof(std::uint16_t),
+                                    width * sizeof(std::uint16_t), tokens,
+                                    cudaMemcpyDeviceToDevice, stream),
+                  "slice sigmoid reference pack");
+            q38::cuda_sigmoid_multiply_slice_bf16(
+                device_values, device_gates, output, tokens, full_width,
+                rank * width, width, stream, 0);
+            require_device_bits(output, expected, elements, stream,
+                                "compact sigmoid output", guard);
+        }
+        check(cudaFree(output), "free compact sigmoid output");
+    }
+    check(cudaFree(expected), "free compact sigmoid reference");
+    check(cudaFree(full), "free full sigmoid result");
+    check(cudaFree(device_gates), "free sigmoid gates");
+    check(cudaFree(device_values), "free sigmoid values");
+}
+
 void test_padded_small_gemm(cudaStream_t stream) {
     cublasHandle_t handle = nullptr;
     if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS)
@@ -2467,6 +2507,7 @@ int main() {
             throw std::runtime_error("RMSNorm result differs");
 
         test_padded_small_gemm(stream);
+        test_sigmoid_multiply_slice(stream);
         test_paired_norm(stream);
         test_ple_residual(stream);
         test_hc_gemv(stream);

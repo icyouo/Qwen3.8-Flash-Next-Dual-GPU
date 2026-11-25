@@ -149,6 +149,90 @@ __global__ void peer_collect_kernel<std::uint16_t, false>(
         output[i] = __bfloat16_as_ushort(__float2bfloat16_rn(a + b));
     }
 }
+
+constexpr unsigned kBf16ExponentRawPacket = 1u << 8;
+constexpr unsigned kBf16ExponentZero = 15u;
+
+__device__ unsigned bf16_exponent_code(unsigned word, unsigned base) {
+    return (word & 0x7fffu) == 0 ? kBf16ExponentZero : ((word >> 7u) & 0xffu) - base;
+}
+
+__global__ void pack_bulk_bf16(const std::uint16_t* input, std::uint8_t* packets,
+                              std::uint16_t* raw_tail, std::size_t blocks) {
+    constexpr unsigned warps_per_cta = 8;
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned warp = threadIdx.x >> 5u;
+    auto* headers = reinterpret_cast<std::uint16_t*>(
+        packets + blocks * TeBf16BulkPackStorage::kPayloadBytes);
+    for (auto block = static_cast<std::size_t>(blockIdx.x) * warps_per_cta + warp;
+         block < blocks; block += static_cast<std::size_t>(gridDim.x) * warps_per_cta) {
+        const auto* words = input + block * TeBf16BulkPackStorage::kBlockWords;
+        const unsigned first = words[lane];
+        const unsigned second = words[lane + 32u];
+        unsigned minimum = 256, maximum = 0;
+        if (first & 0x7fffu) {
+            minimum = (first >> 7u) & 0xffu;
+            maximum = minimum;
+        }
+        if (second & 0x7fffu) {
+            const unsigned exponent = (second >> 7u) & 0xffu;
+            minimum = min(minimum, exponent);
+            maximum = max(maximum, exponent);
+        }
+        for (unsigned mask = 16; mask != 0; mask >>= 1) {
+            minimum = min(minimum, __shfl_xor_sync(0xffffffffu, minimum, mask));
+            maximum = max(maximum, __shfl_xor_sync(0xffffffffu, maximum, mask));
+        }
+        if (minimum == 256) minimum = 0;
+        auto* packet = packets + block * TeBf16BulkPackStorage::kPayloadBytes;
+        if (maximum - minimum < kBf16ExponentZero) {
+            if (lane == 0) headers[block] = static_cast<std::uint16_t>(minimum);
+            packet[lane] = (first & 0x7fu) | ((first >> 8u) & 0x80u);
+            packet[lane + 32u] = (second & 0x7fu) | ((second >> 8u) & 0x80u);
+            packet[64u + lane] = bf16_exponent_code(first, minimum) |
+                (bf16_exponent_code(second, minimum) << 4u);
+        } else {
+            if (lane == 0) headers[block] = kBf16ExponentRawPacket;
+            auto* raw_prefix = reinterpret_cast<std::uint16_t*>(packet);
+            raw_prefix[lane] = static_cast<std::uint16_t>(first);
+            if (lane < 16u) raw_prefix[lane + 32u] = static_cast<std::uint16_t>(second);
+            else raw_tail[block * 16u + lane - 16u] = static_cast<std::uint16_t>(second);
+        }
+    }
+}
+
+__global__ void sum_packed_bulk_bf16(std::uint16_t* local,
+    const std::uint8_t* peer_packets, const std::uint16_t* peer_raw_tail,
+    std::size_t blocks, int rank) {
+    using Pack = TeBf16BulkPackStorage;
+    const auto* headers = reinterpret_cast<const std::uint16_t*>(
+        peer_packets + blocks * Pack::kPayloadBytes);
+    const auto count = blocks * Pack::kBlockWords;
+    for (auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+        const auto block = i / Pack::kBlockWords;
+        const auto word = i % Pack::kBlockWords;
+        const auto header = headers[block];
+        const auto* packet = peer_packets + block * Pack::kPayloadBytes;
+        std::uint16_t peer;
+        if (header == kBf16ExponentRawPacket) {
+            peer = word < 48 ? reinterpret_cast<const std::uint16_t*>(packet)[word]
+                : peer_raw_tail[block * 16u + word - 48u];
+        } else {
+            auto exponent_code = packet[64u + (word & 31u)];
+            exponent_code = (exponent_code >> (word >= 32u ? 4u : 0u)) & 15u;
+            const unsigned exponent = exponent_code == kBf16ExponentZero ? 0 : header + exponent_code;
+            const unsigned sign_and_mantissa = packet[word];
+            peer = ((sign_and_mantissa & 0x80u) << 8u) | (exponent << 7u) |
+                (sign_and_mantissa & 0x7fu);
+        }
+        const auto first = rank == 0 ? local[i] : peer;
+        const auto second = rank == 0 ? peer : local[i];
+        const float a = __bfloat162float(__ushort_as_bfloat16(first));
+        const float b = __bfloat162float(__ushort_as_bfloat16(second));
+        local[i] = __bfloat16_as_ushort(__float2bfloat16_rn(a + b));
+    }
+}
 // Preserve the scalar two-rank arithmetic, issuing aligned peer reads in
 // full 16-byte lanes. Unaligned/tiny row layouts retain the scalar path.
 template<bool F32, bool Gather>
@@ -727,8 +811,58 @@ void te_host_bounce_allgather_f32(float* device0, float* device1,
     if (stats) { ++stats->allgather_calls; stats->bytes_moved += elements * sizeof(float) * 6; }
 }
 bool cuda_te_compiled() { return true; }
+
+static void add_packed_bf16_reduce(cudaGraph_t graph, const TeCollectiveCall calls[2],
+    void* scratch[2], const cudaGraphNode_t* inputs, std::size_t input_count,
+    void* completed[2], const TeBf16BulkPackStorage& packed, std::size_t count) {
+    using Pack = TeBf16BulkPackStorage;
+    auto blocks = count / Pack::kBlockWords;
+    const auto packet_bytes = blocks * Pack::kStoredBytes;
+    cudaGraphNode_t encoded[2], received[2];
+    for (int r = 0; r < 2; ++r) {
+        check(cudaSetDevice(r), "select bulk BF16 pack device");
+        auto* input = calls[r].input;
+        auto* packets = packed.source[r];
+        auto* fallback_tail = packed.fallback_tail[r];
+        void* arguments[] = {&input, &packets, &fallback_tail, &blocks};
+        cudaKernelNodeParams params{};
+        params.func = reinterpret_cast<void*>(pack_bulk_bf16);
+        params.gridDim = dim3(std::min<std::size_t>((blocks + 7) / 8, 256));
+        params.blockDim = dim3(256);
+        params.kernelParams = arguments;
+        check(cudaGraphAddKernelNode(&encoded[r], graph, inputs, input_count, &params),
+              "add paired bulk BF16 packing");
+    }
+    for (int r = 0; r < 2; ++r) {
+        check(cudaSetDevice(r), "select bulk BF16 receive device");
+        check(cudaGraphAddMemcpyNode1D(&received[r], graph, &encoded[1-r], 1,
+            scratch[r], packed.source[1-r], packet_bytes, cudaMemcpyDeviceToDevice),
+            "add paired bulk BF16 packet copy");
+    }
+    for (int r = 0; r < 2; ++r) {
+        check(cudaSetDevice(r), "select bulk BF16 reduce device");
+        auto* input = calls[r].input;
+        auto* peer_packets = scratch[r];
+        auto* peer_fallback_tail = packed.fallback_tail[1-r];
+        void* arguments[] = {&input, &peer_packets, &peer_fallback_tail, &blocks, &r};
+        cudaKernelNodeParams params{};
+        params.func = reinterpret_cast<void*>(sum_packed_bulk_bf16);
+        params.gridDim = dim3(std::min<std::size_t>((count + 255) / 256, 256));
+        params.blockDim = dim3(256);
+        params.kernelParams = arguments;
+        cudaGraphNode_t reduced;
+        // Fallback reads are from a separate peer tail, never from either
+        // original input. The next collective waits on both reduce tails
+        // before reusing the packet and fallback allocations.
+        check(cudaGraphAddKernelNode(&reduced, graph, received, 2, &params),
+              "add paired bulk BF16 decode and sum");
+        completed[r] = reduced;
+    }
+}
+
 void te_graph_add_collective(void* opaque_graph, const TeCollectiveCall calls[2],
-                             void* scratch[2], void* dependencies[2], void* completed[2]) {
+                             void* scratch[2], void* dependencies[2], void* completed[2],
+                             bool bulk_prefill, const TeBf16BulkPackStorage* packed) {
     DeviceGuard guard;
     const auto& a = calls[0];
     const auto& b = calls[1];
@@ -743,6 +877,9 @@ void te_graph_add_collective(void* opaque_graph, const TeCollectiveCall calls[2]
         a.elements > std::numeric_limits<std::size_t>::max() / a.tokens / unit / 2)
         throw std::invalid_argument("TE graph collective descriptors differ");
     const auto count = a.elements * a.tokens * (gather ? 2 : 1);
+    const auto* bulk_copy = std::getenv("Q38_TP_BULK_COPY");
+    const bool staged_sum = bulk_prefill && !gather && count * unit >= (256u << 10u) &&
+        bulk_copy && std::strcmp(bulk_copy, "1") == 0;
     const bool vector=peer_vector_enabled(a,b,scratch,count,fp32,gather);
     const unsigned width=vector?(fp32?4:8):1;
     const auto blocks = static_cast<unsigned>(std::min<std::size_t>((count/width + 255) / 256, 256));
@@ -751,8 +888,19 @@ void te_graph_add_collective(void* opaque_graph, const TeCollectiveCall calls[2]
     std::size_t input_count = 0;
     for (int r = 0; r < 2; ++r)
         if (dependencies[r]) inputs[input_count++] = static_cast<cudaGraphNode_t>(dependencies[r]);
+    if (staged_sum && !fp32 && packed && count % TeBf16BulkPackStorage::kBlockWords == 0) {
+        add_packed_bf16_reduce(graph, calls, scratch, inputs, input_count,
+                               completed, *packed, count);
+        return;
+    }
     for (int r = 0; r < 2; ++r) {
         check(cudaSetDevice(r), "select TE graph reader device");
+        if (staged_sum) {
+            check(cudaGraphAddMemcpyNode1D(&reads[r], graph, inputs, input_count,
+                scratch[r], calls[1-r].input, count * unit, cudaMemcpyDeviceToDevice),
+                "add paired TE bulk peer copy");
+            continue;
+        }
         void* first = a.input;
         void* second = b.input;
         void* output = scratch[r];
@@ -773,6 +921,25 @@ void te_graph_add_collective(void* opaque_graph, const TeCollectiveCall calls[2]
         void* input = scratch[r];
         void* output = gather ? calls[r].output : calls[r].input;
         cudaGraphNode_t node;
+        if (staged_sum) {
+            // Each copy must complete before either rank can overwrite a
+            // producer. Sum local and staged input in the eager rank order.
+            void* first = r == 0 ? output : input;
+            void* second = r == 0 ? input : output;
+            auto elements = a.elements;
+            auto total = count;
+            void* arguments[] = {&first, &second, &output, &elements, &total};
+            cudaKernelNodeParams params{};
+            params.func = fp32 ? reinterpret_cast<void*>(peer_collect_kernel<float, false>) :
+                reinterpret_cast<void*>(peer_collect_kernel<std::uint16_t, false>);
+            params.gridDim = dim3(std::min<std::size_t>((count + 255) / 256, 256));
+            params.blockDim = dim3(256);
+            params.kernelParams = arguments;
+            check(cudaGraphAddKernelNode(&node, graph, reads, 2, &params),
+                  "add paired TE bulk local sum");
+            completed[r] = node;
+            continue;
+        }
         // Match eager P2P's device-copy commit, retaining both reader fences.
         check(cudaGraphAddMemcpyNode1D(&node, graph, reads, 2, output, input,
             count * unit, cudaMemcpyDeviceToDevice), "add TE graph commit");
@@ -859,7 +1026,8 @@ void te_graph_add_device_collective(void* graphs[2], const TeCollectiveCall call
     }
 }
 bool te_bridge_p2p_enabled() { return bridge_p2p.load(); }
-void te_bridge_pair_graph(int group, int rank, void* context, TePairedAction action) {
+static void pair_host_action(int group, int rank, void* context,
+                             TePairedAction action, bool graph_replay) {
     if (rank < 0 || rank > 1) throw std::invalid_argument("invalid paired graph rank");
     auto& st = bridge_for(group);
     std::unique_lock<std::mutex> lock(st.mu);
@@ -885,13 +1053,26 @@ void te_bridge_pair_graph(int group, int rank, void* context, TePairedAction act
     } else {
         try {
             action(st.ptr[0], st.ptr[1]);
-            ++st.stats.paired_graph_calls;
+            if (graph_replay) ++st.stats.paired_graph_calls;
             st.arrived = 0;
             ++st.generation;
         } catch (...) { st.failure = std::current_exception(); }
         st.cv.notify_all();
     }
     if (st.failure) std::rethrow_exception(st.failure);
+}
+void te_bridge_pair_graph(int group, int rank, void* context, TePairedAction action) {
+    pair_host_action(group, rank, context, action, true);
+}
+bool te_bridge_pair_prefill_ready(int group, int rank, bool captured) {
+    pair_host_action(group, rank, &captured, [](void* first, void* second) {
+        auto& rank0 = *static_cast<bool*>(first);
+        auto& rank1 = *static_cast<bool*>(second);
+        const bool ready = rank0 && rank1;
+        rank0 = ready;
+        rank1 = ready;
+    }, false);
+    return captured;
 }
 TeBridge* te_bridge_global() { static TeBridge bridge; return &bridge; }
 void te_bridge_use_p2p(bool enabled, bool stream_ordered) {

@@ -125,6 +125,13 @@ void cuda_sigmoid_multiply_bf16(const std::uint16_t* values,
                                 void* stream,
                                 int device);
 
+// Apply the gate to a column slice of token-major inputs and write packed rows.
+void cuda_sigmoid_multiply_slice_bf16(
+    const std::uint16_t* values, const std::uint16_t* gates,
+    std::uint16_t* output, std::uint32_t tokens, std::uint32_t input_width,
+    std::uint32_t first_column, std::uint32_t output_width, void* stream,
+    int device);
+
 void cuda_add_bf16(const std::uint16_t* left,
                    const std::uint16_t* right,
                    std::uint16_t* output,
